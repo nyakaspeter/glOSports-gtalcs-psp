@@ -1,0 +1,60 @@
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -3337,6 +3337,19 @@
+         return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
+     }();
+     return enabled;
++}
++
++// LCS_GLES_MIN_PIXELS=<n>: also drop a mesh whose bounding box, wholly in
++// front of the camera, projects to less than n pixels along both screen axes
++// (distant small props, far-away detail). Unset or 0: off.
++float min_pixels() {
++    static const float pixels = [] {
++        const char *text = std::getenv("LCS_GLES_MIN_PIXELS");
++        if (text == nullptr || *text == '\0') return 0.0f;
++        const float value = std::strtof(text, nullptr);
++        return std::isfinite(value) && value > 0.0f ? value : 0.0f;
++    }();
++    return pixels;
+ }
+ 
+ bool off_screen(const Gles2State &s, const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &hw,
+@@ -3361,7 +3374,10 @@
+     // Outside when all 8 corners are on the far side of one plane:
+     // w + x, w - x, w + y, w - y >= 0 and (depth clip) z >= 0, w - z >= 0.
+     std::uint32_t outside = 0x3Fu;
+-    for (std::uint32_t corner = 0u; corner < 8u && outside != 0u; ++corner) {
++    const float small = min_pixels();
++    bool in_front = small > 0.0f;
++    float ndc_low[2] = {INFINITY, INFINITY}, ndc_high[2] = {-INFINITY, -INFINITY};
++    for (std::uint32_t corner = 0u; corner < 8u && (outside != 0u || in_front); ++corner) {
+         const float p[4] = {(corner & 1u) ? high[0] : low[0], (corner & 2u) ? high[1] : low[1],
+                             (corner & 4u) ? high[2] : low[2], 1.0f};
+         const auto dot = [&](const std::array<float, 4> &row) {
+@@ -3376,8 +3392,24 @@
+         if (hw.depth_clip_enabled && z < 0.0f) mask |= 16u;
+         if (hw.depth_clip_enabled && w - z < 0.0f) mask |= 32u;
+         outside &= mask;
++        if (in_front) {
++            if (w < 0.01f) {
++                in_front = false;
++            } else {
++                const float inv = 1.0f / w;
++                ndc_low[0] = std::min(ndc_low[0], x * inv); ndc_high[0] = std::max(ndc_high[0], x * inv);
++                ndc_low[1] = std::min(ndc_low[1], y * inv); ndc_high[1] = std::max(ndc_high[1], y * inv);
++            }
++        }
+     }
+-    return outside != 0u;
++    if (outside != 0u) return true;
++    // Clip space spans 2 across the target: pixels = ndc extent * size / 2.
++    // Perspective views only (w depends on the vertex): HUD and other flat
++    // drawing keep every element.
++    const bool perspective = rows[3][0] != 0.0f || rows[3][1] != 0.0f || rows[3][2] != 0.0f;
++    return in_front && perspective &&
++           (ndc_high[0] - ndc_low[0]) * static_cast<float>(cached_width) < 2.0f * small &&
++           (ndc_high[1] - ndc_low[1]) * static_cast<float>(cached_height) < 2.0f * small;
+ }
+ 
+ // Appends a hardware-transform draw: fill(out) writes vertex_count vertices

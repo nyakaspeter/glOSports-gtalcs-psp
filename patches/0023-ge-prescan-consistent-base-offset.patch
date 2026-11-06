@@ -1,0 +1,51 @@
+diff --git a/lcs/host/lcs_ge_exec.cpp b/lcs/host/lcs_ge_exec.cpp
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -6,6 +6,7 @@
+ #include "lcs_menu.hpp"
+ 
+ #include <array>
++#include <atomic>
+ #include <string>
+ 
+ namespace lcs {
+@@ -15,6 +16,15 @@
+ GeTransformState ge_transform{};
+ std::uint32_t ge_base_register = 0u;
+ std::uint32_t ge_offset_address = 0u;
++// The pair above as one word (base high, offset low), stored by the GE worker
++// whenever either changes, for prescan_ge_list, which the game thread runs
++// from the VBlank path while a list may be executing: one atomic read gives a
++// consistent pair instead of two racing loads.
++std::atomic<std::uint64_t> ge_base_offset_snapshot{0u};
++void snapshot_base_offset() noexcept {
++    ge_base_offset_snapshot.store((static_cast<std::uint64_t>(ge_base_register) << 32u) | ge_offset_address,
++                                  std::memory_order_relaxed);
++}
+ std::uint32_t ge_vertex_address = 0u;
+ std::uint32_t ge_index_address = 0u;
+ bool ge_finish_seen = false;
+@@ -125,9 +135,11 @@
+             break;
+         case 0x10u:
+             ge_base_register = data;
++            snapshot_base_offset();
+             break;
+         case 0x13u:
+             ge_offset_address = data << 8u;
++            snapshot_base_offset();
+             break;
+         case 0x08u:
+             pc = relative_address(data);
+@@ -172,8 +184,9 @@
+ GeListPrescan prescan_ge_list(psprecomp::GuestMemory &memory, std::uint32_t list_address) {
+     GeListPrescan result{};
+     if (list_address == 0u) return result;
+-    std::uint32_t base_register = ge_base_register;
+-    std::uint32_t offset_address = ge_offset_address;
++    const std::uint64_t snapshot = ge_base_offset_snapshot.load(std::memory_order_relaxed);
++    std::uint32_t base_register = static_cast<std::uint32_t>(snapshot >> 32u);
++    std::uint32_t offset_address = static_cast<std::uint32_t>(snapshot);
+     const auto relative = [&](std::uint32_t data24) {
+         const std::uint32_t extended = ((base_register & 0x000F0000u) << 8u) | (data24 & 0x00FFFFFFu);
+         return (offset_address + extended) & 0x0FFFFFFFu;

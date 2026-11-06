@@ -1,0 +1,6 @@
+[Entry]
+CATEGORY=Games
+NAME=Grand Theft Auto: Liberty City Stories (PSP)
+DESCRIPTION=Running natively via lcs-recomp
+COMMAND=/home/player/ports/lcs/start.sh
+ICON=/home/player/ports/lcs/icon.png

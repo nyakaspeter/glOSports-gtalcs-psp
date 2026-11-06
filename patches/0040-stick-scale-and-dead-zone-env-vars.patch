@@ -1,0 +1,30 @@
+--- a/lcs/host/lcs_key_bindings.hpp
++++ b/lcs/host/lcs_key_bindings.hpp
+@@ -606,10 +606,24 @@
+ // per-axis dead zone (24% of each axis) zeroed the smaller component of
+ // any push near an axis, which turned the stick into eight directions
+ // (GA36-MB, 2026-10-30). Outputs -127..127 each.
++// LCS_STICK_SCALE (default 1) multiplies the raw deflection: the GA36-MB's
++// sticks reach only about two thirds of what its gamepad driver declares
++// (43-213 of 0-255), so its start.sh sets 1.5. LCS_STICK_DEADZONE (default
++// 0.20) is the radial dead zone as a fraction of full deflection; the
++// GA36-MB's sticks rest up to 8% off centre.
++inline float stick_setting(const char *name, float fallback) noexcept {
++    const char *text = std::getenv(name);
++    if (text == nullptr || *text == '\0') return fallback;
++    char *end = nullptr;
++    const float value = std::strtof(text, &end);
++    return end != text && value >= 0.0f && value < 10.0f ? value : fallback;
++}
++
+ inline void stick_radial(std::int16_t raw_x, std::int16_t raw_y, int &out_x, int &out_y) noexcept {
+-    constexpr float kDeadZone = 0.20f;  // of full deflection; the GA36-MB rests up to 8% off centre
+-    const float x = static_cast<float>(raw_x) / 32767.0f;
+-    const float y = static_cast<float>(raw_y) / 32767.0f;
++    static const float kScale = stick_setting("LCS_STICK_SCALE", 1.0f);
++    static const float kDeadZone = std::min(stick_setting("LCS_STICK_DEADZONE", 0.20f), 0.95f);
++    const float x = static_cast<float>(raw_x) / 32767.0f * kScale;
++    const float y = static_cast<float>(raw_y) / 32767.0f * kScale;
+     const float deflection = std::sqrt(x * x + y * y);
+     if (deflection <= kDeadZone) {
+         out_x = out_y = 0;

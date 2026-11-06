@@ -1,0 +1,107 @@
+diff --git a/lcs/CMakeLists.txt b/lcs/CMakeLists.txt
+index 761c4dc..af49bd6 100644
+--- a/lcs/CMakeLists.txt
++++ b/lcs/CMakeLists.txt
+@@ -5,6 +5,10 @@ file(GLOB HOST_SOURCES CONFIGURE_DEPENDS host/*.cpp)
+ list(REMOVE_ITEM HOST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/host/pack_font5x7.cpp)
+ add_executable(LCSNative ${HOST_SOURCES})
+ target_include_directories(LCSNative PRIVATE host)
++# Debug info for the host code only (profiling with addr2line); package.sh strips it.
++if(NOT MSVC)
++    target_compile_options(LCSNative PRIVATE -g)
++endif()
+ if(WIN32)
+     target_include_directories(LCSNative PRIVATE ${FFMPEG_DIR}/include)
+ endif()
+@@ -36,11 +40,25 @@ else()
+     pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+         libavcodec libavformat libavutil libswresample libswscale)
+     pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+-    pkg_check_modules(VULKAN REQUIRED IMPORTED_TARGET vulkan)
+     find_package(Threads REQUIRED)
+-    target_compile_definitions(LCSNative PRIVATE LCS_VULKAN_GE_BACKEND=1)
+     target_link_libraries(LCSNative PRIVATE
+-        PkgConfig::FFMPEG PkgConfig::SDL2 PkgConfig::VULKAN Threads::Threads)
++        PkgConfig::FFMPEG PkgConfig::SDL2 Threads::Threads)
++    # LCS_VULKAN=OFF builds without the Vulkan GE (software rasterizer only),
++    # for GPUs without Vulkan.
++    option(LCS_VULKAN "Build the Vulkan GE backend" ON)
++    # Without Vulkan: the GLES 2 GE (ARM's Mali-400 fbdev driver), active
++    # only while /dev/mali exists; the software rasterizer otherwise.
++    option(LCS_GLES2 "Build the GLES 2 GE backend when Vulkan is off" ON)
++    if(NOT LCS_VULKAN AND LCS_GLES2)
++        pkg_check_modules(GLES2 REQUIRED IMPORTED_TARGET egl glesv2)
++        target_compile_definitions(LCSNative PRIVATE LCS_GLES2_GE_BACKEND=1)
++        target_link_libraries(LCSNative PRIVATE PkgConfig::GLES2)
++    endif()
++endif()
++if(NOT WIN32 AND LCS_VULKAN)
++    pkg_check_modules(VULKAN REQUIRED IMPORTED_TARGET vulkan)
++    target_compile_definitions(LCSNative PRIVATE LCS_VULKAN_GE_BACKEND=1)
++    target_link_libraries(LCSNative PRIVATE PkgConfig::VULKAN)
+     # ge_spv.hpp is produced here so an edit to a shader is what the binary runs.
+     find_program(LCS_GLSLANG NAMES glslangValidator glslang REQUIRED)
+     set(LCS_GE_SPV_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan/ge_spv.hpp)
+@@ -64,15 +82,33 @@ else()
+         VERBATIM)
+     add_custom_target(lcs_ge_spirv DEPENDS ${LCS_GE_SPV_HEADER})
+     add_dependencies(LCSNative lcs_ge_spirv)
++    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/host/ge_gpu_backend_vulkan.cpp
++        PROPERTIES OBJECT_DEPENDS ${LCS_GE_SPV_HEADER})
++endif()
++if(NOT WIN32)
+     # pack_font5x7 turns host/font5x7.txt into the F10 menu font. Windows skips this.
+-    add_executable(lcs_pack_font5x7 host/pack_font5x7.cpp)
+-    set_target_properties(lcs_pack_font5x7 PROPERTIES EXCLUDE_FROM_ALL TRUE)
++    # When cross-compiling it can't run, so it's built with the build machine's
++    # compiler (LCS_HOST_CXX, default c++).
+     set(LCS_FONT_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/host_font_5x7.hpp)
++    if(CMAKE_CROSSCOMPILING)
++        set(LCS_HOST_CXX c++ CACHE STRING "Build machine's C++ compiler")
++        set(LCS_PACK_FONT ${CMAKE_CURRENT_BINARY_DIR}/lcs_pack_font5x7_host)
++        add_custom_command(
++            OUTPUT ${LCS_PACK_FONT}
++            COMMAND ${LCS_HOST_CXX} -std=c++20 -O1 -o ${LCS_PACK_FONT}
++                ${CMAKE_CURRENT_SOURCE_DIR}/host/pack_font5x7.cpp
++            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/host/pack_font5x7.cpp
++            VERBATIM)
++    else()
++        add_executable(lcs_pack_font5x7 host/pack_font5x7.cpp)
++        set_target_properties(lcs_pack_font5x7 PROPERTIES EXCLUDE_FROM_ALL TRUE)
++        set(LCS_PACK_FONT lcs_pack_font5x7)
++    endif()
+     add_custom_command(
+         OUTPUT ${LCS_FONT_HEADER}
+         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
+-        COMMAND lcs_pack_font5x7 ${CMAKE_CURRENT_SOURCE_DIR}/host/font5x7.txt ${LCS_FONT_HEADER}
+-        DEPENDS lcs_pack_font5x7 ${CMAKE_CURRENT_SOURCE_DIR}/host/font5x7.txt
++        COMMAND ${LCS_PACK_FONT} ${CMAKE_CURRENT_SOURCE_DIR}/host/font5x7.txt ${LCS_FONT_HEADER}
++        DEPENDS ${LCS_PACK_FONT} ${CMAKE_CURRENT_SOURCE_DIR}/host/font5x7.txt
+         COMMENT "Packing host menu font"
+         VERBATIM)
+     add_custom_target(lcs_host_font DEPENDS ${LCS_FONT_HEADER})
+@@ -80,8 +116,6 @@ else()
+     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/host/display_window_sdl.cpp
+         PROPERTIES OBJECT_DEPENDS ${LCS_FONT_HEADER})
+     target_include_directories(LCSNative BEFORE PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+-    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/host/ge_gpu_backend_vulkan.cpp
+-        PROPERTIES OBJECT_DEPENDS ${LCS_GE_SPV_HEADER})
+     # Some linkers do not resolve the shared libraries FFmpeg itself depends on.
+     # Probe a small link, and only then pass FFmpeg's own libdir as -rpath-link.
+     include(CheckCXXSourceCompiles)
+@@ -115,6 +149,15 @@ if(GENERATED_SOURCES)
+             $<$<CONFIG:Release,RelWithDebInfo>:/O2>)
+     else()
+         target_compile_options(lcs_generated PRIVATE -O2)
++        # Thumb-2 conditional branches reach +-1 MB; these units' largest
++        # functions exceed that once instrumented for PGO, so they are ARM code
++        # (in every build, so the profile matches the code it is applied to).
++        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
++            foreach(unit 0061 0062 0063)
++                set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/generated/generated_unit_${unit}.cpp
++                    PROPERTIES COMPILE_OPTIONS -marm)
++            endforeach()
++        endif()
+     endif()
+     target_link_libraries(LCSNative PRIVATE lcs_generated)
+ else()

@@ -1,0 +1,117 @@
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+index 9a630cb..fbd761d 100644
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -4109,6 +4109,38 @@ HwDrawQueue &hw_draw_queue() {
+ 
+ }  // namespace
+ 
++namespace {
++
++// Palette checksums per display list. A draw with a paletted texture hashes
++// its palette for the texture cache key; with thousands of draws a frame
++// sharing a few palettes that was ~15% of the GE thread, so each palette is
++// hashed once per list (lists don't rewrite the palettes they draw with).
++struct ClutChecksum {
++    std::uint32_t generation{};
++    std::uint32_t address{};
++    std::uint32_t bytes{};
++    std::uint32_t checksum{};
++};
++std::array<ClutChecksum, 16> g_clut_checksums{};
++std::uint32_t g_clut_generation = 1u;
++
++const std::uint32_t *cached_clut_checksum(std::uint32_t address, std::uint32_t bytes) noexcept {
++    for (const ClutChecksum &entry : g_clut_checksums)
++        if (entry.generation == g_clut_generation && entry.address == address && entry.bytes == bytes)
++            return &entry.checksum;
++    return nullptr;
++}
++
++void remember_clut_checksum(std::uint32_t address, std::uint32_t bytes, std::uint32_t checksum) noexcept {
++    static std::size_t next = 0u;
++    g_clut_checksums[next] = {g_clut_generation, address, bytes, checksum};
++    next = (next + 1u) % g_clut_checksums.size();
++}
++
++}  // namespace
++
++void begin_ge_list() noexcept { ++g_clut_generation; }
++
+ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                          const std::array<std::uint32_t, 256> &commands,
+                          const GeTransformState &transform,
+@@ -4239,8 +4271,10 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             const std::uint32_t last = std::min(first + gpu_draw.clut_mask, 255u);
+             const std::uint32_t offset_bytes = first * entry_bytes;
+             const std::uint32_t clut_bytes = (last - first + 1u) * entry_bytes;
+-            if (const std::uint8_t *clut = memory.raw_pointer(
+-                    gpu_draw.clut_address + offset_bytes, clut_bytes)) {
++            const std::uint32_t clut_start = gpu_draw.clut_address + offset_bytes;
++            if (const std::uint32_t *cached = cached_clut_checksum(clut_start, clut_bytes)) {
++                gpu_draw.clut_checksum = *cached;
++            } else if (const std::uint8_t *clut = memory.raw_pointer(clut_start, clut_bytes)) {
+                 std::uint32_t checksum = 2166136261u;
+                 std::uint32_t offset = 0u;
+                 for (; offset + 4u <= clut_bytes; offset += 4u) {
+@@ -4258,6 +4292,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                     checksum *= 16777619u;
+                 }
+                 gpu_draw.clut_checksum = checksum;
++                remember_clut_checksum(clut_start, clut_bytes, checksum);
+             }
+         }
+         ge_gpu_backend_prepare_texture_keys(gpu_draw);
+@@ -4706,7 +4741,25 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                                kFullWidthFraction, setup, gpu_draw);
+         }
+ 
+-        if (hud_candidate && !full_width && hud.shrink != 1.0f) {
++        if (hud_candidate && !full_width && hud.shrink < 1.0f) {
++            // Narrower than 16:9 (e.g. 4:3): the frame is stretched more
++            // vertically than horizontally, so widening the HUD (the branch
++            // below) would push it off the sides. Shrink it vertically instead,
++            // towards whichever edge each element is anchored to.
++            std::uint32_t logical_width = 480u;
++            std::uint32_t logical_height = 272u;
++            ge_gpu_backend_display_logical_size(logical_width, logical_height);
++            const float height = static_cast<float>(logical_height);
++            float min_y = height;
++            for (const Vertex &vertex : vertices) min_y = std::min(min_y, vertex.y);
++            const bool bottom = min_y + max_y > height;  // element's centre below the middle
++            const auto squeeze = [&](float y) {
++                return bottom ? height - (height - y) * hud.shrink : y * hud.shrink;
++            };
++            // The scissor stays: the squeezed element is still inside it.
++            for (Vertex &vertex : vertices) vertex.y = squeeze(vertex.y);
++            gpu_draw.widescreen_hud = true;
++        } else if (hud_candidate && !full_width && hud.shrink != 1.0f) {
+             for (Vertex &vertex : vertices)
+                 vertex.x = hud.source_center + (vertex.x - hud.source_center) / hud.shrink;
+             const auto shrink_scissor = [&](std::int32_t value, bool leading) {
+diff --git a/lcs/host/ge_renderer.hpp b/lcs/host/ge_renderer.hpp
+index add1a31..df192db 100644
+--- a/lcs/host/ge_renderer.hpp
++++ b/lcs/host/ge_renderer.hpp
+@@ -60,5 +60,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                          std::uint64_t lighting_state_revision = 0u);
+ 
+ void flush_ge_deferred_rasterization(psprecomp::GuestMemory &memory);
++// A display list starts: palette checksums cached during the previous one
++// are dropped (see render_ge_primitive).
++void begin_ge_list() noexcept;
+ 
+ }
+\ No newline at end of file
+diff --git a/lcs/host/lcs_ge_exec.cpp b/lcs/host/lcs_ge_exec.cpp
+index 7d01663..20e7972 100644
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -31,6 +31,7 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
+     ge_finish_seen = false;
+     ge_finish_arg = 0u;
+     if (list_address == 0u) return;
++    begin_ge_list();
+ 
+     std::array<std::uint32_t, 16> call_stack{};
+     std::uint32_t call_depth = 0u;

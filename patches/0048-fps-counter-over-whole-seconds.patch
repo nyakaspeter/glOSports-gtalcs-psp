@@ -1,0 +1,46 @@
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -420,6 +420,11 @@
+     // logged with PSP and GL draws per frame (LCS_FPS_LOG).
+     bool show_fps{};
+     double fps{};
++    // The counter on screen: frames over whole seconds, so the few ms the
++    // presentation lags the game's frames by do not read a capped 30 as 31.
++    double shown_fps{};
++    std::chrono::steady_clock::time_point shown_start{};
++    std::uint32_t shown_frames{};
+     bool log_fps{};
+     std::chrono::steady_clock::time_point fps_start{};
+     std::uint32_t fps_frames{};
+@@ -2061,7 +2066,7 @@
+ // right, drawn with scissored clears (one per run of lit dots in a row), so
+ // it needs no texture or shader.
+ void draw_fps(RenderState &r) {
+-    if (!r.show_fps || r.fps <= 0.0) return;
++    if (!r.show_fps || r.shown_fps <= 0.0) return;
+     // Glyphs 0-9, f, p, s; bit 4 is the left column, rows 7-8 for descenders.
+     static constexpr std::uint8_t kGlyphs[13][9] = {
+         {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e},
+@@ -2074,7 +2079,7 @@
+     };
+     constexpr int kDot = 2;
+     constexpr int kAdvance = 6 * kDot;
+-    const int fps = std::min(999, static_cast<int>(r.fps + 0.5));
++    const int fps = std::min(999, static_cast<int>(r.shown_fps + 0.5));
+     int glyphs[6];
+     int count = 0;
+     if (fps >= 100) glyphs[count++] = fps / 100;
+@@ -2118,6 +2123,13 @@
+     const auto now = std::chrono::steady_clock::now();
+     if (r.fps_frames == 0u && r.fps_start.time_since_epoch().count() == 0) r.fps_start = now;
+     ++r.fps_frames;
++    if (r.shown_start.time_since_epoch().count() == 0) r.shown_start = now;
++    else ++r.shown_frames;
++    if (now - r.shown_start >= std::chrono::seconds(1)) {
++        r.shown_fps = r.shown_frames / std::chrono::duration<double>(now - r.shown_start).count();
++        r.shown_frames = 0u;
++        r.shown_start = now;
++    }
+     r.fps_psp_draws += psp_draws;
+     r.fps_gl_draws += gl_draws;
+     const double seconds = std::chrono::duration<double>(now - r.fps_start).count();

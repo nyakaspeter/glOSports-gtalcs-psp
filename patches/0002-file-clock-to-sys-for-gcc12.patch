@@ -1,0 +1,17 @@
+diff --git a/lcs/host/lcs_profile.cpp b/lcs/host/lcs_profile.cpp
+index 7256d37..c01e1c7 100644
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -3049,7 +3049,12 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+             rt.memory().store32(stat_address + 0x08u, static_cast<std::uint32_t>(size));
+             rt.memory().store32(stat_address + 0x0Cu, static_cast<std::uint32_t>(size >> 32u));
+             const auto written = std::filesystem::last_write_time(native, error);
++#if defined(__GLIBCXX__)
++            // clock_cast needs GCC 13; to_sys does the same conversion.
++            const auto system_time = std::chrono::file_clock::to_sys(written);
++#else
+             const auto system_time = std::chrono::clock_cast<std::chrono::system_clock>(written);
++#endif
+             const std::time_t seconds = std::chrono::system_clock::to_time_t(system_time);
+             std::tm parts{};
+ #if defined(_WIN32)

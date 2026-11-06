@@ -1,0 +1,41 @@
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -2115,10 +2115,38 @@
+         }
+     }
+     glDisable(GL_SCISSOR_TEST);
++}
++
++// LCS_FPS_CAP=<n> also paces the presents: a frame goes to the screen no
++// sooner than 1/n s after the one before, on a grid a late frame starts
++// again, as the goodluckOS Android ports' cap does. The cap in the vblank wait
++// spaces the game's frames, but frames that queued in the GE and render
++// threads during a dip reached the screen in a burst afterwards (31-32 on the
++// counter).
++void pace_present() {
++    static const std::uint32_t fps = [] {
++        const char *text = std::getenv("LCS_FPS_CAP");
++        if (text == nullptr || *text == '\0') return 0u;
++        return static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
++    }();
++    if (fps == 0u) return;
++    static std::chrono::steady_clock::time_point deadline{};
++    const auto period = std::chrono::microseconds(1000000u / fps);
++    const auto now = std::chrono::steady_clock::now();
++    if (deadline.time_since_epoch().count() == 0) deadline = now;
++    deadline += period;
++    if (deadline <= now) {
++        deadline = now;
++        return;
++    }
++    constexpr auto spin_margin = std::chrono::microseconds(1500);
++    if (deadline - now > spin_margin) std::this_thread::sleep_until(deadline - spin_margin);
++    while (std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+ }
+ 
+ void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
+     draw_fps(r);
++    pace_present();
+     eglSwapBuffers(r.display, r.surface);
+     const auto now = std::chrono::steady_clock::now();
+     if (r.fps_frames == 0u && r.fps_start.time_since_epoch().count() == 0) r.fps_start = now;

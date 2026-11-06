@@ -1,0 +1,67 @@
+diff --git a/lcs/host/lcs_ge_exec.cpp b/lcs/host/lcs_ge_exec.cpp
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -1,5 +1,7 @@
+ #include "lcs_ge_exec.hpp"
+ 
++#include <cstring>
++
+ #include "ge_renderer.hpp"
+ #include "lcs_menu.hpp"
+ 
+@@ -25,6 +27,28 @@ std::uint32_t relative_address(std::uint32_t data24) {
+     return (ge_offset_address + extended) & 0x0FFFFFFFu;
+ }
+ 
++// Display-list words straight from main RAM (a list is thousands of words a
++// frame); anything outside it through the checked accessors.
++struct ListReader {
++    const psprecomp::GuestMemory &memory;
++    const std::uint8_t *ram;
++    std::uint32_t ram_size;
++
++    explicit ListReader(const psprecomp::GuestMemory &m)
++        : memory(m), ram(m.raw_pointer(psprecomp::GuestMemory::kPhysicalBase, m.size())), ram_size(m.size()) {}
++
++    bool fetch(std::uint32_t address, std::uint32_t &word) const {
++        const std::uint32_t offset = (address & 0x1FFFFFFFu) - psprecomp::GuestMemory::kPhysicalBase;
++        if (ram != nullptr && ram_size >= 4u && offset <= ram_size - 4u) {
++            std::memcpy(&word, ram + offset, sizeof(word));
++            return true;
++        }
++        if (!memory.contains(address, 4u)) return false;
++        word = memory.load32(address);
++        return true;
++    }
++};
++
+ }  // namespace
+ 
+ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list_address) {
+@@ -36,10 +60,11 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
+     std::array<std::uint32_t, 16> call_stack{};
+     std::uint32_t call_depth = 0u;
+     std::uint32_t pc = list_address;
++    const ListReader reader(memory);
+ 
+     for (std::uint32_t executed = 0u; executed < kMaxCommands; ++executed) {
+-        if (!memory.contains(pc, 4u)) break;
+-        const std::uint32_t word = memory.load32(pc);
++        std::uint32_t word;
++        if (!reader.fetch(pc, word)) break;
+         const std::uint32_t op_pc = pc;
+         pc = (pc + 4u) & 0x0FFFFFFFu;
+         const std::uint32_t command = word >> 24u;
+@@ -115,9 +140,10 @@ GeListPrescan prescan_ge_list(psprecomp::GuestMemory &memory, std::uint32_t list
+     std::array<std::uint32_t, 16> call_stack{};
+     std::uint32_t call_depth = 0u;
+     std::uint32_t pc = list_address;
++    const ListReader reader(memory);
+     for (std::uint32_t executed = 0u; executed < kMaxCommands; ++executed) {
+-        if (!memory.contains(pc, 4u)) break;
+-        const std::uint32_t word = memory.load32(pc);
++        std::uint32_t word;
++        if (!reader.fetch(pc, word)) break;
+         pc = (pc + 4u) & 0x0FFFFFFFu;
+         const std::uint32_t command = word >> 24u;
+         const std::uint32_t data = word & 0x00FFFFFFu;

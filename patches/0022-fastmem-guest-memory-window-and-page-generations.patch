@@ -1,0 +1,424 @@
+diff --git a/include/psprecomp/guest_memory.hpp b/include/psprecomp/guest_memory.hpp
+--- a/include/psprecomp/guest_memory.hpp
++++ b/include/psprecomp/guest_memory.hpp
+@@ -64,85 +64,80 @@
+     // write_watch_enabled_ is fixed by the constructor, so this view remains
+     // valid across nested AOT/HLE calls. Slow/VRAM paths delegate to the owning
+     // GuestMemory and preserve the original validation/watch behavior.
++    // Fastmem. The whole 29-bit physical space is one reserved window (see the
++    // constructor): RAM at +0x08000000, the four VRAM mirrors at +0x04000000,
++    // the scratchpad at +0x00010000, everything else zero pages. A guest
++    // access is therefore one AND and one load or store, with no range check
++    // and no out-of-line slow path (a guest `lw` went from 10 host
++    // instructions and a branch to 5). Writes to unmapped physical addresses
++    // land in private zero pages, as the old slow path's "ignore" did.
+     class AotFastView {
+     public:
+         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
+-            const std::uint32_t offset = ram_offset_of_fast(address);
+-            if (offset <= ram_limit8_) return ram_data_[offset];
+-            return owner_->aot_load8_slow(address);
++            return window_[address & kWindowMask];
+         }
+         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint16_t aot_load16(std::uint32_t address) const {
+-            const std::uint32_t offset = ram_offset_of_fast(address);
+-            if (offset <= ram_limit16_) return GuestMemory::read_le16(ram_data_ + offset);
+-            return owner_->aot_load16_slow(address);
++            return GuestMemory::read_le16(window_ + (address & kWindowMask));
+         }
+         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32(std::uint32_t address) const {
+-            const std::uint32_t offset = ram_offset_of_fast(address);
+-            if (offset <= ram_limit32_) return GuestMemory::read_le32(ram_data_ + offset);
+-            return owner_->aot_load32_slow(address);
++            return GuestMemory::read_le32(window_ + (address & kWindowMask));
+         }
++        // Every guest store also bumps its 64 KB page's generation (one load,
++        // add and store on a 32 KB table): a host cache keyed by a guest
++        // address range can then tell "unchanged since I read it" from one
++        // compare per page instead of re-hashing the bytes (see
++        // range_generation).
+         PSPRECOMP_MEMORY_FAST_PATH void aot_store8(std::uint32_t address, std::uint8_t value) const {
+-            const std::uint32_t offset = ram_offset_of_fast(address);
+-#if defined(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH)
+-            if (offset <= ram_limit8_) {
+-#else
+-            if (!write_watch_enabled_ && offset <= ram_limit8_) {
+-#endif
+-                ram_data_[offset] = value;
+-                return;
+-            }
+-            owner_->aot_store8_slow(address, value);
++            const std::uint32_t offset = address & kWindowMask;
++            window_[offset] = value;
++            ++generations_[offset >> kPageShift];
+         }
+         PSPRECOMP_MEMORY_FAST_PATH void aot_store16(std::uint32_t address, std::uint16_t value) const {
+-            const std::uint32_t offset = ram_offset_of_fast(address);
+-#if defined(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH)
+-            if (offset <= ram_limit16_) {
+-#else
+-            if (!write_watch_enabled_ && offset <= ram_limit16_) {
+-#endif
+-                GuestMemory::write_le16(ram_data_ + offset, value);
+-                return;
+-            }
+-            owner_->aot_store16_slow(address, value);
++            const std::uint32_t offset = address & kWindowMask;
++            GuestMemory::write_le16(window_ + offset, value);
++            ++generations_[offset >> kPageShift];
+         }
+         PSPRECOMP_MEMORY_FAST_PATH void aot_store32(std::uint32_t address, std::uint32_t value) const {
+-            const std::uint32_t offset = ram_offset_of_fast(address);
+-#if defined(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH)
+-            if (offset <= ram_limit32_) {
+-#else
+-            if (!write_watch_enabled_ && offset <= ram_limit32_) {
+-#endif
+-                GuestMemory::write_le32(ram_data_ + offset, value);
+-                return;
+-            }
+-            owner_->aot_store32_slow(address, value);
++            const std::uint32_t offset = address & kWindowMask;
++            GuestMemory::write_le32(window_ + offset, value);
++            ++generations_[offset >> kPageShift];
+         }
+ 
+     private:
+         friend class GuestMemory;
+-        AotFastView(GuestMemory *owner, std::uint8_t *ram_data,
+-                    std::uint32_t limit8, std::uint32_t limit16,
+-                    std::uint32_t limit32, bool write_watch) noexcept
+-            : owner_(owner), ram_data_(ram_data), ram_limit8_(limit8),
+-              ram_limit16_(limit16), ram_limit32_(limit32),
+-              write_watch_enabled_(write_watch) {}
+-        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH static constexpr std::uint32_t ram_offset_of_fast(
+-            std::uint32_t address) noexcept {
+-            return (address & 0x1FFFFFFFu) - GuestMemory::kPhysicalBase;
+-        }
+-        GuestMemory *owner_{};
+-        std::uint8_t *ram_data_{};
+-        std::uint32_t ram_limit8_{};
+-        std::uint32_t ram_limit16_{};
+-        std::uint32_t ram_limit32_{};
+-        bool write_watch_enabled_{};
++        AotFastView(std::uint8_t *window, std::uint32_t *generations) noexcept
++            : window_(window), generations_(generations) {}
++        std::uint8_t *window_{};
++        std::uint32_t *generations_{};
+     };
+ 
++    static constexpr std::uint32_t kWindowMask = 0x1FFFFFFFu;
++    static constexpr std::size_t kWindowBytes = 0x20000000u;
++    static constexpr std::uint32_t kPageShift = 16u;
++    static constexpr std::size_t kPageCount = kWindowBytes >> kPageShift;
++
+     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH AotFastView aot_fast_view() noexcept {
+-        return AotFastView(this, ram_data_, ram_limit8_, ram_limit16_, ram_limit32_,
+-                           write_watch_enabled_);
++        return AotFastView(window_, generations_.data());
+     }
+ 
++    // Sum of the page generations a range touches. Host writes bump them too,
++    // so an equal sum before and after means the bytes are unchanged. Not
++    // atomic: a reader on another thread may see a stale value and re-read the
++    // data once more, never "unchanged" for bytes written before its own read
++    // of the sum completed on the same thread.
++    [[nodiscard]] std::uint64_t range_generation(std::uint32_t address, std::size_t length) const noexcept {
++        const std::uint32_t first = (address & kWindowMask) >> kPageShift;
++        const std::uint32_t last = static_cast<std::uint32_t>(((address & kWindowMask) + (length == 0u ? 0u : length - 1u)) >> kPageShift);
++        std::uint64_t sum = 0u;
++        for (std::uint32_t page = first; page <= last && page < kPageCount; ++page) sum += generations_[page];
++        return sum;
++    }
++    void touch_pages(std::uint32_t address, std::size_t length) noexcept {
++        const std::uint32_t first = (address & kWindowMask) >> kPageShift;
++        const std::uint32_t last = static_cast<std::uint32_t>(((address & kWindowMask) + (length == 0u ? 0u : length - 1u)) >> kPageShift);
++        for (std::uint32_t page = first; page <= last && page < kPageCount; ++page) ++generations_[page];
++    }
++
+     // Fast paths used only by statically generated AOT code. They retain
+     // strict fallback behavior for invalid/cross-boundary accesses and write watches.
+     //
+@@ -252,6 +247,7 @@
+         const std::uint32_t offset = ram_offset_of(address);
+         if (!write_watch_enabled_ && offset <= ram_limit8_) {
+             ram_data_[offset] = value;
++            ++generations_[(kPhysicalBase + offset) >> kPageShift];
+             return;
+         }
+         store8_checked(address, value);
+@@ -260,6 +256,7 @@
+         const std::uint32_t offset = ram_offset_of(address);
+         if (!write_watch_enabled_ && offset <= ram_limit16_) {
+             write_le16(ram_data_ + offset, value);
++            ++generations_[(kPhysicalBase + offset) >> kPageShift];
+             return;
+         }
+         store16_checked(address, value);
+@@ -268,6 +265,7 @@
+         const std::uint32_t offset = ram_offset_of(address);
+         if (!write_watch_enabled_ && offset <= ram_limit32_) {
+             write_le32(ram_data_ + offset, value);
++            ++generations_[(kPhysicalBase + offset) >> kPageShift];
+             return;
+         }
+         store32_checked(address, value);
+@@ -283,8 +281,9 @@
+     void zero(std::uint32_t address, std::size_t length);
+ 
+     [[nodiscard]] std::string read_c_string(std::uint32_t address, std::size_t max_length = 256u) const;
+-    [[nodiscard]] const std::vector<std::uint8_t> &bytes() const noexcept;
+-    [[nodiscard]] const std::vector<std::uint8_t> &vram_bytes() const noexcept;
++    [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept;
++    [[nodiscard]] std::span<const std::uint8_t> vram_bytes() const noexcept;
++    ~GuestMemory();
+ 
+ private:
+     enum class Region { Vram, Ram };
+@@ -296,8 +295,8 @@
+     [[nodiscard]] ResolvedAddress resolve(std::uint32_t address, std::size_t length) const;
+     [[nodiscard]] bool is_vram_window(std::uint32_t canonical_address) const noexcept;
+     [[nodiscard]] std::size_t vram_offset(std::uint32_t canonical_address) const noexcept;
+-    [[nodiscard]] const std::vector<std::uint8_t> &region_bytes(Region region) const noexcept;
+-    [[nodiscard]] std::vector<std::uint8_t> &region_bytes(Region region) noexcept;
++    [[nodiscard]] std::span<const std::uint8_t> region_bytes(Region region) const noexcept;
++    [[nodiscard]] std::span<std::uint8_t> region_bytes(Region region) noexcept;
+ 
+     // Canonicalize and rebase in one step.  An address below kPhysicalBase --
+     // EDRAM included -- wraps to a value far above any RAM size, so a single
+@@ -342,8 +341,13 @@
+     void aot_store16_slow(std::uint32_t address, std::uint16_t value);
+     void aot_store32_slow(std::uint32_t address, std::uint32_t value);
+ 
+-    std::vector<std::uint8_t> vram_;
+-    std::vector<std::uint8_t> bytes_;
++    // The reserved window (kWindowBytes) and the regions inside it. vram_ is
++    // the first of four mirrors of one 2 MB file mapping.
++    std::uint8_t *window_{};
++    int vram_fd_{-1};
++    std::span<std::uint8_t> vram_;
++    std::span<std::uint8_t> bytes_;
++    std::vector<std::uint32_t> generations_ = std::vector<std::uint32_t>(kPageCount, 0u);
+     // Cached view of bytes_ for the inline fast paths.  Neither region is ever
+     // resized after construction, so these stay valid for the object's life.
+     //
+diff --git a/src/guest_memory.cpp b/src/guest_memory.cpp
+--- a/src/guest_memory.cpp
++++ b/src/guest_memory.cpp
+@@ -3,11 +3,16 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <limits>
+ 
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
+ namespace psprecomp {
+ 
+ // Declared in runtime.hpp/runtime.cpp.  guest_memory.cpp intentionally avoids
+@@ -70,18 +75,45 @@
+ }
+ 
+ GuestMemory::GuestMemory(std::uint32_t size_bytes)
+-    : vram_(kVramSize, 0u), bytes_(size_bytes, 0u), write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
++    : write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
+     if (size_bytes != 32u * 1024u * 1024u && size_bytes != 64u * 1024u * 1024u) {
+         throw Error("PSP RAM size must be 32 MiB or 64 MiB");
+     }
+-    // Bind the inline AOT fast paths to main RAM.  bytes_ is never resized
+-    // afterwards, and the instance is non-copyable, so this stays valid.
++    // One 512 MB window for the whole 29-bit physical space: zero pages
++    // everywhere (MAP_NORESERVE, so untouched pages cost nothing), RAM at
++    // +0x08000000, the scratchpad at +0x00010000, and VRAM as four mirrors of
++    // one 2 MB file so the hardware's address aliasing holds for runs that
++    // cross a mirror boundary.
++    void *window = mmap(nullptr, kWindowBytes, PROT_READ | PROT_WRITE,
++                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    if (window == MAP_FAILED) throw Error("Cannot reserve the guest memory window");
++    window_ = static_cast<std::uint8_t *>(window);
++    char vram_name[64];
++    std::snprintf(vram_name, sizeof vram_name, "/dev/shm/psprecomp-vram-%ld", static_cast<long>(getpid()));
++    vram_fd_ = open(vram_name, O_RDWR | O_CREAT | O_EXCL, 0600);
++    if (vram_fd_ < 0) throw Error("Cannot create the VRAM backing file in /dev/shm");
++    unlink(vram_name);
++    if (ftruncate(vram_fd_, static_cast<off_t>(kVramSize)) != 0) throw Error("Cannot size the VRAM backing file");
++    for (std::uint32_t mirror = 0u; mirror < kVramMirrorCount; ++mirror) {
++        void *at = window_ + kVramPhysicalBase + mirror * kVramSize;
++        if (mmap(at, kVramSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, vram_fd_, 0) != at)
++            throw Error("Cannot map a VRAM mirror into the guest memory window");
++    }
++    vram_ = std::span<std::uint8_t>(window_ + kVramPhysicalBase, kVramSize);
++    bytes_ = std::span<std::uint8_t>(window_ + kPhysicalBase, size_bytes);
++    // Bind the inline host fast paths to main RAM. The window is never moved
++    // and the instance is non-copyable, so this stays valid.
+     ram_data_ = bytes_.data();
+     ram_limit8_ = size_bytes - 1u;
+     ram_limit16_ = size_bytes - 2u;
+     ram_limit32_ = size_bytes - 4u;
+ }
+ 
++GuestMemory::~GuestMemory() {
++    if (window_ != nullptr) munmap(window_, kWindowBytes);
++    if (vram_fd_ >= 0) close(vram_fd_);
++}
++
+ std::uint32_t GuestMemory::size() const noexcept { return static_cast<std::uint32_t>(bytes_.size()); }
+ std::uint32_t GuestMemory::vram_size() const noexcept { return static_cast<std::uint32_t>(vram_.size()); }
+ 
+@@ -114,10 +146,10 @@
+     return {Region::Ram, static_cast<std::size_t>(c - kPhysicalBase)};
+ }
+ 
+-const std::vector<std::uint8_t> &GuestMemory::region_bytes(Region region) const noexcept {
++std::span<const std::uint8_t> GuestMemory::region_bytes(Region region) const noexcept {
+     return region == Region::Vram ? vram_ : bytes_;
+ }
+-std::vector<std::uint8_t> &GuestMemory::region_bytes(Region region) noexcept {
++std::span<std::uint8_t> GuestMemory::region_bytes(Region region) noexcept {
+     return region == Region::Vram ? vram_ : bytes_;
+ }
+ 
+@@ -150,7 +182,7 @@
+ 
+ std::uint32_t GuestMemory::aot_load32_slow(std::uint32_t address) const {
+     const std::uint32_t c = canonical(address);
+-    const std::vector<std::uint8_t> *data = nullptr;
++    const std::span<std::uint8_t> *data = nullptr;
+     std::size_t offset = 0u;
+     if (is_vram_window(c)) {
+         data = &vram_;
+@@ -192,7 +224,7 @@
+ void GuestMemory::aot_store16_slow(std::uint32_t address, std::uint16_t value) {
+     if (write_watch_enabled_) { store16(address, value); return; }
+     const std::uint32_t c = canonical(address);
+-    std::vector<std::uint8_t> *data = nullptr;
++    std::span<std::uint8_t> *data = nullptr;
+     std::size_t offset = 0u;
+     if (is_vram_window(c)) { data = &vram_; offset = vram_offset(c); }
+     else if (c >= kPhysicalBase) { data = &bytes_; offset = static_cast<std::size_t>(c - kPhysicalBase); }
+@@ -206,7 +238,7 @@
+ void GuestMemory::aot_store32_slow(std::uint32_t address, std::uint32_t value) {
+     if (write_watch_enabled_) { store32(address, value); return; }
+     const std::uint32_t c = canonical(address);
+-    std::vector<std::uint8_t> *data = nullptr;
++    std::span<std::uint8_t> *data = nullptr;
+     std::size_t offset = 0u;
+     if (is_vram_window(c)) { data = &vram_; offset = vram_offset(c); }
+     else if (c >= kPhysicalBase) { data = &bytes_; offset = static_cast<std::size_t>(c - kPhysicalBase); }
+@@ -235,6 +267,7 @@
+ void GuestMemory::aot_copy_lz_match(std::uint32_t destination, std::uint32_t source,
+                                     std::uint32_t length) {
+     if (length == 0u) return;
++    touch_pages(destination, length);
+ 
+     const std::uint32_t canonical_destination = canonical(destination);
+     const std::uint32_t canonical_source = canonical(source);
+@@ -259,7 +292,7 @@
+         return;
+     }
+ 
+-    auto &data = region_bytes(destination_resolved.region);
++    auto data = region_bytes(destination_resolved.region);
+     if (destination_resolved.offset + length > data.size() ||
+         source_resolved.offset + length > data.size() ||
+         source_resolved.offset >= destination_resolved.offset) {
+@@ -291,18 +324,9 @@
+ }
+ 
+ const std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t length) const noexcept {
+-    const std::uint32_t c = canonical(address);
+-    if (is_vram_window(c)) {
+-        const std::size_t offset = vram_offset(c);
+-        // A run that would wrap past the end of the 2 MiB EDRAM image is not
+-        // contiguous in host memory even though it is legal in guest space.
+-        if (offset + length <= vram_.size()) return vram_.data() + offset;
+-        return nullptr;
+-    }
+-    if (c < kPhysicalBase) return nullptr;
+-    const std::size_t offset = static_cast<std::size_t>(c - kPhysicalBase);
+-    if (offset + length <= bytes_.size()) return bytes_.data() + offset;
+-    return nullptr;
++    // The mirrors make a VRAM run contiguous across a mirror boundary too.
++    if (!contains(address, length)) return nullptr;
++    return window_ + canonical(address);
+ }
+ 
+ std::uint8_t GuestMemory::load8_checked(std::uint32_t address) const {
+@@ -330,13 +354,15 @@
+     return (existing & (0xFFFFFF00u << (24u - shift))) | (memory_word >> shift);
+ }
+ void GuestMemory::store8_checked(std::uint32_t address, std::uint8_t value) {
++    touch_pages(address, 1u);
+     const auto r = resolve(address, 1u);
+-    auto &data = region_bytes(r.region);
++    auto data = region_bytes(r.region);
+     const std::uint8_t old = data[r.offset];
+     log_write_watch(address, 1u, "store8", old, value);
+     data[r.offset] = value;
+ }
+ void GuestMemory::store16_checked(std::uint32_t address, std::uint16_t value) {
++    touch_pages(address, 2u);
+     const std::uint16_t old = load16(address);
+     log_write_watch(address, 2u, "store16", old, value);
+     const auto write_byte = [this](std::uint32_t byte_address, std::uint8_t byte) {
+@@ -347,6 +373,7 @@
+     write_byte(address + 1u, static_cast<std::uint8_t>((value >> 8u) & 0xFFu));
+ }
+ void GuestMemory::store32_checked(std::uint32_t address, std::uint32_t value) {
++    touch_pages(address, 4u);
+     const std::uint32_t old = load32(address);
+     log_write_watch(address, 4u, "store32", old, value);
+     const auto write_byte = [this](std::uint32_t byte_address, std::uint8_t byte) {
+@@ -377,11 +404,12 @@
+     if (!contains(address, source.size()))
+         throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
+     log_write_watch(address, source.size(), "copy_in", 0u, 0u);
++    touch_pages(address, source.size());
+     std::size_t copied = 0u;
+     while (copied < source.size()) {
+         const std::uint32_t current = address + static_cast<std::uint32_t>(copied);
+         const auto r = resolve(current, 1u);
+-        auto &data = region_bytes(r.region);
++        auto data = region_bytes(r.region);
+         const std::size_t chunk = std::min(source.size() - copied, data.size() - r.offset);
+         std::copy_n(source.begin() + static_cast<std::ptrdiff_t>(copied), chunk,
+                     data.begin() + static_cast<std::ptrdiff_t>(r.offset));
+@@ -395,7 +423,7 @@
+     while (copied < destination.size()) {
+         const std::uint32_t current = address + static_cast<std::uint32_t>(copied);
+         const auto r = resolve(current, 1u);
+-        const auto &data = region_bytes(r.region);
++        const auto data = region_bytes(r.region);
+         const std::size_t chunk = std::min(destination.size() - copied, data.size() - r.offset);
+         std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(r.offset), chunk,
+                     destination.begin() + static_cast<std::ptrdiff_t>(copied));
+@@ -406,11 +434,12 @@
+     if (!contains(address, length))
+         throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
+     log_write_watch(address, length, "zero", 0u, 0u);
++    touch_pages(address, length);
+     std::size_t cleared = 0u;
+     while (cleared < length) {
+         const std::uint32_t current = address + static_cast<std::uint32_t>(cleared);
+         const auto r = resolve(current, 1u);
+-        auto &data = region_bytes(r.region);
++        auto data = region_bytes(r.region);
+         const std::size_t chunk = std::min(length - cleared, data.size() - r.offset);
+         std::fill_n(data.begin() + static_cast<std::ptrdiff_t>(r.offset), chunk, 0u);
+         cleared += chunk;
+@@ -426,7 +455,7 @@
+     }
+     throw Error("Unterminated guest string at " + hex32(address));
+ }
+-const std::vector<std::uint8_t> &GuestMemory::bytes() const noexcept { return bytes_; }
+-const std::vector<std::uint8_t> &GuestMemory::vram_bytes() const noexcept { return vram_; }
++std::span<const std::uint8_t> GuestMemory::bytes() const noexcept { return bytes_; }
++std::span<const std::uint8_t> GuestMemory::vram_bytes() const noexcept { return vram_; }
+ 
+ } // namespace psprecomp

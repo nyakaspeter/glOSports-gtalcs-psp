@@ -1,0 +1,196 @@
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -1303,7 +1303,129 @@
+ 
+ void set_success(psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 0u); }
+ 
+-std::uint64_t system_time_microseconds() { return virtual_time_us; }
++// ---- The game's timer (LCS_SMOOTH_CLOCK) and the frame log (LCS_FRAME_LOG) ----
++// The guest clock (virtual_time_us) moves to the next vblank boundary at each
++// vblank wait, and by whole skipped vblanks when the game runs late, so the
++// game, which reads it once a frame for its time step, simulates 33 or 50 ms
++// steps while the real frames take, say, 37: the world moves in uneven jumps
++// between evenly spaced frames. LCS_SMOOTH_CLOCK=1 gives the game's timer
++// reads (sceKernelGetSystemTime/Wide/Low, sceKernelLibcClock, the pad's sample
++// times) the guest clock plus an offset, set at each vblank wait so that the
++// game resumes at the real time; the scheduler, the thread delays, the audio
++// and the vblank interrupt keep the guest clock as before. The offset stays
++// within four vblanks (more is a stall: the clocks are put level again) and
++// never makes the timer go back.
++bool smooth_clock_enabled() {
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_SMOOTH_CLOCK");
++        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
++    }();
++    return enabled;
++}
++
++std::int64_t game_clock_offset_us = 0;
++std::uint64_t game_clock_last_us = 0u;   // the latest time handed to the game
++bool game_clock_based = false;
++std::uint64_t game_clock_real_base_us = 0u;
++
++std::uint64_t steady_now_us() {
++    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
++std::uint64_t system_time_microseconds() {
++    if (!smooth_clock_enabled()) return virtual_time_us;
++    const std::int64_t shifted = static_cast<std::int64_t>(virtual_time_us) + game_clock_offset_us;
++    std::uint64_t time = shifted > 0 ? static_cast<std::uint64_t>(shifted) : 0u;
++    if (time < game_clock_last_us) time = game_clock_last_us;
++    game_clock_last_us = time;
++    return time;
++}
++
++// At a vblank wait, with the guest clock the thread resumes at.
++void game_clock_at_vblank_wait(std::uint64_t resume_virtual_us) {
++    if (!smooth_clock_enabled()) return;
++    const std::uint64_t real = steady_now_us();
++    if (!game_clock_based) {
++        game_clock_real_base_us = real - resume_virtual_us;
++        game_clock_based = true;
++    }
++    constexpr std::int64_t kLimit = 4 * 16683;
++    std::int64_t target = static_cast<std::int64_t>(real - game_clock_real_base_us) -
++                          static_cast<std::int64_t>(resume_virtual_us);
++    if (target > kLimit || target < -kLimit) {
++        game_clock_real_base_us = real - resume_virtual_us;
++        target = 0;
++    }
++    const std::int64_t no_going_back =
++        static_cast<std::int64_t>(game_clock_last_us) - static_cast<std::int64_t>(resume_virtual_us);
++    game_clock_offset_us = std::max(target, no_going_back);
++}
++
++// LCS_FRAME_LOG=1: a line per vblank wait in /dev/shm/lcs-frames.csv (real
++// time, the guest clock at the wait and at resume, the vblank count, the
++// timer offset, the display lists since the last wait, the first value of
++// each timer read since the last wait, 0 for none, and the game's own frame
++// timer: CTimer's milliseconds and time step at 0x08B5E02C / 0x08B5E030 in
++// this EBOOT, the function at 0x0891B4xx that caps a frame at 60 ms and the
++// step at 3.333), to see the step the game simulates against the time its
++// frames take.
++constexpr std::uint32_t kGameTimeMsAddress = 0x08B5E02Cu;
++constexpr std::uint32_t kGameTimeStepAddress = 0x08B5E030u;
++struct FrameLog {
++    bool enabled{};
++    std::FILE *file{};
++    std::uint64_t first_read[4]{};   // GetSystemTimeWide, GetSystemTime, GetSystemTimeLow, LibcClock
++    std::uint32_t reads{};
++    std::uint32_t lists{};
++    std::uint64_t last_flush_us{};
++};
++FrameLog frame_log;
++
++void frame_log_open() {
++    static bool opened = false;
++    if (opened) return;
++    opened = true;
++    const char *text = std::getenv("LCS_FRAME_LOG");
++    if (text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0) return;
++    frame_log.file = std::fopen("/dev/shm/lcs-frames.csv", "w");
++    if (frame_log.file == nullptr) return;
++    static char buffer[1u << 16];
++    std::setvbuf(frame_log.file, buffer, _IOFBF, sizeof(buffer));
++    std::fprintf(frame_log.file, "real_us,virtual_us,resume_us,vcount,offset_us,lists,reads,wide,systime,low,clock,game_ms,game_step\n");
++    frame_log.enabled = true;
++}
++
++void frame_log_read(std::uint32_t kind, std::uint64_t value) {
++    if (!frame_log.enabled) return;
++    ++frame_log.reads;
++    if (frame_log.first_read[kind] == 0u) frame_log.first_read[kind] = value != 0u ? value : 1u;
++}
++
++void frame_log_vblank_wait(const psprecomp::GuestMemory &memory, std::uint64_t wait_virtual_us,
++                           std::uint64_t resume_virtual_us, std::uint64_t vcount) {
++    frame_log_open();
++    if (!frame_log.enabled) return;
++    const std::uint64_t real = steady_now_us();
++    const std::uint32_t game_ms = memory.load32(kGameTimeMsAddress);
++    const float game_step = std::bit_cast<float>(memory.load32(kGameTimeStepAddress));
++    std::fprintf(frame_log.file, "%llu,%llu,%llu,%llu,%lld,%u,%u,%llu,%llu,%llu,%llu,%u,%.4f\n",
++                 static_cast<unsigned long long>(real), static_cast<unsigned long long>(wait_virtual_us),
++                 static_cast<unsigned long long>(resume_virtual_us), static_cast<unsigned long long>(vcount),
++                 static_cast<long long>(game_clock_offset_us), frame_log.lists, frame_log.reads,
++                 static_cast<unsigned long long>(frame_log.first_read[0]),
++                 static_cast<unsigned long long>(frame_log.first_read[1]),
++                 static_cast<unsigned long long>(frame_log.first_read[2]),
++                 static_cast<unsigned long long>(frame_log.first_read[3]), game_ms,
++                 static_cast<double>(game_step));
++    frame_log.reads = 0u;
++    frame_log.lists = 0u;
++    for (auto &value : frame_log.first_read) value = 0u;
++    if (real - frame_log.last_flush_us >= 1000000u) {
++        std::fflush(frame_log.file);
++        frame_log.last_flush_us = real;
++    }
++}
+ 
+ void enqueue_continuation(std::int32_t uid, const psprecomp::AllegrexContext &context) {
+     auto thread = thread_table.threads.find(uid);
+@@ -2760,6 +2882,7 @@
+                 return;
+             }
+             const std::uint64_t usec = system_time_microseconds();
++            frame_log_read(1u, usec);
+             rt.memory().store32(output, static_cast<std::uint32_t>(usec));
+             rt.memory().store32(output + 4u, static_cast<std::uint32_t>(usec >> 32u));
+             set_success(ctx);
+@@ -2769,6 +2892,7 @@
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+ 
+             const std::uint64_t usec = system_time_microseconds();
++            frame_log_read(0u, usec);
+             ctx.set_gpr(2, static_cast<std::uint32_t>(usec));
+             ctx.set_gpr(3, static_cast<std::uint32_t>(usec >> 32u));
+         });
+@@ -2776,7 +2900,9 @@
+     runtime.register_hle("ThreadManForUser", 0x369ED59Du,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+ 
+-            ctx.set_gpr(2, static_cast<std::uint32_t>(system_time_microseconds()));
++            const std::uint64_t usec = system_time_microseconds();
++            frame_log_read(2u, usec);
++            ctx.set_gpr(2, static_cast<std::uint32_t>(usec));
+         });
+ 
+     const auto refer_profiler = [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+@@ -3663,6 +3789,7 @@
+             ctx.set_gpr(2, static_cast<std::uint32_t>(display_vblank_index));
+         });
+     auto wait_vblank = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
++        const std::uint64_t wait_virtual_us = virtual_time_us;
+         ++display_vblank_index;
+         check_wall_clock_limit(rt, 0x3Fu);
+         PresentRequest request{};
+@@ -3700,6 +3827,8 @@
+         log_game_clock();
+         const std::uint32_t vblank_delay = static_cast<std::uint32_t>(
+             (virtual_time_us / kVblankPeriodUs + 1u) * kVblankPeriodUs - virtual_time_us);
++        game_clock_at_vblank_wait(virtual_time_us + vblank_delay);
++        frame_log_vblank_wait(rt.memory(), wait_virtual_us, virtual_time_us + vblank_delay, display_vblank_index);
+         if (deliver_pending_ge_callback(ctx, vblank_delay, true)) return;
+         if (dispatch_vblank_interrupt(rt, ctx, vblank_delay)) return;
+         (void)delay_current_thread(rt, ctx, vblank_delay);
+@@ -3713,6 +3842,7 @@
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 0x04000000u); });
+     runtime.register_hle("sceGe_user", 0xAB49E76Au,
+         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
++            ++frame_log.lists;
+             const std::uint32_t list_address = ctx.gpr[4];
+             const bool from_vblank = in_vblank_interrupt();
+             bool list_finished = false;
+@@ -4886,7 +5016,9 @@
+         });
+     runtime.register_hle("UtilsForUser", 0x91E4F6A7u,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+-            ctx.set_gpr(2, static_cast<std::uint32_t>(virtual_time_us));
++            const std::uint64_t usec = system_time_microseconds();
++            frame_log_read(3u, usec);
++            ctx.set_gpr(2, static_cast<std::uint32_t>(usec));
+         });
+     runtime.register_hle("SysMemUserForUser", 0x13A5ABEFu,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { set_success(ctx); });

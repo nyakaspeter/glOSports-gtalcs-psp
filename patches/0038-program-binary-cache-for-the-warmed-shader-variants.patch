@@ -1,0 +1,261 @@
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -354,10 +354,19 @@
+     EGLContext upload_context{EGL_NO_CONTEXT};
+     EGLSurface upload_surface{EGL_NO_SURFACE};
+     SharedTextures shared;
+-    // LCS_GLES_SHADER_WARMUP: the program keys file (empty: off), and set
+-    // while the startup compiles them.
+-    std::string shader_variants_path;
++    // LCS_GLES_SHADER_WARMUP: config/shader-cache/ (empty: off) names every
++    // program variant earlier sessions linked, <key>.bin each; all are made
++    // before the first frame (`warming` set meanwhile). LCS_GLES_SHADER_CACHE:
++    // the files hold the driver's program binaries (GL_OES_get_program_binary,
++    // the two pointers set), loaded instead of compiling and saved after a
++    // compile; off or unsupported: the names still say what to compile.
++    std::string shader_cache_directory;
+     bool warming{};
++    PFNGLGETPROGRAMBINARYOESPROC get_program_binary{};
++    PFNGLPROGRAMBINARYOESPROC program_binary{};
++    std::uint64_t shader_source_hash{};
++    std::size_t cache_loaded{};
++    std::size_t cache_saved{};
+     FbdevWindow window{};
+     std::uint32_t screen_width{640u};
+     std::uint32_t screen_height{480u};
+@@ -947,6 +956,14 @@
+         return 0u;
+     }
+     return shader;
++}
++
++void finish_program(Program &program) {
++    program.vertex_location = glGetUniformLocation(program.id, "uV");
++    program.fragment_location = glGetUniformLocation(program.id, "uF");
++    program.raw_location = glGetUniformLocation(program.id, "uR");
++    glUseProgram(program.id);
++    if (const GLint sampler = glGetUniformLocation(program.id, "uTex"); sampler >= 0) glUniform1i(sampler, 0);
+ }
+ 
+ bool link_program(Program &program, const std::string &vertex, const std::string &fragment,
+@@ -987,12 +1004,86 @@
+         program.id = 0u;
+         return false;
+     }
+-    program.vertex_location = glGetUniformLocation(program.id, "uV");
+-    program.fragment_location = glGetUniformLocation(program.id, "uF");
+-    program.raw_location = glGetUniformLocation(program.id, "uR");
+-    glUseProgram(program.id);
+-    if (const GLint sampler = glGetUniformLocation(program.id, "uTex"); sampler >= 0) glUniform1i(sampler, 0);
++    finish_program(program);
+     return true;
++}
++
++// LCS_GLES_SHADER_CACHE: the driver's linked program binary, saved after the
++// first compile and loaded instead of compiling from then on. The file
++// carries a hash of the shader sources and the driver strings: a changed
++// shader or driver misses (and is overwritten); a binary the driver rejects
++// falls back to the compiler.
++struct ProgramBinaryHeader {
++    char magic[4];
++    std::uint32_t format;
++    std::uint32_t length;
++    std::uint32_t reserved;
++    std::uint64_t source_hash;
++};
++
++std::uint64_t fnv1a(std::uint64_t hash, const char *text) noexcept {
++    for (; text != nullptr && *text != '\0'; ++text) {
++        hash ^= static_cast<unsigned char>(*text);
++        hash *= 0x100000001B3ull;
++    }
++    return hash;
++}
++
++std::string program_binary_path(const RenderState &r, std::uint64_t key) {
++    char name[32];
++    std::snprintf(name, sizeof(name), "%016llx.bin", static_cast<unsigned long long>(key));
++    return r.shader_cache_directory + '/' + name;
++}
++
++bool load_program_binary(RenderState &r, std::uint64_t key, Program &program) {
++    if (r.program_binary == nullptr) return false;
++    std::ifstream input(program_binary_path(r, key), std::ios::binary);
++    if (!input) return false;
++    ProgramBinaryHeader header{};
++    if (!input.read(reinterpret_cast<char *>(&header), sizeof(header)) ||
++        std::memcmp(header.magic, "LCSB", 4) != 0 || header.source_hash != r.shader_source_hash ||
++        header.length == 0u || header.length > (16u << 20u))
++        return false;
++    std::vector<char> data(header.length);
++    if (!input.read(data.data(), static_cast<std::streamsize>(data.size()))) return false;
++    program.id = glCreateProgram();
++    r.program_binary(program.id, static_cast<GLenum>(header.format), data.data(),
++                     static_cast<GLint>(data.size()));
++    GLint ok = GL_FALSE;
++    glGetProgramiv(program.id, GL_LINK_STATUS, &ok);
++    while (glGetError() != GL_NO_ERROR) {}
++    if (ok != GL_TRUE) {
++        glDeleteProgram(program.id);
++        program.id = 0u;
++        return false;
++    }
++    finish_program(program);
++    ++r.cache_loaded;
++    return true;
++}
++
++void save_program_binary(RenderState &r, std::uint64_t key, const Program &program) {
++    if (r.get_program_binary == nullptr) return;
++    GLint length = 0;
++    glGetProgramiv(program.id, GL_PROGRAM_BINARY_LENGTH_OES, &length);
++    if (length <= 0) return;
++    std::vector<char> data(static_cast<std::size_t>(length));
++    GLsizei written = 0;
++    GLenum format = 0u;
++    r.get_program_binary(program.id, length, &written, &format, data.data());
++    if (glGetError() != GL_NO_ERROR || written <= 0) return;
++    ProgramBinaryHeader header{{'L', 'C', 'S', 'B'}, static_cast<std::uint32_t>(format),
++                               static_cast<std::uint32_t>(written), 0u, r.shader_source_hash};
++    const std::string path = program_binary_path(r, key);
++    const std::string temporary = path + ".tmp";
++    {
++        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
++        if (!output) return;
++        output.write(reinterpret_cast<const char *>(&header), sizeof(header));
++        output.write(data.data(), written);
++        if (!output) return;
++    }
++    if (std::rename(temporary.c_str(), path.c_str()) == 0) ++r.cache_saved;
+ }
+ 
+ Program *program_for(RenderState &r, std::uint64_t key) {
+@@ -1033,52 +1124,47 @@
+     }
+     Program &program = r.programs[key];
+     std::string error;
+-    if (!r.warming) ++r.fps_compiles;
+-    if (!link_program(program, std::string(defines) + kVertexShader,
+-                      std::string(defines) + kFragmentShader, error)) {
+-        runtime_log_error("gles2 ge program", error);
+-        std::cerr << "[gles2] " << error << '\n';
+-        return nullptr;
+-    }
+-    r.current_program = program.id;
+-    if (!r.warming && !r.shader_variants_path.empty()) {
+-        // A variant the start-up didn't compile: the next start-up will.
+-        if (std::FILE *file = std::fopen(r.shader_variants_path.c_str(), "a")) {
+-            std::fprintf(file, "%016llx\n", static_cast<unsigned long long>(key));
+-            std::fclose(file);
++    if (!load_program_binary(r, key, program)) {
++        if (!r.warming) ++r.fps_compiles;
++        if (!link_program(program, std::string(defines) + kVertexShader,
++                          std::string(defines) + kFragmentShader, error)) {
++            runtime_log_error("gles2 ge program", error);
++            std::cerr << "[gles2] " << error << '\n';
++            return nullptr;
+         }
++        save_program_binary(r, key, program);
+     }
++    r.current_program = program.id;
+     return &program;
+ }
+ 
+-// LCS_GLES_SHADER_WARMUP: config/shader-variants.txt (next to LCSNative.ini)
+-// lists the program keys earlier sessions compiled, one hex key per line;
+-// compiled here before the first frame (10-50 ms each in ARM's compiler, a
+-// visible hitch when one is first drawn mid-game). Lines that aren't a hex
+-// key are skipped.
+-std::filesystem::path shader_variants_path() {
++// LCS_GLES_SHADER_WARMUP: config/shader-cache/ (next to LCSNative.ini) holds
++// one <16 hex digits>.bin per program variant earlier sessions linked (the
++// driver's binary, see load_program_binary; the name alone is the record).
++// All are made here before the first frame: a variant first drawn mid-game
++// costs 10-50 ms in ARM's compiler, a visible hitch. Other names are skipped.
++std::filesystem::path shader_cache_directory_path() {
+     const LcsConfiguration &config = lcs_render_configuration();
+     const std::filesystem::path directory =
+         !config.source_path.empty() ? config.source_path.parent_path() : config.executable_directory;
+-    return directory / "shader-variants.txt";
++    return directory / "shader-cache";
+ }
+ 
+ std::size_t warm_up_programs(RenderState &r) {
+-    std::ifstream input(r.shader_variants_path);
+-    std::size_t compiled = 0u;
+-    std::string line;
++    std::size_t made = 0u;
++    std::error_code ignored;
+     r.warming = true;
+-    while (std::getline(input, line)) {
+-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+-        if (line.empty() || line.size() > 16u ||
+-            line.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
++    for (const auto &entry : std::filesystem::directory_iterator(r.shader_cache_directory, ignored)) {
++        const std::string name = entry.path().filename().string();
++        if (name.size() != 20u || name.compare(16u, 4u, ".bin") != 0 ||
++            name.find_first_not_of("0123456789abcdefABCDEF") < 16u)
+             continue;
+-        const std::uint64_t key = std::strtoull(line.c_str(), nullptr, 16);
++        const std::uint64_t key = std::strtoull(name.c_str(), nullptr, 16);
+         if (r.programs.find(key) != r.programs.end()) continue;
+-        if (program_for(r, key) != nullptr) ++compiled;
++        if (program_for(r, key) != nullptr) ++made;
+     }
+     r.warming = false;
+-    return compiled;
++    return made;
+ }
+ 
+ void upload_uniforms(Program &program, const UniformValues &values) {
+@@ -2820,15 +2906,47 @@
+     // LCS_GLES_SHADER_WARMUP=0: no shader-variants.txt, programs compiled on
+     // first use only.
+     std::size_t warmed = 0u;
++    long warm_up_milliseconds = 0;
+     if (env_enabled("LCS_GLES_SHADER_WARMUP")) {
+-        r.shader_variants_path = shader_variants_path().string();
+-        warmed = warm_up_programs(r);
++        const std::filesystem::path directory = shader_cache_directory_path();
++        std::error_code ignored;
++        std::filesystem::create_directories(directory, ignored);
++        if (std::filesystem::is_directory(directory, ignored)) r.shader_cache_directory = directory.string();
++        // LCS_GLES_SHADER_CACHE=0: every program compiled from source (and
++        // new variants not recorded).
++        if (!r.shader_cache_directory.empty() && env_enabled("LCS_GLES_SHADER_CACHE") &&
++            has_extension("GL_OES_get_program_binary")) {
++            r.get_program_binary = reinterpret_cast<PFNGLGETPROGRAMBINARYOESPROC>(
++                eglGetProcAddress("glGetProgramBinaryOES"));
++            r.program_binary = reinterpret_cast<PFNGLPROGRAMBINARYOESPROC>(
++                eglGetProcAddress("glProgramBinaryOES"));
++            if (r.get_program_binary == nullptr || r.program_binary == nullptr) {
++                r.get_program_binary = nullptr;
++                r.program_binary = nullptr;
++            }
++            std::uint64_t hash = 0xCBF29CE484222325ull;
++            hash = fnv1a(hash, kVertexShader);
++            hash = fnv1a(hash, kFragmentShader);
++            hash = fnv1a(hash, reinterpret_cast<const char *>(glGetString(GL_RENDERER)));
++            hash = fnv1a(hash, reinterpret_cast<const char *>(glGetString(GL_VERSION)));
++            r.shader_source_hash = hash;
++        }
++        const auto started = std::chrono::steady_clock::now();
++        if (!r.shader_cache_directory.empty()) warmed = warm_up_programs(r);
++        warm_up_milliseconds = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::steady_clock::now() - started).count());
+     }
+     std::cout << "[gles2] EGL " << major << '.' << minor << " on fbdev " << r.screen_width << 'x'
+               << r.screen_height << ", " << reinterpret_cast<const char *>(glGetString(GL_RENDERER))
+               << ", targets " << r.target_width << 'x' << r.target_height
+               << (r.depth24 ? ", depth24" : ", depth16") << ", render thread";
+-    if (!r.shader_variants_path.empty()) std::cout << ", " << warmed << " shader variants warmed";
++    if (!r.shader_cache_directory.empty()) {
++        std::cout << ", " << warmed << " shader variants warmed in " << warm_up_milliseconds << " ms";
++        if (r.program_binary != nullptr)
++            std::cout << " (" << r.cache_loaded << " from cache, " << r.cache_saved << " saved)";
++        else
++            std::cout << " (no program binary cache)";
++    }
+     std::cout << '\n' << std::flush;
+     {
+         GLint vertex_uniforms = 0, fragment_uniforms = 0, varyings = 0, attributes = 0;

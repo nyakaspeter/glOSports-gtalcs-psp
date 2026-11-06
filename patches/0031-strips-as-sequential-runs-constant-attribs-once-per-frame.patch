@@ -1,0 +1,327 @@
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -125,6 +125,12 @@
+     // The texture is uploaded (or in this frame's uploads): the merge loop
+     // picks the textured program without the render thread's map.
+     bool texture_ready{};
++    // LCS_GLES_STRIP_RUNS: a strip whose vertices draw in stream order (not
++    // indexed, or indexed 0..n-1), and how many degenerate vertices (0, 2 or
++    // 3) sit in the stream right before first_vertex to join it to the
++    // previous batch's strip (see accumulate_hardware_packed_0115).
++    bool strip_run{};
++    std::uint8_t strip_join{};
+ };
+ 
+ // Uniforms: the vertex shader's are the array uV[UVertexCount], the fragment
+@@ -307,6 +313,15 @@
+     // default strips stay strips (about a third of the indices; ARM's driver
+     // copies and scans every index on the CPU).
+     bool strips{true};
++    // LCS_GLES_STRIP_RUNS=0: merged strips always go through an index array.
++    // By default consecutive strips drawn in stream order get the degenerate
++    // vertices joining them in the vertex stream (Batch::strip_join), so a
++    // merged group of them is one sequential run: glDrawArrays, no index
++    // copy in the driver.
++    bool strip_runs{true};
++    // LCS_GLES_CONST_ATTRIBS=0: set the constant attributes aQ and aFog per
++    // draw instead of once per frame.
++    bool const_attribs{true};
+     bool index_vbo{};
+     std::array<std::array<GLuint, 3>, 3> buffers{};  // [ring][vertices, packed, indices]
+     std::uint32_t ring{};
+@@ -332,6 +347,11 @@
+     std::uint32_t fps_frames{};
+     std::uint64_t fps_psp_draws{};
+     std::uint64_t fps_gl_draws{};
++    // LCS_FPS_LOG: GL draws by glDrawArrays and by glDrawElements, and the
++    // index bytes the latter hand the driver, per frame.
++    std::uint64_t fps_gl_arrays{};
++    std::uint64_t fps_gl_elements{};
++    std::uint64_t fps_index_bytes{};
+     // LCS_FPS_LOG: bytes per frame sent to the GPU (vertices, packed, indices, textures).
+     std::array<std::uint64_t, 4> fps_bytes{};
+     std::uint64_t fps_culled{};
+@@ -1531,8 +1551,10 @@
+     glVertexAttribPointer(1, 1, GL_UNSIGNED_SHORT, GL_FALSE, 10, base + 2);
+     glVertexAttribPointer(2, 2, GL_UNSIGNED_BYTE, GL_FALSE, 10, base);
+     set_attribute_arrays(r, 0x07u);
+-    glVertexAttrib1f(3, 1.0f);
+-    glVertexAttrib1f(4, 1.0f);
++    if (!r.const_attribs) {
++        glVertexAttrib1f(3, 1.0f);
++        glVertexAttrib1f(4, 1.0f);
++    }
+ }
+ 
+ // Raw vertices: each element as its PSP type (the shader scales them).
+@@ -1574,8 +1596,10 @@
+         }
+     }
+     set_attribute_arrays(r, mask);
+-    glVertexAttrib1f(3, 1.0f);
+-    glVertexAttrib1f(4, 1.0f);
++    if (!r.const_attribs) {
++        glVertexAttrib1f(3, 1.0f);
++        glVertexAttrib1f(4, 1.0f);
++    }
+ }
+ 
+ void bind_vertices(RenderState &r, const Vertex *base) {
+@@ -1759,14 +1783,16 @@
+         std::fprintf(stderr, "glos: culled draws %.0f vertices %.0f\n", r.fps_culled / frames,
+                      r.fps_culled_vertices / frames);
+     if (r.log_fps) {
+-        std::fprintf(stderr, "glos: breaks/frame target %.0f scissor %.0f program %.0f texture %.0f sampler %.0f fixed %.0f blend %.0f uniforms %.0f rawstate %.0f rawlayout %.0f strip %.0f range %.0f first %.0f\n",
++        std::fprintf(stderr, "glos: breaks/frame target %.0f scissor %.0f program %.0f texture %.0f sampler %.0f fixed %.0f blend %.0f uniforms %.0f rawstate %.0f rawlayout %.0f strip %.0f range %.0f first %.0f  gl arrays %.0f elements %.0f index bytes %.0f\n",
+                      r.fps_breaks[0] / frames, r.fps_breaks[1] / frames, r.fps_breaks[2] / frames,
+                      r.fps_breaks[3] / frames, r.fps_breaks[4] / frames, r.fps_breaks[5] / frames,
+                      r.fps_breaks[6] / frames, r.fps_breaks[7] / frames, r.fps_breaks[8] / frames,
+                      r.fps_breaks[9] / frames, r.fps_breaks[10] / frames, r.fps_breaks[11] / frames,
+-                     r.fps_breaks[12] / frames);
++                     r.fps_breaks[12] / frames, r.fps_gl_arrays / frames, r.fps_gl_elements / frames,
++                     r.fps_index_bytes / frames);
+         r.fps_breaks = {};
+     }
++    r.fps_gl_arrays = r.fps_gl_elements = r.fps_index_bytes = 0u;
+     r.fps_culled = r.fps_culled_vertices = 0u;
+     r.fps_frames = 0u;
+     r.fps_psp_draws = 0u;
+@@ -1782,11 +1808,12 @@
+     std::uint32_t target_width{};
+     std::uint32_t target_height{};
+     bool strips{};
++    bool strip_runs{};
+     bool log_fps{};
+ };
+ 
+ MergeSettings merge_settings(const RenderState &r) {
+-    return {r.target_width, r.target_height, r.strips, r.log_fps};
++    return {r.target_width, r.target_height, r.strips, r.strip_runs, r.log_fps};
+ }
+ 
+ // Pass 1: merge a frame's draws into GL draws (frame.commands) with all
+@@ -1803,9 +1830,30 @@
+     if (frame.batches.empty()) return;
+     Command group{};
+     bool group_open = false;
++    // A strip group built as one sequential run (LCS_GLES_STRIP_RUNS): its
++    // vertex count from the group's base, and no indices; 0 in index mode.
++    std::uint32_t run_count = 0u;
++    const Batch *previous = nullptr;  // the batch last added to the group
++    const auto end_run = [&]() {
++        // The run's indices, so a strip that can't extend it joins the usual
++        // way (append_strip repeats indices).
++        if (run_count == 0u) return;
++        const std::size_t at = index16.size();
++        index16.resize(at + run_count);
++        std::uint16_t *dst = index16.data() + at;
++        for (std::uint32_t i = 0u; i < run_count; ++i) dst[i] = static_cast<std::uint16_t>(i);
++        run_count = 0u;
++    };
+     const auto flush = [&]() {
+         if (!group_open) return;
+         group_open = false;
++        if (run_count != 0u) {
++            group.index_count = run_count;
++            group.arrays = true;
++            run_count = 0u;
++            commands.push_back(group);
++            return;
++        }
+         group.index_count = static_cast<std::uint32_t>(index16.size()) - group.first_index;
+         if (group.index_count == 0u) return;
+         // One sequential run of vertices draws without indices (no index
+@@ -1912,10 +1960,22 @@
+             group.first_index = static_cast<std::uint32_t>(index16.size());
+             group.strip = strip;
+             group_open = true;
++            previous = nullptr;
+         }
+         const std::uint32_t offset = (batch.first_vertex - group.base) / stride;
+-        if (strip) append_strip(index16, frame, batch, offset, group.first_index);
+-        else append_triangles(index16, frame, batch, offset);
++        if (strip && m.strip_runs && batch.strip_run &&
++            (previous == nullptr || (run_count != 0u && batch.strip_join != 0u && previous == &batch - 1 &&
++                                     offset == run_count + batch.strip_join))) {
++            // Drawn in stream order: the group's first strip starts a run, a
++            // later one extends it when the GE thread put the vertices that
++            // join it to the batch before (the run's last) in the stream.
++            run_count = offset + batch.vertex_count;
++        } else {
++            end_run();
++            if (strip) append_strip(index16, frame, batch, offset, group.first_index);
++            else append_triangles(index16, frame, batch, offset);
++        }
++        previous = &batch;
+         if (self_feedback) flush();
+     }
+     flush();
+@@ -1974,6 +2034,12 @@
+     }
+     r.attribute_arrays = 0xFFFFFFFFu;
+     set_attribute_arrays(r, 0x1Fu);
++    if (r.const_attribs) {
++        // aQ and aFog, constant 1 for packed and raw vertices: the current
++        // attribute values are context state, so once per frame, not per draw.
++        glVertexAttrib1f(3, 1.0f);
++        glVertexAttrib1f(4, 1.0f);
++    }
+     glActiveTexture(GL_TEXTURE0);
+     invalidate_state(r);
+     r.current_target = nullptr;
+@@ -2047,9 +2113,12 @@
+         const GLenum mode = command.strip ? GL_TRIANGLE_STRIP : GL_TRIANGLES;
+         if (command.arrays) {
+             glDrawArrays(mode, static_cast<GLint>(command.first_vertex), static_cast<GLsizei>(command.index_count));
++            ++r.fps_gl_arrays;
+         } else {
+             glDrawElements(mode, static_cast<GLsizei>(command.index_count), GL_UNSIGNED_SHORT,
+                            index_base + static_cast<std::size_t>(command.first_index) * sizeof(std::uint16_t));
++            ++r.fps_gl_elements;
++            r.fps_index_bytes += command.index_count * sizeof(std::uint16_t);
+         }
+         ++gl_draws;
+     }
+@@ -2215,7 +2284,8 @@
+         return text != nullptr && *text != '\0' ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 24u;
+     }();
+     for (Batch &batch : frame.batches) {
+-        if (!batch.hardware_transform || batch.pretransformed || batch.vertex_count > max_vertices) continue;
++        // Not raw batches: their first_vertex is a byte offset into frame.packed.
++        if (!batch.hardware_transform || batch.raw || batch.pretransformed || batch.vertex_count > max_vertices) continue;
+         if (batch.packed) {
+             // Same decode as the vertex shader's PACKED variant.
+             const std::uint32_t first = static_cast<std::uint32_t>(frame.vertices.size());
+@@ -2237,6 +2307,7 @@
+             }
+             batch.first_vertex = first;
+             batch.packed = false;
++            batch.strip_join = 0u;  // its joining vertices stay in the packed array
+         }
+         std::uint32_t width = kReferenceWidth;
+         std::uint32_t height = kReferenceHeight;
+@@ -2371,6 +2442,10 @@
+     r.use_vbo = vbo == nullptr || *vbo == '\0' || std::strcmp(vbo, "0") != 0;
+     const char *strips = std::getenv("LCS_GLES_STRIPS");
+     r.strips = strips == nullptr || *strips == '\0' || std::strcmp(strips, "0") != 0;
++    const char *runs = std::getenv("LCS_GLES_STRIP_RUNS");
++    r.strip_runs = runs == nullptr || *runs == '\0' || std::strcmp(runs, "0") != 0;
++    const char *constants = std::getenv("LCS_GLES_CONST_ATTRIBS");
++    r.const_attribs = constants == nullptr || *constants == '\0' || std::strcmp(constants, "0") != 0;
+     r.index_vbo = vbo != nullptr && std::strcmp(vbo, "2") == 0;
+     s.stop = false;
+     // LCS_GLES_TRANSFORM_THREAD=0: hardware transform in the vertex shader,
+@@ -2809,6 +2884,14 @@
+     s.report.game_draw_calls += batch.logical_draw_count;
+     s.report.hw_transform_draw_calls += batch.logical_draw_count;
+     s.report.game_vertices += emitted;
++}
++
++// The indices are 0..count-1: the vertices draw in stream order.
++bool identity_indices(std::span<const std::uint32_t> indices, std::uint32_t count) {
++    if (indices.size() != count) return false;
++    for (std::uint32_t i = 0u; i < count; ++i)
++        if (indices[i] != i) return false;
++    return true;
+ }
+ 
+ }  // namespace
+@@ -2903,7 +2986,22 @@
+     const bool indexed = !triangle_indices.empty();
+     const std::size_t emitted = indexed ? triangle_indices.size() : vertex_count;
+     if (emitted == 0u || (transform.primitive == 4u ? emitted < 3u : (emitted % 3u) != 0u)) return true;
+-    if (s.packed.size() / sizeof(Packed0115) + vertex_count > kMaxFrameVertices) {
++    // LCS_GLES_STRIP_RUNS: a strip drawn in stream order (Batch::strip_run)
++    // that follows another packed one ending where it starts gets the
++    // degenerate vertices joining the two in the stream itself: the previous
++    // strip's last vertex and its own first, plus the first once more when
++    // the previous strip's length is odd (append_strip's rule, so every
++    // triangle keeps its winding whichever strip starts the merged group).
++    const bool strip_run = transform.primitive == 4u && s.render.strip_runs && s.render.strips &&
++                           (!indexed || identity_indices(triangle_indices, vertex_count));
++    std::uint32_t join = 0u;
++    if (strip_run && !s.batches.empty()) {
++        const Batch &previous = s.batches.back();
++        if (previous.strip_run && previous.packed &&
++            static_cast<std::size_t>(previous.first_vertex + previous.vertex_count) * sizeof(Packed0115) == s.packed.size())
++            join = 2u + (previous.vertex_count & 1u);
++    }
++    if (s.packed.size() / sizeof(Packed0115) + join + vertex_count > kMaxFrameVertices) {
+         ++s.report.game_vertex_overflows;
+         return true;
+     }
+@@ -2920,7 +3018,14 @@
+     // 10-byte vertex (first_vertex counts those).
+     const std::size_t padded = (s.packed.size() + sizeof(Packed0115) - 1u) / sizeof(Packed0115) * sizeof(Packed0115);
+     s.packed.resize(padded);
+-    const std::uint32_t first_vertex = static_cast<std::uint32_t>(padded / sizeof(Packed0115));
++    if (join != 0u) {
++        // padded is the previous strip's end: the joining vertices go there.
++        s.packed.resize(padded + static_cast<std::size_t>(join) * sizeof(Packed0115));
++        std::uint8_t *at = s.packed.data() + padded;
++        std::memcpy(at, at - sizeof(Packed0115), sizeof(Packed0115));
++        for (std::uint32_t i = 1u; i < join; ++i) std::memcpy(at + i * sizeof(Packed0115), bytes, sizeof(Packed0115));
++    }
++    const std::uint32_t first_vertex = static_cast<std::uint32_t>(padded / sizeof(Packed0115) + join);
+     const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
+     s.packed.insert(s.packed.end(), bytes, bytes + packed_vertices.size());
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+@@ -2935,6 +3040,8 @@
+     batch.logical_draw_count = std::max<std::uint32_t>(1u, transform.logical_prim_batches);
+     batch.hardware_transform = true;
+     batch.packed = true;
++    batch.strip_run = strip_run;
++    batch.strip_join = static_cast<std::uint8_t>(join);
+     batch.feedback_address = draw.texture_address & 0x001FFFF0u;
+     batch.framebuffer_feedback = draw.texture_enabled && is_target(s, batch.feedback_address);
+     s.report.game_draw_calls += batch.logical_draw_count;
+@@ -2955,7 +3062,13 @@
+     const bool indexed = !triangle_indices.empty();
+     const std::size_t emitted = indexed ? triangle_indices.size() : vertex_count;
+     if (emitted == 0u || (transform.primitive == 4u ? emitted < 3u : (emitted % 3u) != 0u)) return true;
+-    if (s.packed.size() + raw_vertices.size() > kMaxFrameVertices * sizeof(Packed0115) || vertex_count > 65536u) {
++    // As the packed path: a strip in stream order may get the vertices
++    // joining it to the previous batch's strip (same layout and state, ending
++    // where this one starts); at most three more vertices.
++    const bool strip_run = transform.primitive == 4u && s.render.strip_runs && s.render.strips &&
++                           (!indexed || identity_indices(triangle_indices, vertex_count));
++    if (s.packed.size() + raw_vertices.size() + (strip_run ? 3u * layout.stride : 0u) >
++            kMaxFrameVertices * sizeof(Packed0115) || vertex_count > 65536u) {
+         ++s.report.game_vertex_overflows;
+         return true;
+     }
+@@ -2976,10 +3089,22 @@
+     if (layout.color_type == 7u) alignment = 4u;
+     else if (layout.color_type >= 4u) alignment = std::max(alignment, 2u);
+     const std::size_t padded = (s.packed.size() + alignment - 1u) & ~static_cast<std::size_t>(alignment - 1u);
+-    s.packed.resize(padded);
+-    const std::uint32_t first_vertex = static_cast<std::uint32_t>(padded);
+-    const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
+     const auto *bytes = reinterpret_cast<const std::uint8_t *>(raw_vertices.data());
++    std::uint32_t join = 0u;
++    if (strip_run && !state_changed && !s.batches.empty()) {
++        const Batch &previous = s.batches.back();
++        if (previous.strip_run && previous.raw && previous.raw_layout == layout && padded == s.packed.size() &&
++            previous.first_vertex + static_cast<std::size_t>(previous.vertex_count) * layout.stride == padded)
++            join = 2u + (previous.vertex_count & 1u);
++    }
++    s.packed.resize(padded + static_cast<std::size_t>(join) * layout.stride);
++    if (join != 0u) {
++        std::uint8_t *at = s.packed.data() + padded;
++        std::memcpy(at, at - layout.stride, layout.stride);
++        for (std::uint32_t i = 1u; i < join; ++i) std::memcpy(at + i * layout.stride, bytes, layout.stride);
++    }
++    const std::uint32_t first_vertex = static_cast<std::uint32_t>(padded + join * layout.stride);
++    const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
+     s.packed.insert(s.packed.end(), bytes, bytes + raw_vertices.size());
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+     if (state_changed || s.raw_states.empty()) s.raw_states.push_back(raw_state);
+@@ -2996,6 +3121,8 @@
+     batch.raw = true;
+     batch.raw_layout = layout;
+     batch.raw_state = static_cast<std::uint32_t>(s.raw_states.size() - 1u);
++    batch.strip_run = strip_run;
++    batch.strip_join = static_cast<std::uint8_t>(join);
+     batch.feedback_address = draw.texture_address & 0x001FFFF0u;
+     batch.framebuffer_feedback = draw.texture_enabled && is_target(s, batch.feedback_address);
+     s.report.game_draw_calls += batch.logical_draw_count;

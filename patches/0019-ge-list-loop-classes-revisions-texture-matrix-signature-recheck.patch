@@ -1,0 +1,124 @@
+diff --git a/lcs/host/lcs_ge_exec.cpp b/lcs/host/lcs_ge_exec.cpp
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -22,6 +22,29 @@
+ 
+ constexpr std::uint32_t kMaxCommands = 2'000'000u;
+ 
++// Per-command class bits: most words are plain register writes and take the
++// short path. Bit 1: handled by the switch below. Bit 2: a matrix/morph word
++// (0x2A-0x41, texture matrix included). Bit 4: lighting or material state.
++// Bit 8: anything the hardware transform is built from (matrices, viewport,
++// depth clip, cull, fog range).
++constexpr std::uint8_t kSwitch = 1u, kMatrix = 2u, kLighting = 4u, kTransform = 8u;
++constexpr std::array<std::uint8_t, 256> kCommandClass = [] {
++    std::array<std::uint8_t, 256> c{};
++    for (std::uint32_t op : {0x01u, 0x02u, 0x04u, 0x08u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Fu, 0x10u, 0x13u}) c[op] |= kSwitch;
++    for (std::uint32_t op = 0x2Au; op <= 0x41u; ++op) c[op] |= kMatrix;
++    for (std::uint32_t op = 0x3Au; op <= 0x3Fu; ++op) c[op] |= kTransform;
++    for (std::uint32_t op = 0x42u; op <= 0x4Du; ++op) c[op] |= kTransform;
++    for (std::uint32_t op : {0x1Cu, 0x1Du, 0x9Bu, 0xCDu, 0xCEu}) c[op] |= kTransform;
++    for (std::uint32_t op = 0x17u; op <= 0x1Bu; ++op) c[op] |= kLighting;
++    for (std::uint32_t op = 0x50u; op <= 0x5Du; ++op) c[op] |= kLighting;
++    for (std::uint32_t op = 0x5Fu; op <= 0x9Au; ++op) c[op] |= kLighting;
++    return c;
++}();
++// Bumped when a register of that group is written; render_ge_primitive's
++// lighting and transform caches compare them. Start at 1: 0 means "no cache".
++std::uint64_t ge_lighting_revision = 1u;
++std::uint64_t ge_transform_revision = 1u;
++
+ std::uint32_t relative_address(std::uint32_t data24) {
+     const std::uint32_t extended = ((ge_base_register & 0x000F0000u) << 8u) | (data24 & 0x00FFFFFFu);
+     return (ge_offset_address + extended) & 0x0FFFFFFFu;
+@@ -84,10 +107,13 @@
+         const std::uint32_t command = word >> 24u;
+         const std::uint32_t data = word & 0x00FFFFFFu;
+         ge_commands[command] = data;
++        const std::uint8_t cls = kCommandClass[command];
++        if (cls == 0u) continue;
++        if (cls & kMatrix) update_ge_transform_state(ge_transform, command, data);
++        if (cls & kLighting) ++ge_lighting_revision;
++        if (cls & kTransform) ++ge_transform_revision;
++        if (!(cls & kSwitch)) continue;
+ 
+-        if (command >= 0x2Au && command <= 0x3Fu)
+-            update_ge_transform_state(ge_transform, command, data);
+-
+         switch (command) {
+         case 0x00u:
+             break;
+@@ -127,7 +153,8 @@
+             std::string error;
+             lcs_set_ge_command(op_pc);
+             if (!render_ge_primitive(memory, ge_commands, ge_transform, ge_vertex_address,
+-                                     ge_index_address, data, stats, error)) {
++                                     ge_index_address, data, stats, error, 1u, 0u,
++                                     ge_transform_revision, ge_lighting_revision)) {
+                 flush_ge_deferred_rasterization(memory);
+                 return;
+             }
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -4182,12 +4182,16 @@
+     // The model-to-clip transform for this draw (two 4x4 products and a dozen
+     // float24 decodes): built once here and reused by the hardware path below
+     // unless that path needs the world-space or generated-UV variant.
+-    GeGpuHardwareTransform plain_hw{};
+-    bool plain_hw_built = false;
++    // Cached across draws while no matrix, viewport, clip, cull or fog-range
++    // register was written (camera_state_revision from the list executor).
++    static thread_local GeGpuHardwareTransform plain_hw{};
++    static thread_local std::uint64_t plain_hw_revision = 0u;
++    bool plain_hw_built = camera_state_revision != 0u && plain_hw_revision == camera_state_revision;
+     const auto plain_transform = [&]() -> const GeGpuHardwareTransform & {
+         if (!plain_hw_built) {
+             plain_hw = build_gpu_hardware_transform(commands, transform, false, false);
+             plain_hw_built = true;
++            plain_hw_revision = camera_state_revision;
+         }
+         return plain_hw;
+     };
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -2050,6 +2050,19 @@
+     ++s.report.staged_draw_calls;
+     s.report.staged_vertices += vertices.size();
+     return true;
++}
++
++// A texture's guest bytes are re-hashed every kTextureRecheckFrames frames
++// (LCS_GLES_TEXTURE_RECHECK; 1 = every frame as before): hashing every texture
++// every frame was 3.6% of the GE thread, and a texture the game rewrites in
++// place shows up at most that many frames late.
++std::uint64_t texture_recheck_frames() noexcept {
++    static const std::uint64_t frames = [] {
++        const char *text = std::getenv("LCS_GLES_TEXTURE_RECHECK");
++        const unsigned long value = text != nullptr && *text != '\0' ? std::strtoul(text, nullptr, 10) : 4ul;
++        return static_cast<std::uint64_t>(std::clamp<unsigned long>(value, 1ul, 60ul));
++    }();
++    return frames;
+ }
+ 
+ bool ge_gpu_backend_texture_needed(const GeGpuDrawDescriptor &draw) noexcept {
+@@ -2063,7 +2076,8 @@
+     ++s.report.texture_decode_requests;
+     TextureInfo *found = find_texture(s, texture_key(draw));
+     if (found == nullptr) return true;
+-    found->signature_epoch = s.frame_epoch;
++    // Only a signature computed this frame counts as a check.
++    if (draw.texture_content_signature != 0u) found->signature_epoch = s.frame_epoch;
+     found->last_used_epoch = s.frame_epoch;
+     if (draw.texture_content_signature != 0u &&
+         found->descriptor.texture_content_signature != draw.texture_content_signature)
+@@ -2089,7 +2103,7 @@
+         return false;
+     if (is_target(s, draw.texture_address)) return false;
+     const TextureInfo *found = find_texture(s, texture_key(draw));
+-    return found == nullptr || found->signature_epoch != s.frame_epoch;
++    return found == nullptr || found->signature_epoch + texture_recheck_frames() <= s.frame_epoch;
+ }
+ 
+ bool ge_gpu_backend_is_framebuffer_feedback_texture(const GeGpuDrawDescriptor &draw) noexcept {

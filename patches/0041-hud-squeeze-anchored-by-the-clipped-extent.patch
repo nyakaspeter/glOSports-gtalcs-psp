@@ -1,0 +1,19 @@
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -5221,7 +5221,15 @@
+             const float height = static_cast<float>(logical_height);
+             float min_y = height;
+             for (const Vertex &vertex : vertices) min_y = std::min(min_y, vertex.y);
+-            const bool bottom = min_y + max_y > height;  // element's centre below the middle
++            // The centre of what the scissor lets through decides the edge.
++            // Radar tiles are rotated quads far larger than the radar,
++            // clipped to it; by their whole extent some centred above the
++            // middle and were squeezed towards the top (seen in VCS, the same
++            // engine: a strip of the map above the circle).
++            const float visible_min_y = std::max(min_y, static_cast<float>(setup.scissor_y0));
++            const float visible_max_y = std::min(max_y, static_cast<float>(setup.scissor_y1 + 1));
++            const bool bottom = visible_min_y <= visible_max_y ? visible_min_y + visible_max_y > height
++                                                               : min_y + max_y > height;
+             const auto squeeze = [&](float y) {
+                 return bottom ? height - (height - y) * hud.shrink : y * hud.shrink;
+             };

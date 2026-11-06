@@ -1,0 +1,1036 @@
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -49,6 +49,7 @@
+     Delayed,
+     Completed,
+     IoDeferred,
++    HostWait,  // parked until a host worker delivers (sceAtracDecodeData)
+ };
+ 
+ struct ThreadRecord {
+@@ -668,22 +669,25 @@
+ 
+ constexpr std::uint32_t kAtracOutputChannels = 2u;
+ 
+-void close_atrac_decoder(AtracContextState &state) {
+-    state.decoder.close();
+-    state.decoder_eof = false;
++std::uint64_t atrac_open_position(const AtracContextState &state) {
++    std::uint64_t seek = state.sample_position;
++    if (state.header.total_samples != 0u && seek > state.header.total_samples)
++        seek = state.header.total_samples;
++    return seek;
+ }
+ 
+-bool open_atrac_decoder(AtracContextState &state) {
++bool open_atrac_decoder(AtracContextState &state, std::uint64_t seek) {
+     if (state.decoder.is_open()) return true;
+     if (state.source_path.empty()) return false;
+-    std::uint64_t seek = state.sample_position;
+-    if (state.header.total_samples != 0u && seek > state.header.total_samples)
+-        seek = state.header.total_samples;
+     if (!state.decoder.open(state.source_path, state.header.sample_rate,
+                             kAtracOutputChannels, seek))
+         return false;
+     state.decoder_eof = false;
+     return true;
++}
++
++bool open_atrac_decoder(AtracContextState &state) {
++    return open_atrac_decoder(state, atrac_open_position(state));
+ }
+ 
+ std::size_t read_atrac_pcm(AtracContextState &state, std::span<std::uint8_t> output) {
+@@ -695,8 +699,243 @@
+ 
+ std::uint32_t atrac_samples_per_frame(const AtracContextState &state) {
+     return state.header.atrac3plus ? 2048u : 1024u;
++}
++
++// sceAtracDecodeData's arguments, kept while its guest thread is parked.
++struct AtracDecodeRequest {
++    std::uint32_t id{};
++    std::uint32_t output{};
++    std::uint32_t samples_addr{};
++    std::uint32_t finish_addr{};
++    std::uint32_t remain_addr{};
++};
++
++struct AtracGuestWait {
++    psprecomp::Runtime *runtime{};
++    AtracDecodeRequest request{};
++};
++
++// Threads in ThreadState::HostWait by uid, and a bit per context one waits on.
++std::unordered_map<std::int32_t, AtracGuestWait> atrac_guest_waits;
++std::uint32_t atrac_wait_mask{};
++
++void atrac_refresh_wait_mask() {
++    atrac_wait_mask = 0u;
++    for (const auto &[uid, wait] : atrac_guest_waits) {
++        (void)uid;
++        atrac_wait_mask |= 1u << wait.request.id;
++    }
++}
++
++// LCS_ATRAC_WORKER=0 decodes on the game thread as before.
++bool atrac_worker_enabled() {
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_ATRAC_WORKER");
++        return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
++    }();
++    return enabled;
++}
++
++// LCS_ATRAC_WORKER: a persistent worker owns the decoders and keeps a ring of
++// decoded frames per context that sceAtracDecodeData pops from.  The ring is
++// only empty right after the decoder was (re)opened; the guest thread is then
++// parked (ThreadState::HostWait) until the worker has the frame.
++constexpr std::size_t kAtracRingFrames = 3u;
++
++// Guarded by atrac_worker.mutex.
++struct AtracPrefetchRing {
++    bool wanted{};  // keep decoding; cleared by atrac_prefetch_close
++    std::uint64_t seek{};
++    std::size_t frame_bytes{};
++    std::array<std::vector<std::uint8_t>, kAtracRingFrames> frames{};
++    std::array<std::size_t, kAtracRingFrames> sizes{};
++    std::size_t head{};
++    std::size_t count{};
++    bool eof{};
++};
++
++struct AtracWorker {
++    std::mutex mutex;
++    std::condition_variable cv;        // the worker: work arrived, or stop
++    std::condition_variable ready_cv;  // the game thread: a frame arrived
++    std::thread thread;
++    std::array<AtracPrefetchRing, 6> rings{};
++    int busy_context{-1};
++    bool stop{};
++    bool started{};
++    // Bit per context with a frame (or the end of its stream) to pop; the
++    // game thread polls it without the mutex.
++    std::atomic<std::uint32_t> ready_mask{0u};
++};
++AtracWorker atrac_worker;
++
++std::uint32_t atrac_context_index(const AtracContextState &state) {
++    return static_cast<std::uint32_t>(&state - atrac_contexts.data());
++}
++
++bool atrac_worker_pick(std::uint32_t &id) {
++    for (std::uint32_t index = 0u; index < atrac_worker.rings.size(); ++index) {
++        const AtracPrefetchRing &ring = atrac_worker.rings[index];
++        if (ring.wanted && !ring.eof && ring.count < kAtracRingFrames) {
++            id = index;
++            return true;
++        }
++    }
++    return false;
++}
++
++void atrac_worker_main() {
++    name_host_thread("lcs-atrac");
++    for (;;) {
++        std::uint32_t id = 0u;
++        std::size_t slot = 0u;
++        std::size_t frame_bytes = 0u;
++        std::uint64_t seek = 0u;
++        {
++            std::unique_lock lock(atrac_worker.mutex);
++            atrac_worker.cv.wait(lock, [&id] { return atrac_worker.stop || atrac_worker_pick(id); });
++            if (atrac_worker.stop) break;
++            const AtracPrefetchRing &ring = atrac_worker.rings[id];
++            slot = (ring.head + ring.count) % kAtracRingFrames;
++            frame_bytes = ring.frame_bytes;
++            seek = ring.seek;
++            atrac_worker.busy_context = static_cast<int>(id);
++        }
++        AtracContextState &state = atrac_contexts[id];
++        std::vector<std::uint8_t> &frame = atrac_worker.rings[id].frames[slot];
++        frame.resize(frame_bytes);
++        const bool opened = open_atrac_decoder(state, seek);
++        const std::size_t got = opened ? state.decoder.read(frame) : 0u;
++        {
++            std::lock_guard lock(atrac_worker.mutex);
++            AtracPrefetchRing &ring = atrac_worker.rings[id];
++            atrac_worker.busy_context = -1;
++            if (ring.wanted) {  // not closed meanwhile
++                ring.sizes[slot] = got;
++                ++ring.count;
++                if (!opened || got < frame_bytes) {
++                    ring.eof = true;
++                    state.decoder_eof = true;
++                }
++                atrac_worker.ready_mask.fetch_or(1u << id, std::memory_order_release);
++            }
++        }
++        atrac_worker.cv.notify_all();
++        atrac_worker.ready_cv.notify_all();
++    }
+ }
+ 
++// Game thread: keep this context's ring filled from its current position.
++void atrac_prefetch_request(AtracContextState &state) {
++    const std::uint32_t id = atrac_context_index(state);
++    {
++        std::lock_guard lock(atrac_worker.mutex);
++        if (!atrac_worker.started) {
++            atrac_worker.started = true;
++            atrac_worker.stop = false;
++            atrac_worker.thread = std::thread(&atrac_worker_main);
++        }
++        AtracPrefetchRing &ring = atrac_worker.rings[id];
++        if (ring.wanted) return;
++        ring.wanted = true;
++        ring.seek = atrac_open_position(state);
++        ring.frame_bytes =
++            static_cast<std::size_t>(atrac_samples_per_frame(state)) * kAtracOutputChannels * 2u;
++    }
++    atrac_worker.cv.notify_all();
++}
++
++// Game thread: stop decoding this context and drop its frames.  The caller
++// then closes the decoder, which the worker no longer touches.
++void atrac_prefetch_close(AtracContextState &state) {
++    const std::uint32_t id = atrac_context_index(state);
++    std::unique_lock lock(atrac_worker.mutex);
++    AtracPrefetchRing &ring = atrac_worker.rings[id];
++    ring.wanted = false;
++    atrac_worker.cv.wait(lock, [id] { return atrac_worker.busy_context != static_cast<int>(id); });
++    ring.head = 0u;
++    ring.count = 0u;
++    ring.eof = false;
++    // A thread parked on this context re-runs its decode step against the
++    // reset state (atrac_poll_guest_waits).
++    if ((atrac_wait_mask & (1u << id)) != 0u) atrac_worker.ready_mask.fetch_or(1u << id);
++}
++
++// Game thread: the next decoded frame, or false while the worker still owes it.
++bool atrac_prefetch_pop(AtracContextState &state, std::span<std::uint8_t> output,
++                        std::size_t &got) {
++    const std::uint32_t id = atrac_context_index(state);
++    const std::uint32_t bit = 1u << id;
++    std::unique_lock lock(atrac_worker.mutex);
++    AtracPrefetchRing &ring = atrac_worker.rings[id];
++    if (ring.count == 0u) {
++        if (!ring.eof) {
++            atrac_worker.ready_mask.fetch_and(~bit);
++            return false;
++        }
++        got = 0u;
++        return true;
++    }
++    got = std::min(ring.sizes[ring.head], output.size());
++    std::memcpy(output.data(), ring.frames[ring.head].data(), got);
++    ring.head = (ring.head + 1u) % kAtracRingFrames;
++    --ring.count;
++    if (ring.count == 0u && !ring.eof) atrac_worker.ready_mask.fetch_and(~bit);
++    lock.unlock();
++    atrac_worker.cv.notify_all();
++    return true;
++}
++
++// Game thread, when the guest thread could not be parked: block until the
++// worker has something for this context.
++void atrac_prefetch_wait(std::uint32_t id) {
++    std::unique_lock lock(atrac_worker.mutex);
++    atrac_worker.ready_cv.wait(lock, [id] {
++        return !atrac_worker.started || atrac_worker.stop ||
++            (atrac_worker.ready_mask.load() & (1u << id)) != 0u;
++    });
++}
++
++void atrac_worker_stop() {
++    std::thread worker;
++    {
++        std::lock_guard lock(atrac_worker.mutex);
++        if (!atrac_worker.started) return;
++        atrac_worker.stop = true;
++        worker = std::move(atrac_worker.thread);
++    }
++    atrac_worker.cv.notify_all();
++    atrac_worker.ready_cv.notify_all();
++    if (worker.joinable()) worker.join();
++    std::lock_guard lock(atrac_worker.mutex);
++    atrac_worker.started = false;
++    atrac_worker.stop = false;
++    atrac_worker.busy_context = -1;
++    atrac_worker.rings = {};
++    atrac_worker.ready_mask.store(0u);
++}
++
++struct AtracWorkerLifetime {
++    ~AtracWorkerLifetime() { atrac_worker_stop(); }
++};
++AtracWorkerLifetime atrac_worker_lifetime;
++
++void close_atrac_decoder(AtracContextState &state) {
++    if (atrac_worker_enabled()) atrac_prefetch_close(state);
++    state.decoder.close();
++    state.decoder_eof = false;
++}
++
++// One frame of PCM; false only with the worker, while the frame is not decoded yet.
++bool atrac_read(AtracContextState &state, std::span<std::uint8_t> output, std::size_t &got) {
++    if (!atrac_worker_enabled()) {
++        got = read_atrac_pcm(state, output);
++        return true;
++    }
++    atrac_prefetch_request(state);
++    return atrac_prefetch_pop(state, output, got);
++}
++
+ std::uint32_t atrac_bitrate_kbps(const AtracContextState &state) {
+     if (state.header.atrac3plus) {
+         const std::uint32_t raw = (static_cast<std::uint32_t>(state.header.block_align) * 352800u) / 1000u;
+@@ -1091,6 +1330,8 @@
+ }
+ 
+ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason);
++void atrac_poll_guest_waits();
++bool atrac_block_for_guest_waits();
+ bool event_flag_matches(const EventFlagRecord &flag, std::uint32_t requested, std::uint32_t mode);
+ void consume_event_flag(EventFlagRecord &flag, std::uint32_t requested, std::uint32_t mode);
+ 
+@@ -1178,6 +1419,7 @@
+     (void)reason;
+     maybe_rearm_umd_stream_flag();
+     promote_expired_delays();
++    atrac_poll_guest_waits();
+     thread_table.continuations.erase(
+         std::remove_if(thread_table.continuations.begin(), thread_table.continuations.end(),
+                        [](const ThreadContinuation &item) {
+@@ -1198,6 +1440,8 @@
+             promote_expired_delays();
+         }
+     }
++    // Only parked threads left: wait for the worker instead of deadlocking.
++    while (thread_table.continuations.empty() && atrac_block_for_guest_waits()) {}
+     if (thread_table.continuations.empty()) return false;
+ 
+     const auto selected = best_ready_thread();
+@@ -1358,6 +1602,9 @@
+         (void)target_uid;
+         waiters.erase(std::remove_if(waiters.begin(), waiters.end(),
+             [uid](const ThreadContinuation &waiter) { return waiter.uid == uid; }), waiters.end());
++    }
++    if (atrac_guest_waits.erase(uid) != 0u) {
++        atrac_refresh_wait_mask();
+     }
+     std::erase_if(thread_table.thread_end_waiters,
+                   [](const auto &entry) { return entry.second.empty(); });
+@@ -1612,9 +1859,145 @@
+     deferred_io_resumes[worker_uid] =
+         DeferredIoResume{thread_table.current_uid, ctx.pc, ctx.pc};
+     refresh_lcs_post_dispatch_hook();
++    return true;
++}
++
++constexpr std::uint32_t kAtracErrorApiFail = 0x80630002u;
++constexpr std::uint32_t kAtracErrorNoId = 0x80630003u;
++constexpr std::uint32_t kAtracErrorBadId = 0x80630005u;
++constexpr std::uint32_t kAtracErrorUnknownFormat = 0x80630006u;
++constexpr std::uint32_t kAtracErrorAllDataLoaded = 0x80630009u;
++constexpr std::uint32_t kAtracErrorIncorrectReadSize = 0x80630013u;
++constexpr std::uint32_t kAtracErrorBadAddress = 0x800200D3u;
++
++enum class AtracDecodeResult { Done, Wait };
++
++// sceAtracDecodeData past its argument checks.  Wait: the worker has not
++// decoded the frame yet; the caller parks the guest thread and the step runs
++// again, on the game thread against the parked context, once it has.
++AtracDecodeResult atrac_decode_step(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx,
++                                    const AtracDecodeRequest &request) {
++    AtracContextState *state = request.id < atrac_contexts.size() &&
++        atrac_contexts[request.id].allocated ? &atrac_contexts[request.id] : nullptr;
++    if (!state) { ctx.set_gpr(2, kAtracErrorBadId); return AtracDecodeResult::Done; }
++    if (state->source_path.empty()) {
++        state->internal_error = kAtracErrorUnknownFormat;
++        ctx.set_gpr(2, kAtracErrorApiFail);
++        return AtracDecodeResult::Done;
++    }
++    const std::uint32_t max_samples = atrac_samples_per_frame(*state);
++    auto restart_for_loop = [&]() -> bool {
++        if (state->loop_num == 0) return false;
++        if (state->header.loop_start < 0) return false;
++        if (state->loop_num > 0) --state->loop_num;
++        state->sample_position = static_cast<std::uint32_t>(state->header.loop_start);
++        close_atrac_decoder(*state);
++        if (atrac_worker_enabled()) {
++            atrac_prefetch_request(*state);
++            return true;
++        }
++        return open_atrac_decoder(*state);
++    };
++    if (state->sample_position >= state->header.total_samples && !restart_for_loop()) {
++        if (request.samples_addr != 0u) rt.memory().store32(request.samples_addr, 0u);
++        if (request.finish_addr != 0u) rt.memory().store32(request.finish_addr, 1u);
++        if (request.remain_addr != 0u) rt.memory().store32(request.remain_addr, 0u);
++        set_success(ctx);
++        return AtracDecodeResult::Done;
++    }
++    const std::uint32_t requested_samples = static_cast<std::uint32_t>(std::min<std::uint64_t>(
++        max_samples, state->header.total_samples - state->sample_position));
++    static std::vector<std::uint8_t> pcm;
++    const std::size_t pcm_bytes =
++        static_cast<std::size_t>(requested_samples) * kAtracOutputChannels * 2u;
++    if (pcm.size() < pcm_bytes) pcm.resize(pcm_bytes);
++    const std::span<std::uint8_t> pcm_span(pcm.data(), pcm_bytes);
++    std::size_t got = 0u;
++    if (!atrac_read(*state, pcm_span, got)) return AtracDecodeResult::Wait;
++    if (got == 0u && restart_for_loop() && !atrac_read(*state, pcm_span, got))
++        return AtracDecodeResult::Wait;
++    const std::size_t bytes_per_sample = static_cast<std::size_t>(kAtracOutputChannels) * 2u;
++    const std::uint32_t samples = static_cast<std::uint32_t>(got / bytes_per_sample);
++    got = static_cast<std::size_t>(samples) * bytes_per_sample;
++    if (request.output != 0u && got != 0u)
++        rt.memory().copy_in(request.output, std::span<const std::uint8_t>(pcm.data(), got));
++    state->sample_position += samples;
++    if (state->buffered_encoded_bytes >= state->header.block_align)
++        state->buffered_encoded_bytes -= state->header.block_align;
++    else
++        state->buffered_encoded_bytes = 0u;
++    const bool finished = samples == 0u ||
++        (state->sample_position >= state->header.total_samples && state->loop_num == 0);
++    const std::uint32_t remaining_frames = state->header.block_align == 0u ? 0u :
++        state->buffered_encoded_bytes / state->header.block_align;
++    if (request.samples_addr != 0u) rt.memory().store32(request.samples_addr, samples);
++    if (request.finish_addr != 0u) rt.memory().store32(request.finish_addr, finished ? 1u : 0u);
++    if (request.remain_addr != 0u) rt.memory().store32(request.remain_addr, remaining_frames);
++    set_success(ctx);
++    return AtracDecodeResult::Done;
++}
++
++// Game thread: resume the parked threads whose frame the worker delivered (or
++// whose context was reset: the step then answers from the new state).
++void atrac_poll_guest_waits() {
++    if (atrac_wait_mask == 0u) return;
++    const std::uint32_t ready = atrac_worker.ready_mask.load(std::memory_order_acquire);
++    if ((ready & atrac_wait_mask) == 0u) return;
++    for (auto it = atrac_guest_waits.begin(); it != atrac_guest_waits.end();) {
++        const auto thread = thread_table.threads.find(it->first);
++        if (thread == thread_table.threads.end() || thread->second.state != ThreadState::HostWait) {
++            it = atrac_guest_waits.erase(it);
++            continue;
++        }
++        if ((ready & (1u << it->second.request.id)) == 0u ||
++            atrac_decode_step(*it->second.runtime, thread->second.suspended_context,
++                              it->second.request) == AtracDecodeResult::Wait) {
++            ++it;
++            continue;
++        }
++        enqueue_continuation(it->first, thread->second.suspended_context);
++        it = atrac_guest_waits.erase(it);
++    }
++    atrac_refresh_wait_mask();
++}
++
++// Game thread with nothing runnable: block on the worker for a parked thread's
++// frame.  False when no thread is parked or the worker is gone.
++bool atrac_block_for_guest_waits() {
++    if (atrac_guest_waits.empty()) return false;
++    {
++        std::unique_lock lock(atrac_worker.mutex);
++        if (!atrac_worker.started || atrac_worker.stop) return false;
++        atrac_worker.ready_cv.wait(lock, [] {
++            return atrac_worker.stop ||
++                (atrac_worker.ready_mask.load(std::memory_order_acquire) & atrac_wait_mask) != 0u;
++        });
++        if (atrac_worker.stop) return false;
++    }
++    atrac_poll_guest_waits();
+     return true;
+ }
+ 
++// Parks the current thread until the worker has its frame; false when the
++// scheduler could not switch away (the caller then waits on the host thread).
++bool atrac_park_current_thread(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx,
++                               const AtracDecodeRequest &request) {
++    const std::int32_t uid = thread_table.current_uid;
++    const auto current = thread_table.threads.find(uid);
++    if (current == thread_table.threads.end()) return false;
++    const psprecomp::AllegrexContext caller = ctx;
++    current->second.state = ThreadState::HostWait;
++    current->second.suspended_context = make_wait_context(ctx);
++    atrac_guest_waits[uid] = AtracGuestWait{&rt, request};
++    atrac_wait_mask |= 1u << request.id;
++    if (activate_next_thread(ctx, "atrac-wait")) return true;
++    atrac_guest_waits.erase(uid);
++    atrac_refresh_wait_mask();
++    current->second.state = ThreadState::Running;
++    ctx = caller;
++    return false;
++}
++
+ std::uint64_t starvation_tick_microseconds = 1u;
+ 
+ double wall_clock_limit_seconds = 0.0;
+@@ -1843,6 +2226,7 @@
+ void lcs_starvation_tick(psprecomp::Runtime &starvation_runtime, psprecomp::AllegrexContext &ctx) {
+     virtual_time_us += starvation_tick_microseconds;
+     promote_expired_delays();
++    atrac_poll_guest_waits();
+ 
+     check_wall_clock_limit(starvation_runtime, 0xFFFu);
+ 
+@@ -1867,6 +2251,11 @@
+     ge_worker_stop();
+ }
+ 
++void audio_worker_shutdown() {
++    atrac_worker_stop();
++    sas_worker_shutdown();
++}
++
+ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start) {
+     thread_table = ThreadTable{};
+     lcs_menu_init(runtime);
+@@ -1907,6 +2296,9 @@
+     general_purpose_io = 0u;
+     savedata_utility = SavedataUtilityState{};
+     ge_worker_stop();
++    atrac_worker_stop();
++    atrac_guest_waits.clear();
++    atrac_wait_mask = 0u;
+     pending_ge_callbacks.clear();
+     mpeg_contexts.clear();
+     for (auto &state : atrac_contexts) close_atrac_decoder(state);
+@@ -3697,14 +4089,6 @@
+             mpeg_contexts.erase(mpeg_out);
+             set_success(ctx);
+         });
+-
+-    constexpr std::uint32_t kAtracErrorApiFail = 0x80630002u;
+-    constexpr std::uint32_t kAtracErrorNoId = 0x80630003u;
+-    constexpr std::uint32_t kAtracErrorBadId = 0x80630005u;
+-    constexpr std::uint32_t kAtracErrorUnknownFormat = 0x80630006u;
+-    constexpr std::uint32_t kAtracErrorAllDataLoaded = 0x80630009u;
+-    constexpr std::uint32_t kAtracErrorIncorrectReadSize = 0x80630013u;
+-    constexpr std::uint32_t kAtracErrorBadAddress = 0x800200D3u;
+ 
+     const auto get_atrac = [](std::uint32_t id) -> AtracContextState * {
+         if (id >= atrac_contexts.size() || !atrac_contexts[id].allocated) return nullptr;
+@@ -3821,52 +4205,11 @@
+             if (output != 0u && !rt.memory().contains(output, max_bytes)) {
+                 ctx.set_gpr(2, kAtracErrorBadAddress); return;
+             }
+-            if (state->source_path.empty()) {
+-                state->internal_error = kAtracErrorUnknownFormat;
+-                ctx.set_gpr(2, kAtracErrorApiFail); return;
+-            }
+-            auto restart_for_loop = [&]() -> bool {
+-                if (state->loop_num == 0) return false;
+-                if (state->header.loop_start < 0) return false;
+-                if (state->loop_num > 0) --state->loop_num;
+-                state->sample_position = static_cast<std::uint32_t>(state->header.loop_start);
+-                close_atrac_decoder(*state);
+-                return open_atrac_decoder(*state);
+-            };
+-            if (state->sample_position >= state->header.total_samples && !restart_for_loop()) {
+-                if (samples_addr != 0u) rt.memory().store32(samples_addr, 0u);
+-                if (finish_addr != 0u) rt.memory().store32(finish_addr, 1u);
+-                if (remain_addr != 0u) rt.memory().store32(remain_addr, 0u);
+-                set_success(ctx);
+-                return;
++            const AtracDecodeRequest request{ctx.gpr[4], output, samples_addr, finish_addr, remain_addr};
++            while (atrac_decode_step(rt, ctx, request) == AtracDecodeResult::Wait) {
++                if (atrac_park_current_thread(rt, ctx, request)) return;
++                atrac_prefetch_wait(request.id);
+             }
+-            const std::uint32_t requested_samples = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+-                max_samples, state->header.total_samples - state->sample_position));
+-            static std::vector<std::uint8_t> pcm;
+-            const std::size_t pcm_bytes =
+-                static_cast<std::size_t>(requested_samples) * kAtracOutputChannels * 2u;
+-            if (pcm.size() < pcm_bytes) pcm.resize(pcm_bytes);
+-            const std::span<std::uint8_t> pcm_span(pcm.data(), pcm_bytes);
+-            std::size_t got = read_atrac_pcm(*state, pcm_span);
+-            if (got == 0u && restart_for_loop()) got = read_atrac_pcm(*state, pcm_span);
+-            const std::size_t bytes_per_sample = static_cast<std::size_t>(kAtracOutputChannels) * 2u;
+-            const std::uint32_t samples = static_cast<std::uint32_t>(got / bytes_per_sample);
+-            got = static_cast<std::size_t>(samples) * bytes_per_sample;
+-            if (output != 0u && got != 0u)
+-                rt.memory().copy_in(output, std::span<const std::uint8_t>(pcm.data(), got));
+-            state->sample_position += samples;
+-            if (state->buffered_encoded_bytes >= state->header.block_align)
+-                state->buffered_encoded_bytes -= state->header.block_align;
+-            else
+-                state->buffered_encoded_bytes = 0u;
+-            const bool finished = samples == 0u ||
+-                (state->sample_position >= state->header.total_samples && state->loop_num == 0);
+-            const std::uint32_t remaining_frames = state->header.block_align == 0u ? 0u :
+-                state->buffered_encoded_bytes / state->header.block_align;
+-            if (samples_addr != 0u) rt.memory().store32(samples_addr, samples);
+-            if (finish_addr != 0u) rt.memory().store32(finish_addr, finished ? 1u : 0u);
+-            if (remain_addr != 0u) rt.memory().store32(remain_addr, remaining_frames);
+-            set_success(ctx);
+         });
+ 
+     runtime.register_hle("sceAtrac3plus", 0x9AE849A7u,
+@@ -4081,13 +4424,27 @@
+         const std::uint64_t start_us = audio_queue_buffer(state, frames);
+         if (buffer != 0u && frames != 0u &&
+             rt.memory().contains(buffer, samples * sizeof(std::int16_t))) {
+-            std::vector<std::int16_t> pcm(samples);
+-            for (std::size_t index = 0; index < samples; ++index) {
+-                pcm[index] = static_cast<std::int16_t>(
+-                    rt.memory().load16(buffer + static_cast<std::uint32_t>(index * 2u)));
++            const std::uint8_t *raw = sas_worker_enabled()
++                ? rt.memory().raw_pointer(buffer, samples * sizeof(std::int16_t)) : nullptr;
++            if (sas_worker_attach_output(buffer, frames, stereo, left, right, channel, start_us,
++                                         virtual_time_us)) {
++                // The SAS worker submits the block once it has mixed the buffer.
++            } else if (raw != nullptr) {
++                // One copy of the little-endian samples instead of a load16 each.
++                static std::vector<std::int16_t> pcm;
++                pcm.resize(samples);
++                std::memcpy(pcm.data(), raw, samples * sizeof(std::int16_t));
++                audio_output_submit(pcm, frames, stereo, left, right, 44100u, channel, start_us,
++                                    virtual_time_us);
++            } else {
++                std::vector<std::int16_t> pcm(samples);
++                for (std::size_t index = 0; index < samples; ++index) {
++                    pcm[index] = static_cast<std::int16_t>(
++                        rt.memory().load16(buffer + static_cast<std::uint32_t>(index * 2u)));
++                }
++                audio_output_submit(pcm, frames, stereo, left, right, 44100u, channel, start_us,
++                                    virtual_time_us);
+             }
+-            audio_output_submit(pcm, frames, stereo, left, right, 44100u, channel, start_us,
+-                                virtual_time_us);
+         }
+         const std::uint64_t wait_us = start_us > virtual_time_us ? start_us - virtual_time_us : 0u;
+         if (blocking) {
+--- a/lcs/host/lcs_profile.hpp
++++ b/lcs/host/lcs_profile.hpp
+@@ -9,4 +9,7 @@
+ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start);
+ void set_wall_clock_limit(double seconds);
+ void ge_worker_shutdown();
++// Joins the SAS and ATRAC workers (LCS_SAS_WORKER, LCS_ATRAC_WORKER); call
++// before audio_output_shutdown, the SAS worker submits audio.
++void audio_worker_shutdown();
+ }
+--- a/lcs/host/lcs_sas.cpp
++++ b/lcs/host/lcs_sas.cpp
+@@ -1,12 +1,21 @@
+ #include "lcs_sas.hpp"
++#include "lcs_audio_output.hpp"
+ 
+ #include "psprecomp/common.hpp"
+ 
+ #include <algorithm>
+ #include <array>
++#include <condition_variable>
+ #include <cstdint>
+ #include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <thread>
+ #include <vector>
++#if !defined(_WIN32)
++#include <pthread.h>
++#endif
+ 
+ namespace lcs {
+ namespace {
+@@ -99,6 +108,10 @@
+ };
+ 
+ SasState sas_state{};
++
++// Waits for the SAS worker to finish every queued mix: sas_state is only
++// touched by the game thread once nothing is in flight.
++void sas_drain();
+ 
+ constexpr std::uint32_t kSasErrorInvalidGrain = 0x80420001u;
+ constexpr std::uint32_t kSasErrorInvalidMaxVoices = 0x80420002u;
+@@ -126,6 +139,7 @@
+ }
+ 
+ SasVoiceState *sas_voice(std::uint32_t core, std::int32_t voice, psprecomp::AllegrexContext &ctx) {
++    sas_drain();
+     if (!sas_valid_core(core)) {
+         ctx.set_gpr(2, kSasErrorNotInitialized);
+         return nullptr;
+@@ -561,6 +575,11 @@
+     }
+ }
+ 
++void sas_store_le16(std::uint8_t *destination, std::uint16_t value) noexcept {
++    destination[0] = static_cast<std::uint8_t>(value & 0xFFu);
++    destination[1] = static_cast<std::uint8_t>(value >> 8u);
++}
++
+ void sas_mix_into(psprecomp::Runtime &rt, std::uint32_t output, std::uint32_t frames,
+                   bool include_input = false,
+                   std::uint32_t input_left = 0x1000u,
+@@ -570,6 +589,9 @@
+     static thread_local std::vector<std::int32_t> wet_mix;
+     sas_render_buses(rt.memory(), frames, dry_mix, effect_send);
+     sas_process_effect_send(effect_send, wet_mix, frames);
++    // The worker thread writes through a raw pointer: store16 would also bump
++    // the page generation, a counter the game thread's own stores race with.
++    std::uint8_t *raw = sas_worker_enabled() ? rt.memory().raw_pointer(output, frames * 4u) : nullptr;
+ 
+     for (std::uint32_t frame = 0u; frame < frames; ++frame) {
+         std::int64_t l = 0;
+@@ -590,10 +612,17 @@
+             l += wet_mix[frame * 2u];
+             r += wet_mix[frame * 2u + 1u];
+         }
+-        rt.memory().store16(output + frame * 4u, static_cast<std::uint16_t>(
+-            static_cast<std::int16_t>(std::clamp<std::int64_t>(l, -32768, 32767))));
+-        rt.memory().store16(output + frame * 4u + 2u, static_cast<std::uint16_t>(
+-            static_cast<std::int16_t>(std::clamp<std::int64_t>(r, -32768, 32767))));
++        const auto left = static_cast<std::uint16_t>(
++            static_cast<std::int16_t>(std::clamp<std::int64_t>(l, -32768, 32767)));
++        const auto right = static_cast<std::uint16_t>(
++            static_cast<std::int16_t>(std::clamp<std::int64_t>(r, -32768, 32767)));
++        if (raw != nullptr) {
++            sas_store_le16(raw + frame * 4u, left);
++            sas_store_le16(raw + frame * 4u + 2u, right);
++        } else {
++            rt.memory().store16(output + frame * 4u, left);
++            rt.memory().store16(output + frame * 4u + 2u, right);
++        }
+     }
+ }
+ 
+@@ -601,24 +630,201 @@
+     static thread_local std::vector<std::int32_t> dry_mix;
+     static thread_local std::vector<std::int32_t> effect_send;
+     sas_render_buses(rt.memory(), frames, dry_mix, effect_send);
++    std::uint8_t *raw = sas_worker_enabled() ? rt.memory().raw_pointer(output, frames * 8u) : nullptr;
+     const std::uint32_t left_base = output;
+     const std::uint32_t right_base = output + frames * 2u;
+     const std::uint32_t send_left_base = output + frames * 4u;
+     const std::uint32_t send_right_base = output + frames * 6u;
+     for (std::uint32_t frame = 0u; frame < frames; ++frame) {
+         const auto store = [&](std::uint32_t base, std::int32_t value) {
+-            rt.memory().store16(base + frame * 2u, static_cast<std::uint16_t>(
+-                static_cast<std::int16_t>(std::clamp(value, -32768, 32767))));
++            const auto sample = static_cast<std::uint16_t>(
++                static_cast<std::int16_t>(std::clamp(value, -32768, 32767)));
++            if (raw != nullptr)
++                sas_store_le16(raw + (base - output) + frame * 2u, sample);
++            else
++                rt.memory().store16(base + frame * 2u, sample);
+         };
+         store(left_base, dry_mix[frame * 2u]);
+         store(right_base, dry_mix[frame * 2u + 1u]);
+         store(send_left_base, effect_send[frame * 2u]);
+         store(send_right_base, effect_send[frame * 2u + 1u]);
++    }
++}
++
++// LCS_SAS_WORKER: __sceSasCore queues the mix and returns; a persistent worker
++// renders it into guest memory (the guest never reads that buffer, it only
++// hands it to sceAudioOutput*, see sas_worker_attach_output) and submits the
++// audio block the game thread attached to the job.  Every other sceSas* call
++// drains the queue first, so the worker owns sas_state while a job is queued.
++struct SasSubmission {
++    std::uint32_t buffer{};
++    std::uint32_t frames{};
++    bool stereo{};
++    std::uint32_t left{};
++    std::uint32_t right{};
++    std::uint32_t channel{};
++    std::uint64_t start_time_us{};
++    std::uint64_t now_us{};
++};
++
++struct SasJob {
++    std::uint32_t output{};
++    std::uint32_t frames{};
++    std::uint32_t mode{};
++    std::uint64_t sequence{};
++    std::vector<SasSubmission> submissions;
++
++    [[nodiscard]] bool covers(std::uint32_t begin, std::uint32_t end) const noexcept {
++        const std::uint32_t job_begin = psprecomp::GuestMemory::canonical(output);
++        const std::uint32_t job_end = job_begin + frames * (mode == 0u ? 4u : 8u);
++        return job_begin < end && begin < job_end;
++    }
++};
++
++constexpr std::size_t kSasMaxQueuedJobs = 8u;
++
++struct SasWorker {
++    std::mutex mutex;
++    std::condition_variable cv;
++    std::thread thread;
++    std::deque<SasJob> jobs;
++    SasJob current;
++    bool busy{};
++    bool stop{};
++    bool started{};
++    std::uint64_t next_sequence{1u};
++    psprecomp::Runtime *runtime{};
++};
++SasWorker sas_worker;
++
++void sas_worker_main() {
++    name_host_thread("lcs-sas");
++    std::vector<std::int16_t> pcm;
++    for (;;) {
++        {
++            std::unique_lock lock(sas_worker.mutex);
++            sas_worker.cv.wait(lock, [] { return sas_worker.stop || !sas_worker.jobs.empty(); });
++            if (sas_worker.jobs.empty()) break;
++            sas_worker.current = std::move(sas_worker.jobs.front());
++            sas_worker.jobs.pop_front();
++            sas_worker.busy = true;
++        }
++        psprecomp::Runtime &rt = *sas_worker.runtime;
++        const SasJob &job = sas_worker.current;
++        if (job.mode == 0u)
++            sas_mix_into(rt, job.output, job.frames);
++        else
++            sas_mix_raw(rt, job.output, job.frames);
++        std::vector<SasSubmission> submissions;
++        {
++            std::lock_guard lock(sas_worker.mutex);
++            submissions.swap(sas_worker.current.submissions);
++            sas_worker.busy = false;
++        }
++        sas_worker.cv.notify_all();
++        for (const SasSubmission &item : submissions) {
++            const std::size_t samples = static_cast<std::size_t>(item.frames) * (item.stereo ? 2u : 1u);
++            const std::uint8_t *raw = rt.memory().raw_pointer(item.buffer, samples * sizeof(std::int16_t));
++            if (raw == nullptr) continue;
++            pcm.resize(samples);
++            std::memcpy(pcm.data(), raw, samples * sizeof(std::int16_t));
++            audio_output_submit(pcm, item.frames, item.stereo, item.left, item.right, 44100u,
++                                item.channel, item.start_time_us, item.now_us);
++        }
+     }
++}
++
++void sas_worker_post(psprecomp::Runtime &rt, std::uint32_t output, std::uint32_t frames,
++                     std::uint32_t mode) {
++    {
++        std::unique_lock lock(sas_worker.mutex);
++        if (!sas_worker.started) {
++            sas_worker.started = true;
++            sas_worker.stop = false;
++            sas_worker.runtime = &rt;
++            sas_worker.thread = std::thread(&sas_worker_main);
++        }
++        sas_worker.cv.wait(lock, [] { return sas_worker.jobs.size() < kSasMaxQueuedJobs; });
++        sas_worker.jobs.push_back(SasJob{output, frames, mode, sas_worker.next_sequence++, {}});
++    }
++    sas_worker.cv.notify_all();
++}
++
++void sas_drain() {
++    if (!sas_worker_enabled()) return;
++    std::unique_lock lock(sas_worker.mutex);
++    if (!sas_worker.started) return;
++    sas_worker.cv.wait(lock, [] { return sas_worker.jobs.empty() && !sas_worker.busy; });
++}
++
++void sas_worker_stop() {
++    std::thread worker;
++    {
++        std::lock_guard lock(sas_worker.mutex);
++        if (!sas_worker.started) return;
++        sas_worker.stop = true;
++        worker = std::move(sas_worker.thread);
++    }
++    sas_worker.cv.notify_all();
++    if (worker.joinable()) worker.join();
++    std::lock_guard lock(sas_worker.mutex);
++    sas_worker.started = false;
++    sas_worker.stop = false;
++    sas_worker.busy = false;
++    sas_worker.jobs.clear();
++    sas_worker.current = SasJob{};
++}
++
++struct SasWorkerLifetime {
++    ~SasWorkerLifetime() { sas_worker_stop(); }
++};
++SasWorkerLifetime sas_worker_lifetime;
++
+ }
+ 
++bool sas_worker_enabled() {
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_SAS_WORKER");
++        return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
++    }();
++    return enabled;
+ }
+ 
++bool sas_worker_attach_output(std::uint32_t buffer, std::uint32_t frames, bool stereo,
++                              std::uint32_t left, std::uint32_t right, std::uint32_t channel,
++                              std::uint64_t start_time_us, std::uint64_t now_us) {
++    if (!sas_worker_enabled()) return false;
++    const std::uint32_t begin = psprecomp::GuestMemory::canonical(buffer);
++    const std::uint32_t end = begin + frames * (stereo ? 4u : 2u);
++    std::lock_guard lock(sas_worker.mutex);
++    if (!sas_worker.started) return false;
++    // The last overlapping job completes last; the earlier ones are already
++    // mixed by then, the worker runs them in order.
++    SasJob *target = nullptr;
++    for (auto it = sas_worker.jobs.rbegin(); it != sas_worker.jobs.rend() && target == nullptr; ++it)
++        if (it->covers(begin, end)) target = &*it;
++    if (target == nullptr && sas_worker.busy && sas_worker.current.covers(begin, end))
++        target = &sas_worker.current;
++    if (target == nullptr) return false;
++    target->submissions.push_back(SasSubmission{buffer, frames, stereo, left, right, channel,
++                                                start_time_us, now_us});
++    return true;
++}
++
++void sas_worker_shutdown() {
++    sas_worker_stop();
++}
++
++void name_host_thread(const char *name) {
++#if defined(__linux__)
++    pthread_setname_np(pthread_self(), name);
++#elif defined(__APPLE__)
++    pthread_setname_np(name);
++#else
++    (void)name;
++#endif
++}
++
+ void register_sas_hle(psprecomp::Runtime &runtime) {
+     runtime.register_hle("sceSasCore", 0x42778A9Fu,
+         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+@@ -627,6 +833,7 @@
+             const std::uint32_t max_voices = ctx.gpr[6];
+             const std::uint32_t output_mode = ctx.gpr[7];
+             const std::uint32_t sample_rate = ctx.gpr[8];
++            sas_drain();
+             if ((core & 0x3Fu) != 0u || !rt.memory().contains(core, 64u)) {
+                 ctx.set_gpr(2, kSasErrorBadAddress); return;
+             }
+@@ -820,6 +1027,7 @@
+ 
+     runtime.register_hle("sceSasCore", 0x787D04D5u,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
++            sas_drain();
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             std::uint32_t mask = ctx.gpr[5];
+             const bool pause = ctx.gpr[6] != 0u;
+@@ -830,6 +1038,7 @@
+ 
+     runtime.register_hle("sceSasCore", 0x2C8E6AB3u,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
++            sas_drain();
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             std::uint32_t flags = 0u;
+             for (std::size_t i = 0; i < sas_state.voices.size(); ++i)
+@@ -839,6 +1048,7 @@
+ 
+     runtime.register_hle("sceSasCore", 0x68A46B95u,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
++            sas_drain();
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             std::uint32_t flags = 0u;
+             for (std::size_t i = 0; i < sas_state.voices.size(); ++i)
+@@ -855,6 +1065,7 @@
+ 
+     runtime.register_hle("sceSasCore", 0x33D4AB37u,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
++            sas_drain();
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             const std::int32_t type = static_cast<std::int32_t>(ctx.gpr[5]);
+             if (type < -1 || type > 8) { ctx.set_gpr(2, kSasErrorReverbType); return; }
+@@ -869,6 +1080,7 @@
+ 
+     runtime.register_hle("sceSasCore", 0x267A6DD2u,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
++            sas_drain();
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             const std::int32_t delay = static_cast<std::int32_t>(ctx.gpr[5]);
+             const std::int32_t feedback = static_cast<std::int32_t>(ctx.gpr[6]);
+@@ -879,6 +1091,7 @@
+ 
+     runtime.register_hle("sceSasCore", 0xD5A229C9u,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
++            sas_drain();
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             if (ctx.gpr[5] > 0x1000u || ctx.gpr[6] > 0x1000u) {
+                 ctx.set_gpr(2, kSasErrorReverbVolume); return;
+@@ -888,17 +1101,25 @@
+ 
+     runtime.register_hle("sceSasCore", 0xF983B186u,
+         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
++            sas_drain();
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             sas_state.reverb.dry = ctx.gpr[5] != 0u; sas_state.reverb.wet = ctx.gpr[6] != 0u; set_success(ctx);
+         });
+ 
+     runtime.register_hle("sceSasCore", 0xA3589D81u,
+         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
++            // No drain: the worker never writes the fields validated here, and
++            // the queued mixes read sas_state in order.
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             const std::uint32_t output = ctx.gpr[5];
+             const std::size_t bytes = static_cast<std::size_t>(sas_state.grain_size) *
+                 (sas_state.output_mode == 0u ? 4u : 8u);
+             if (!rt.memory().contains(output, bytes)) { ctx.set_gpr(2, kSasErrorInvalidParameter); return; }
++            if (sas_worker_enabled()) {
++                sas_worker_post(rt, output, sas_state.grain_size, sas_state.output_mode);
++                set_success(ctx);
++                return;
++            }
+             if (sas_state.output_mode == 0u)
+                 sas_mix_into(rt, output, sas_state.grain_size);
+             else
+@@ -908,6 +1129,7 @@
+ 
+     runtime.register_hle("sceSasCore", 0x50A14DFCu,
+         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
++            sas_drain();
+             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+             if (sas_state.output_mode == 1u) { ctx.set_gpr(2, 0x800001FFu); return; }
+             const std::uint32_t inout = ctx.gpr[5];
+--- a/lcs/host/lcs_sas.hpp
++++ b/lcs/host/lcs_sas.hpp
+@@ -1,8 +1,27 @@
+ #pragma once
+ #include "psprecomp/runtime.hpp"
+ 
++#include <cstdint>
++
+ namespace lcs {
+ 
+ void register_sas_hle(psprecomp::Runtime &runtime);
+ 
++// LCS_SAS_WORKER=0 mixes on the game thread as before.
++[[nodiscard]] bool sas_worker_enabled();
++
++// When [buffer, buffer + frames * (stereo ? 4 : 2)) is the output of a SAS mix
++// still in flight on the worker, the worker submits it (audio_output_submit
++// with these arguments) once mixed and this returns true; otherwise the caller
++// submits the buffer itself.
++bool sas_worker_attach_output(std::uint32_t buffer, std::uint32_t frames, bool stereo,
++                              std::uint32_t left, std::uint32_t right, std::uint32_t channel,
++                              std::uint64_t start_time_us, std::uint64_t now_us);
++
++// Finishes the queued mixes and joins the worker; a no-op when it never started.
++void sas_worker_shutdown();
++
++// pthread_setname_np for the calling thread where the platform has it.
++void name_host_thread(const char *name);
++
+ }
+--- a/lcs/host/main.cpp
++++ b/lcs/host/main.cpp
+@@ -112,6 +112,7 @@
+         std::cout << "Running from entry " << psprecomp::hex32(entry) << "\n" << std::flush;
+         runtime.run(entry, max_dispatches);
+         lcs::ge_worker_shutdown();
++        lcs::audio_worker_shutdown();
+ 
+         if (runtime.stopped()) {
+             std::cout << "Runtime stopped: " << runtime.stop_reason() << "\n";

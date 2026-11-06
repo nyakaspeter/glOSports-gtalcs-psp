@@ -1,0 +1,61 @@
+diff --git a/include/psprecomp/runtime.hpp b/include/psprecomp/runtime.hpp
+--- a/include/psprecomp/runtime.hpp
++++ b/include/psprecomp/runtime.hpp
+@@ -227,14 +227,16 @@
+         // Unwind every still-live native caller without touching another global
+         // generation counter or scheduling from stale guest registers.
+         if (chain_context_invalidated_) {
+-            const std::uint64_t interval = g_runtime_starvation_interval_fast;
+-            if (interval != 0u) ++dispatches_since_import_;
++            if (chain_budget_ != 0u) --chain_budget_;
+             return false;
+         }
+ 
+-        const std::uint64_t starvation_interval = g_runtime_starvation_interval_fast;
+-        if (starvation_interval == 0u) return true;
+-        if (++dispatches_since_import_ < starvation_interval) return true;
++        // One 32-bit countdown instead of a 64-bit counter, a 64-bit global
++        // (a GOT load on PIE) and a 64-bit compare on every fixed cross-unit
++        // call: this is the hottest path in the generated code.
++        if (chain_budget_ == 0u) return true;  // no starvation hook configured
++        if (--chain_budget_ != 0u) return true;
++        chain_budget_ = chain_budget_reload_;
+         return run_starvation_boundary(ctx);
+     }
+ 
+@@ -315,6 +317,9 @@
+     // beginning of each outer Runtime dispatch.
+     bool chain_context_invalidated_{};
+     std::uint64_t dispatches_since_import_{};
++    // Direct-chain countdown to the next starvation boundary (0: no hook).
++    std::uint32_t chain_budget_{};
++    std::uint32_t chain_budget_reload_{};
+     std::uint64_t chained_dispatches_{};
+     std::uint64_t dispatch_work_count_{};
+     std::unordered_map<std::string, HleLibrary,
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -188,6 +188,10 @@
+     if (g_starvation_hook == nullptr || interval == 0u) return true;
+     // Preserve excess work if a context switch deferred several boundaries.
+     dispatches_since_import_ -= std::min(dispatches_since_import_, interval);
++    // The direct chains count down separately (invoke_chained_direct); the
++    // interval can change after construction, so refresh the reload value.
++    chain_budget_reload_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(interval, 0xFFFFFFFFu));
++    if (chain_budget_ == 0u) chain_budget_ = chain_budget_reload_;
+     const RuntimeExecutionContextToken before = capture_runtime_execution_context();
+     g_starvation_hook(*this, ctx);
+     const bool same_context = runtime_execution_context_matches(before);
+@@ -579,6 +583,11 @@
+     stop_reason_.clear();
+     cpu_.pc = entry;
+     load_counted_pcs();
++    // Arm the direct-chain countdown (invoke_chained_direct) from the
++    // configured scheduler interval; 0 keeps it off when there is no hook.
++    chain_budget_reload_ = static_cast<std::uint32_t>(
++        std::min<std::uint64_t>(g_runtime_starvation_interval_fast, 0xFFFFFFFFu));
++    chain_budget_ = chain_budget_reload_;
+     const bool profile_dispatch = std::getenv("PSPRECOMP_PROFILE_DISPATCH") != nullptr;
+     const auto parse_environment_u64 = [](const char *name, std::uint64_t fallback = 0u) {
+         const char *text = std::getenv(name);

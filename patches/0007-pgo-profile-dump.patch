@@ -1,0 +1,36 @@
+diff --git a/lcs/host/main.cpp b/lcs/host/main.cpp
+index fb9bf83..bea1140 100644
+--- a/lcs/host/main.cpp
++++ b/lcs/host/main.cpp
+@@ -9,6 +9,10 @@
+ #include "lcs_render_config.hpp"
+ 
+ #include <algorithm>
++#include <csignal>
++#if !defined(_WIN32)
++#include <unistd.h>
++#endif
+ #include <cstdint>
+ #include <cstdlib>
+ #include <filesystem>
+@@ -21,7 +25,20 @@ void register_generated_functions(Runtime &runtime);
+ } // namespace psprecomp
+ #endif
+ 
++#if defined(LCS_PGO_GENERATE)
++// Instrumented builds (PGO=generate) only write their profile on a normal
++// exit, and the game has no quit: SIGUSR1 writes it and exits.
++extern "C" void __gcov_dump(void);
++static void dump_profile_and_exit(int) {
++    __gcov_dump();
++    _exit(0);
++}
++#endif
++
+ int main(int argc, char **argv) {
++#if defined(LCS_PGO_GENERATE)
++    std::signal(SIGUSR1, dump_profile_and_exit);
++#endif
+     std::filesystem::path elf_path = "game/EBOOT.ELF";
+     std::filesystem::path game_root = "game";
+     std::uint64_t max_dispatches = std::numeric_limits<std::uint64_t>::max();

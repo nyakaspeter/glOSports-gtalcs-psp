@@ -1,0 +1,640 @@
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -38,6 +38,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <condition_variable>
+@@ -45,6 +46,9 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <deque>
++#include <filesystem>
++#include <fstream>
+ #include <iostream>
+ #include <memory>
+ #include <mutex>
+@@ -191,12 +195,17 @@
+     std::uint32_t logical_height{kReferenceHeight};
+ };
+ 
++struct UploadJob;
++
+ struct TextureUpload {
+     std::uint64_t key{};
+     std::uint32_t width{};
+     std::uint32_t height{};
+     std::uint32_t mip_levels{1u};
+     std::vector<std::byte> rgba8;
++    // LCS_GLES_UPLOAD_THREAD: the upload thread's job (which holds the
++    // pixels; rgba8 is then empty).
++    std::shared_ptr<UploadJob> job;
+ };
+ 
+ // One frame, handed from the GE thread to the render thread.
+@@ -265,12 +274,61 @@
+ struct GlTexture {
+     GLuint id{};
+     std::uint32_t mip_levels{1u};
++    std::uint32_t width{};
++    std::uint32_t height{};
+     bool pot{};
+     // Texture parameters last set on it (GLES 2 has no sampler objects).
+     GLint wrap_s{};
+     GLint wrap_t{};
+     GLint min_filter{};
+     GLint mag_filter{};
++};
++
++// LCS_GLES_UPLOAD_THREAD: a decoded texture handed to the upload thread, which
++// uploads it on its own context (sharing the render context's objects). The
++// render thread adopts the result when the frame that needs it comes; a job
++// the upload thread hasn't started by then it takes over and uploads itself.
++enum UploadJobState : std::uint8_t { JobQueued, JobUploading, JobDone, JobRender };
++struct UploadJob {
++    std::atomic<std::uint8_t> state{JobQueued};
++    TextureUpload upload;
++    GlTexture texture;  // set by the upload thread (JobDone)
++};
++
++// Texture objects freed on the render thread, kept for reuse by shape
++// (LCS_GLES_TEXTURE_POOL): new textures go into them with glTexSubImage2D
++// instead of a new GPU allocation (ARM's driver maps fresh memory for every
++// glTexImage2D). The pixel format is always RGBA8, so the shape is size and
++// level count. Shared with the upload thread, under its own mutex.
++struct PooledTexture {
++    GLuint id{};
++    std::uint32_t width{};
++    std::uint32_t height{};
++    std::uint32_t levels{};
++    std::size_t bytes{};
++    std::uint64_t reusable_at{};  // render frames done: earlier frames may still sample it
++};
++constexpr std::size_t kPoolMaxTextures = 64u;
++constexpr std::size_t kPoolMaxBytes = 8u * 1024u * 1024u;
++constexpr std::uint64_t kPoolReuseFrames = 3u;
++
++// What the render thread shares with the upload thread: the pool, the job
++// queue, and counters for LCS_FPS_LOG.
++struct SharedTextures {
++    bool pool_enabled{};
++    std::mutex pool_mutex;
++    std::deque<PooledTexture> pool;  // oldest first
++    std::size_t pool_bytes{};
++    std::atomic<std::uint64_t> render_frames{};
++    std::atomic<std::uint64_t> pool_hits{};
++    std::atomic<std::uint64_t> allocations{};
++    // The upload thread's queue (GE thread -> upload thread).
++    std::mutex mutex;
++    std::condition_variable cv;       // jobs queued, or stop
++    std::condition_variable done_cv;  // jobs done
++    std::deque<std::shared_ptr<UploadJob>> queue;
++    bool stop{};
++    std::atomic<bool> failed{};  // the upload thread couldn't make its context current
+ };
+ 
+ struct Program {
+@@ -285,11 +343,21 @@
+     std::uint32_t raw_sent_state{};
+ };
+ 
+-// Everything on the render thread; nothing else touches it.
++// Everything on the render thread; nothing else touches it (but `shared`,
++// see SharedTextures).
+ struct RenderState {
+     EGLDisplay display{EGL_NO_DISPLAY};
+     EGLSurface surface{EGL_NO_SURFACE};
+     EGLContext context{EGL_NO_CONTEXT};
++    // LCS_GLES_UPLOAD_THREAD: the upload thread's context (sharing context's
++    // objects) and its pbuffer (none with EGL_KHR_surfaceless_context).
++    EGLContext upload_context{EGL_NO_CONTEXT};
++    EGLSurface upload_surface{EGL_NO_SURFACE};
++    SharedTextures shared;
++    // LCS_GLES_SHADER_WARMUP: the program keys file (empty: off), and set
++    // while the startup compiles them.
++    std::string shader_variants_path;
++    bool warming{};
+     FbdevWindow window{};
+     std::uint32_t screen_width{640u};
+     std::uint32_t screen_height{480u};
+@@ -361,6 +429,11 @@
+     // scissor, program, texture, sampler, fixed state, blend colour, uniforms,
+     // raw state, raw layout, strip/list, index range, first of frame.
+     std::array<std::uint64_t, 13> fps_breaks{};
++    // LCS_FPS_LOG: textures adopted from the upload thread and uploaded here,
++    // and programs compiled, per interval.
++    std::uint64_t fps_thread_uploads{};
++    std::uint64_t fps_render_uploads{};
++    std::uint64_t fps_compiles{};
+ };
+ 
+ // -------------------------------------------------------------- GE side --
+@@ -415,7 +488,9 @@
+     std::vector<std::unique_ptr<Frame>> spare;
+     bool stop{};
+     bool use_transform_thread{};
++    bool use_upload_thread{};
+     std::thread transform_thread;
++    std::thread upload_thread;
+     std::thread render_thread;
+     RenderState render;
+ 
+@@ -958,6 +1033,7 @@
+     }
+     Program &program = r.programs[key];
+     std::string error;
++    if (!r.warming) ++r.fps_compiles;
+     if (!link_program(program, std::string(defines) + kVertexShader,
+                       std::string(defines) + kFragmentShader, error)) {
+         runtime_log_error("gles2 ge program", error);
+@@ -965,7 +1041,44 @@
+         return nullptr;
+     }
+     r.current_program = program.id;
++    if (!r.warming && !r.shader_variants_path.empty()) {
++        // A variant the start-up didn't compile: the next start-up will.
++        if (std::FILE *file = std::fopen(r.shader_variants_path.c_str(), "a")) {
++            std::fprintf(file, "%016llx\n", static_cast<unsigned long long>(key));
++            std::fclose(file);
++        }
++    }
+     return &program;
++}
++
++// LCS_GLES_SHADER_WARMUP: config/shader-variants.txt (next to LCSNative.ini)
++// lists the program keys earlier sessions compiled, one hex key per line;
++// compiled here before the first frame (10-50 ms each in ARM's compiler, a
++// visible hitch when one is first drawn mid-game). Lines that aren't a hex
++// key are skipped.
++std::filesystem::path shader_variants_path() {
++    const LcsConfiguration &config = lcs_render_configuration();
++    const std::filesystem::path directory =
++        !config.source_path.empty() ? config.source_path.parent_path() : config.executable_directory;
++    return directory / "shader-variants.txt";
++}
++
++std::size_t warm_up_programs(RenderState &r) {
++    std::ifstream input(r.shader_variants_path);
++    std::size_t compiled = 0u;
++    std::string line;
++    r.warming = true;
++    while (std::getline(input, line)) {
++        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
++        if (line.empty() || line.size() > 16u ||
++            line.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
++            continue;
++        const std::uint64_t key = std::strtoull(line.c_str(), nullptr, 16);
++        if (r.programs.find(key) != r.programs.end()) continue;
++        if (program_for(r, key) != nullptr) ++compiled;
++    }
++    r.warming = false;
++    return compiled;
+ }
+ 
+ void upload_uniforms(Program &program, const UniformValues &values) {
+@@ -1052,19 +1165,146 @@
+     return out;
+ }
+ 
++// A texture object to the pool (render thread): reusable once the frames that
++// may still sample it are done; the oldest go past the pool's bounds.
++void pool_texture(SharedTextures &t, const GlTexture &texture) {
++    std::size_t bytes = 0u;
++    for (std::uint32_t level = 0u; level < texture.mip_levels; ++level)
++        bytes += static_cast<std::size_t>(std::max(1u, texture.width >> level)) *
++                 std::max(1u, texture.height >> level) * 4u;
++    std::vector<GLuint> evicted;
++    {
++        std::lock_guard<std::mutex> lock(t.pool_mutex);
++        t.pool.push_back({texture.id, texture.width, texture.height, texture.mip_levels, bytes,
++                          t.render_frames.load() + kPoolReuseFrames});
++        t.pool_bytes += bytes;
++        while (t.pool.size() > kPoolMaxTextures || t.pool_bytes > kPoolMaxBytes) {
++            evicted.push_back(t.pool.front().id);
++            t.pool_bytes -= t.pool.front().bytes;
++            t.pool.pop_front();
++        }
++    }
++    if (!evicted.empty()) glDeleteTextures(static_cast<GLsizei>(evicted.size()), evicted.data());
++}
++
++// A pooled texture object of this shape, or 0 (either thread).
++GLuint take_pooled_texture(SharedTextures &t, std::uint32_t width, std::uint32_t height, std::uint32_t levels) {
++    std::lock_guard<std::mutex> lock(t.pool_mutex);
++    const std::uint64_t frames = t.render_frames.load();
++    for (auto it = t.pool.begin(); it != t.pool.end(); ++it) {
++        if (it->width != width || it->height != height || it->levels != levels || it->reusable_at > frames) continue;
++        const GLuint id = it->id;
++        t.pool_bytes -= it->bytes;
++        t.pool.erase(it);
++        return id;
++    }
++    return 0u;
++}
++
+ void delete_texture(RenderState &r, std::uint64_t key) {
+     const auto found = r.textures.find(key);
+     if (found == r.textures.end()) return;
+-    if (found->second.id != 0u) glDeleteTextures(1, &found->second.id);
++    if (found->second.id != 0u) {
++        if (r.shared.pool_enabled) pool_texture(r.shared, found->second);
++        else glDeleteTextures(1, &found->second.id);
++    }
+     r.textures.erase(found);
++}
++
++// Uploads a decoded texture into a new texture object, or with the pool on
++// into a pooled one of its shape (glTexSubImage2D, no GPU allocation), on the
++// calling thread's context (render or upload thread); leaves it bound. Same
++// levels as upload_texture: the game's, then the chain completed to 1x1 (a
++// mipmapped texture is complete). id 0: nothing to upload.
++GlTexture create_texture(SharedTextures &t, const TextureUpload &upload) {
++    GlTexture texture{};
++    const std::size_t base_bytes = static_cast<std::size_t>(upload.width) * upload.height * 4u;
++    if (upload.width == 0u || upload.height == 0u || upload.rgba8.size() < base_bytes) return texture;
++    texture.width = upload.width;
++    texture.height = upload.height;
++    texture.pot = power_of_two(upload.width) && power_of_two(upload.height);
++    const std::uint32_t levels = texture.pot ? upload.mip_levels : 1u;
++    std::uint32_t total = 1u;  // the levels the texture ends up with
++    if (levels > 1u)
++        for (std::uint32_t w = upload.width, h = upload.height; w > 1u || h > 1u; ++total) {
++            w = std::max(1u, w >> 1u);
++            h = std::max(1u, h >> 1u);
++        }
++    if (t.pool_enabled) texture.id = take_pooled_texture(t, upload.width, upload.height, total);
++    const bool allocate = texture.id == 0u;
++    if (allocate) {
++        glGenTextures(1, &texture.id);
++        ++t.allocations;
++    } else {
++        ++t.pool_hits;
++    }
++    glBindTexture(GL_TEXTURE_2D, texture.id);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    const auto level_image = [&](std::uint32_t level, std::uint32_t width, std::uint32_t height, const void *pixels) {
++        if (allocate)
++            glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), GL_RGBA, static_cast<GLsizei>(width),
++                         static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++        else
++            glTexSubImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), 0, 0, static_cast<GLsizei>(width),
++                            static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++    };
++    std::uint32_t width = upload.width;
++    std::uint32_t height = upload.height;
++    std::size_t offset = 0u;
++    std::uint32_t uploaded = 0u;
++    const std::byte *last = nullptr;
++    std::uint32_t last_width = 0u;
++    std::uint32_t last_height = 0u;
++    while (uploaded < levels) {
++        const std::size_t level_bytes = static_cast<std::size_t>(width) * height * 4u;
++        if (offset + level_bytes > upload.rgba8.size()) break;
++        last = upload.rgba8.data() + offset;
++        level_image(uploaded, width, height, last);
++        offset += level_bytes;
++        last_width = width;
++        last_height = height;
++        ++uploaded;
++        if (width == 1u && height == 1u) break;
++        width = std::max(1u, width >> 1u);
++        height = std::max(1u, height >> 1u);
++    }
++    if (levels > 1u) {
++        std::vector<std::byte> generated;
++        while (!(last_width == 1u && last_height == 1u)) {
++            generated = half_size(last, last_width, last_height);
++            last_width = std::max(1u, last_width >> 1u);
++            last_height = std::max(1u, last_height >> 1u);
++            level_image(uploaded, last_width, last_height, generated.data());
++            last = generated.data();
++            ++uploaded;
++        }
++    }
++    texture.mip_levels = uploaded;  // == total
++    return texture;
+ }
+ 
++// A texture uploaded off the frame (create_texture) becomes the key's; the
++// one it replaces goes to the pool or is deleted.
++void adopt_texture(RenderState &r, std::uint64_t key, const GlTexture &texture) {
++    delete_texture(r, key);
++    if (texture.id != 0u) r.textures[key] = texture;
++}
++
+ void upload_texture(RenderState &r, TextureUpload &upload) {
+     if (upload.width == 0u || upload.height == 0u || upload.rgba8.empty()) return;
++    ++r.fps_render_uploads;
++    if (r.shared.pool_enabled) {
++        adopt_texture(r, upload.key, create_texture(r.shared, upload));
++        r.bound_texture = 0xFFFFFFFFu;
++        return;
++    }
+     GlTexture &texture = r.textures[upload.key];
+     texture.pot = power_of_two(upload.width) && power_of_two(upload.height);
+     const std::uint32_t levels = texture.pot ? upload.mip_levels : 1u;
+-    if (texture.id == 0u) glGenTextures(1, &texture.id);
++    if (texture.id == 0u) {
++        glGenTextures(1, &texture.id);
++        ++r.shared.allocations;
++    }
+     texture.wrap_s = texture.wrap_t = texture.min_filter = texture.mag_filter = 0;
+     glBindTexture(GL_TEXTURE_2D, texture.id);
+     r.bound_texture = texture.id;
+@@ -1781,6 +2021,14 @@
+                      r.fps_bytes[2] / frames / 1024.0, r.fps_bytes[3] / frames / 1024.0);
+     r.fps_bytes = {};
+     if (r.log_fps)
++        std::fprintf(stderr, "glos: texture uploads upload-thread %llu render-thread %llu  pool hits %llu allocations %llu  shader compiles %llu\n",
++                     static_cast<unsigned long long>(r.fps_thread_uploads),
++                     static_cast<unsigned long long>(r.fps_render_uploads),
++                     static_cast<unsigned long long>(r.shared.pool_hits.exchange(0u)),
++                     static_cast<unsigned long long>(r.shared.allocations.exchange(0u)),
++                     static_cast<unsigned long long>(r.fps_compiles));
++    r.fps_thread_uploads = r.fps_render_uploads = r.fps_compiles = 0u;
++    if (r.log_fps)
+         std::fprintf(stderr, "glos: culled draws %.0f vertices %.0f  prescan us/frame %.0f\n", r.fps_culled / frames,
+                      r.fps_culled_vertices / frames, static_cast<double>(ge_prescan_nanoseconds_take()) / frames / 1000.0);
+     if (r.log_fps) {
+@@ -1982,10 +2230,36 @@
+     flush();
+ }
+ 
++// LCS_GLES_UPLOAD_THREAD: a texture of this frame that went to the upload
++// thread. Done there (uploaded and glFinish'ed on its context): adopted, and
++// the draws bind it. Not started yet: uploaded here instead. Being uploaded:
++// waits for that batch (a few textures) to finish.
++void finish_upload_job(RenderState &r, UploadJob &job) {
++    std::uint8_t expected = JobQueued;
++    if (job.state.compare_exchange_strong(expected, JobRender)) {
++        if (job.upload.width == 0u || job.upload.height == 0u || job.upload.rgba8.empty()) return;
++        ++r.fps_render_uploads;
++        adopt_texture(r, job.upload.key, create_texture(r.shared, job.upload));
++        r.bound_texture = 0xFFFFFFFFu;
++        return;
++    }
++    if (expected != JobDone) {
++        std::unique_lock<std::mutex> lock(r.shared.mutex);
++        r.shared.done_cv.wait(lock, [&] { return job.state.load() == JobDone; });
++    }
++    ++r.fps_thread_uploads;
++    adopt_texture(r, job.upload.key, job.texture);
++}
++
+ void render_frame(RenderState &r, Frame &frame) {
+     r.display_framebuffer = frame.display_framebuffer;
+     for (std::uint64_t key : frame.deletes) delete_texture(r, key);
+     for (TextureUpload &upload : frame.uploads) {
++        if (upload.job != nullptr) {
++            r.fps_bytes[3] += upload.job->upload.rgba8.size();
++            finish_upload_job(r, *upload.job);
++            continue;
++        }
+         r.fps_bytes[3] += upload.rgba8.size();
+         upload_texture(r, upload);
+     }
+@@ -1998,6 +2272,7 @@
+     if (!frame.merged) merge_frame(merge_settings(r), frame);  // no transform thread
+     if (frame.batches.empty()) {
+         ++r.frame_epoch;
++        ++r.shared.render_frames;
+         return;
+     }
+     for (std::size_t i = 0u; i < frame.breaks.size(); ++i) r.fps_breaks[i] += frame.breaks[i];
+@@ -2143,6 +2418,7 @@
+         swap(r, frame.psp_draws, gl_draws);
+     }
+     ++r.frame_epoch;
++    ++r.shared.render_frames;
+ }
+ 
+ // Frames the game writes to PSP memory itself (movies, loading screens).
+@@ -2184,6 +2460,9 @@
+         if (entry.second.id != 0u) glDeleteProgram(entry.second.id);
+     if (r.present_program.id != 0u) glDeleteProgram(r.present_program.id);
+     if (r.guest_texture != 0u) glDeleteTextures(1, &r.guest_texture);
++    for (const PooledTexture &pooled : r.shared.pool) glDeleteTextures(1, &pooled.id);
++    r.shared.pool.clear();
++    r.shared.pool_bytes = 0u;
+     for (auto &set : r.buffers)
+         if (set[0] != 0u) glDeleteBuffers(3, set.data());
+     r.buffers = {};
+@@ -2214,10 +2493,62 @@
+         s->spare.push_back(std::move(frame));
+     }
+     destroy_gl_objects(r);
++    eglMakeCurrent(r.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++}
++
++// LCS_GLES_UPLOAD_THREAD: uploads the GE thread's decoded textures on a
++// second context sharing the render context's objects, a few at a time, then
++// glFinish: done, the render thread can bind them (it binds every texture
++// again each frame, as GLES requires for changes made in another context).
++void upload_thread_main(Gles2State *s) {
++    RenderState &r = s->render;
++    SharedTextures &t = r.shared;
++    if (eglMakeCurrent(r.display, r.upload_surface, r.upload_surface, r.upload_context) != EGL_TRUE) {
++        std::cerr << "[gles2] upload thread off: eglMakeCurrent failed 0x" << std::hex << eglGetError() << std::dec << '\n';
++        t.failed = true;  // its queued jobs go to the render thread
++        return;
++    }
++    std::vector<std::shared_ptr<UploadJob>> batch;
++    for (;;) {
++        {
++            std::unique_lock<std::mutex> lock(t.mutex);
++            t.cv.wait(lock, [&] { return t.stop || !t.queue.empty(); });
++            if (t.stop) break;  // jobs left queued are the render thread's
++            std::size_t bytes = 0u;
++            while (!t.queue.empty() && batch.size() < 8u && bytes < 1024u * 1024u) {
++                std::shared_ptr<UploadJob> job = std::move(t.queue.front());
++                t.queue.pop_front();
++                std::uint8_t expected = JobQueued;
++                if (!job->state.compare_exchange_strong(expected, JobUploading)) continue;  // the render thread's
++                bytes += job->upload.rgba8.size();
++                batch.push_back(std::move(job));
++            }
++        }
++        if (batch.empty()) continue;
++        for (const std::shared_ptr<UploadJob> &job : batch) job->texture = create_texture(t, job->upload);
++        glBindTexture(GL_TEXTURE_2D, 0);
++        glFinish();
++        {
++            std::lock_guard<std::mutex> lock(t.mutex);
++            for (const std::shared_ptr<UploadJob> &job : batch) job->state = JobDone;
++        }
++        t.done_cv.notify_all();
++        batch.clear();
++    }
+     eglMakeCurrent(r.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+ }
+ 
+ void Gles2State::stop_render_thread() {
++    if (upload_thread.joinable()) {
++        // First: the render thread takes over what it leaves queued.
++        {
++            std::lock_guard<std::mutex> lock(render.shared.mutex);
++            render.shared.stop = true;
++        }
++        render.shared.cv.notify_all();
++        upload_thread.join();
++        render.shared.stop = false;
++    }
+     if (!render_thread.joinable() && !transform_thread.joinable()) return;
+     {
+         std::lock_guard<std::mutex> lock(queue_mutex);
+@@ -2347,6 +2678,8 @@
+     s.stop_render_thread();
+     RenderState &r = s.render;
+     if (r.display != EGL_NO_DISPLAY) {
++        if (r.upload_context != EGL_NO_CONTEXT) eglDestroyContext(r.display, r.upload_context);
++        if (r.upload_surface != EGL_NO_SURFACE) eglDestroySurface(r.display, r.upload_surface);
+         if (r.context != EGL_NO_CONTEXT) eglDestroyContext(r.display, r.context);
+         if (r.surface != EGL_NO_SURFACE) eglDestroySurface(r.display, r.surface);
+         eglTerminate(r.display);
+@@ -2354,6 +2687,11 @@
+     r.display = EGL_NO_DISPLAY;
+     r.surface = EGL_NO_SURFACE;
+     r.context = EGL_NO_CONTEXT;
++    r.upload_context = EGL_NO_CONTEXT;
++    r.upload_surface = EGL_NO_SURFACE;
++    r.shared.queue.clear();
++    r.shared.failed = false;
++    s.use_upload_thread = false;
+     s.textures.clear();
+     s.targets.clear();
+     s.last_texture = nullptr;
+@@ -2362,6 +2700,65 @@
+     s.deletes.clear();
+     s.texture_bytes = 0u;
+     s.enabled = false;
++}
++
++bool env_enabled(const char *name) {
++    const char *text = std::getenv(name);
++    return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
++}
++
++// Off unless set to something other than 0: the texture pool and the upload
++// thread work but measured no change in the dips (which are draw bursts, not
++// uploads), so they stay optional.
++bool env_opted_in(const char *name) {
++    const char *text = std::getenv(name);
++    return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
++}
++
++// LCS_GLES_UPLOAD_THREAD: the upload thread's context, sharing the render
++// context's objects, current on a 1x1 pbuffer (or no surface with
++// EGL_KHR_surfaceless_context). Tried once here; on failure the textures
++// upload on the render thread as before.
++bool create_upload_context(RenderState &r, EGLConfig config, std::string &why) {
++    const char *extensions = eglQueryString(r.display, EGL_EXTENSIONS);
++    const bool surfaceless = extensions != nullptr && std::strstr(extensions, "EGL_KHR_surfaceless_context") != nullptr;
++    EGLConfig upload_config = config;
++    if (!surfaceless) {
++        EGLint types = 0;
++        eglGetConfigAttrib(r.display, config, EGL_SURFACE_TYPE, &types);
++        if ((types & EGL_PBUFFER_BIT) == 0) {
++            const EGLint attributes[] = {
++                EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
++                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
++                EGL_NONE
++            };
++            EGLint count = 0;
++            if (eglChooseConfig(r.display, attributes, &upload_config, 1, &count) != EGL_TRUE || count < 1) {
++                why = "no pbuffer config";
++                return false;
++            }
++        }
++        const EGLint pbuffer[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
++        r.upload_surface = eglCreatePbufferSurface(r.display, upload_config, pbuffer);
++        if (r.upload_surface == EGL_NO_SURFACE) {
++            why = "eglCreatePbufferSurface failed 0x" + std::to_string(eglGetError());
++            return false;
++        }
++    }
++    const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
++    r.upload_context = eglCreateContext(r.display, upload_config, r.context, context_attributes);
++    if (r.upload_context == EGL_NO_CONTEXT ||
++        eglMakeCurrent(r.display, r.upload_surface, r.upload_surface, r.upload_context) != EGL_TRUE) {
++        why = "shared context failed 0x" + std::to_string(eglGetError());
++        if (r.upload_context != EGL_NO_CONTEXT) eglDestroyContext(r.display, r.upload_context);
++        if (r.upload_surface != EGL_NO_SURFACE) eglDestroySurface(r.display, r.upload_surface);
++        r.upload_context = EGL_NO_CONTEXT;
++        r.upload_surface = EGL_NO_SURFACE;
++        return false;
++    }
++    eglMakeCurrent(r.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    why = surfaceless ? "surfaceless" : "pbuffer";
++    return true;
+ }
+ 
+ bool create_backend(Gles2State &s, std::string &error) {
+@@ -2420,10 +2817,19 @@
+     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+     glClear(GL_COLOR_BUFFER_BIT);
+     eglSwapBuffers(r.display, r.surface);
++    // LCS_GLES_SHADER_WARMUP=0: no shader-variants.txt, programs compiled on
++    // first use only.
++    std::size_t warmed = 0u;
++    if (env_enabled("LCS_GLES_SHADER_WARMUP")) {
++        r.shader_variants_path = shader_variants_path().string();
++        warmed = warm_up_programs(r);
++    }
+     std::cout << "[gles2] EGL " << major << '.' << minor << " on fbdev " << r.screen_width << 'x'
+               << r.screen_height << ", " << reinterpret_cast<const char *>(glGetString(GL_RENDERER))
+               << ", targets " << r.target_width << 'x' << r.target_height
+-              << (r.depth24 ? ", depth24" : ", depth16") << ", render thread\n" << std::flush;
++              << (r.depth24 ? ", depth24" : ", depth16") << ", render thread";
++    if (!r.shader_variants_path.empty()) std::cout << ", " << warmed << " shader variants warmed";
++    std::cout << '\n' << std::flush;
+     {
+         GLint vertex_uniforms = 0, fragment_uniforms = 0, varyings = 0, attributes = 0;
+         glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &vertex_uniforms);
+@@ -2453,6 +2859,20 @@
+     // no transform worker.
+     const char *worker = std::getenv("LCS_GLES_TRANSFORM_THREAD");
+     s.use_transform_thread = worker == nullptr || *worker == '\0' || std::strcmp(worker, "0") != 0;
++    // LCS_GLES_TEXTURE_POOL=0: a new texture object per upload, freed on delete.
++    r.shared.pool_enabled = env_opted_in("LCS_GLES_TEXTURE_POOL");
++    // LCS_GLES_UPLOAD_THREAD=0: textures upload on the render thread.
++    s.use_upload_thread = false;
++    if (env_opted_in("LCS_GLES_UPLOAD_THREAD")) {
++        std::string why;
++        s.use_upload_thread = create_upload_context(r, config, why);
++        std::cout << "[gles2] upload thread " << (s.use_upload_thread ? "on (" : "off: ") << why
++                  << (s.use_upload_thread ? ")" : "") << ", texture pool " << (r.shared.pool_enabled ? "on" : "off")
++                  << '\n' << std::flush;
++    }
++    r.shared.stop = false;
++    r.shared.failed = false;
++    if (s.use_upload_thread) s.upload_thread = std::thread(upload_thread_main, &s);
+     s.render_thread = std::thread(render_thread_main, &s);
+     if (s.use_transform_thread) s.transform_thread = std::thread(transform_thread_main, &s);
+     return true;
+@@ -2512,7 +2932,21 @@
+     s.texture_bytes += texture.bytes;
+     s.last_texture_rgba.assign(rgba.begin(),
+                                rgba.begin() + std::min(rgba.size(), static_cast<std::size_t>(width) * height * 4u));
+-    s.uploads.push_back({key, width, height, mips, std::move(rgba)});
++    SharedTextures &shared = s.render.shared;
++    if (s.use_upload_thread && !shared.failed.load(std::memory_order_relaxed)) {
++        // To the upload thread now; the frame carries the job, which the
++        // render thread adopts (or takes over) before the frame's draws.
++        auto job = std::make_shared<UploadJob>();
++        job->upload = {key, width, height, mips, std::move(rgba), {}};
++        s.uploads.push_back({key, width, height, mips, {}, job});
++        {
++            std::lock_guard<std::mutex> lock(shared.mutex);
++            shared.queue.push_back(std::move(job));
++        }
++        shared.cv.notify_one();
++    } else {
++        s.uploads.push_back({key, width, height, mips, std::move(rgba)});
++    }
+     ++s.report.decoded_texture_uploads;
+     s.report.unique_texture_keys = s.textures.size();
+     return true;

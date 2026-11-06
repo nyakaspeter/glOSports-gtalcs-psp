@@ -1,0 +1,1213 @@
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+index f2ffbcf..1a20d81 100644
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -169,6 +169,17 @@ bool packed_0115_gpu_decode_enabled() noexcept {
+     return enabled;
+ }
+ 
++// PSPRECOMP_GE_GPU_RAW: 0 off, 1 (default) every eligible layout, 2 without
++// skinned ones (weights stay on the CPU).
++std::uint32_t raw_gpu_decode_mode() noexcept {
++    static const std::uint32_t mode = [] {
++        const char *text = std::getenv("PSPRECOMP_GE_GPU_RAW");
++        if (text == nullptr || *text == '\0') return 1u;
++        return static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
++    }();
++    return mode;
++}
++
+ bool direct_nonindexed_gpu_draw_enabled() noexcept {
+     static const bool enabled = [] {
+         const char *text = std::getenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW");
+@@ -1106,6 +1117,147 @@ bool prepare_directional_lighting_affine(const PreparedLighting &state,
+     return true;
+ }
+ 
++// The raw path's uniform block (see GeGpuRawState): matrices as rows so the
++// shader transforms with dot products, the prepared lighting as is.
++void fill_raw_state(GeGpuRawState &out, GeGpuRawLayout &variant, const GeTransformState &transform,
++                    const PreparedLighting &lighting, bool lighting_on,
++                    const std::array<std::uint32_t, 256> &commands) noexcept {
++    auto &u = out.uniforms;
++    const auto rows = [&](std::size_t first, const float *m) {
++        for (std::size_t r = 0u; r < 3u; ++r) u[first + r] = {m[r], m[3u + r], m[6u + r], m[9u + r]};
++    };
++    rows(0u, transform.world.data());
++    rows(3u, transform.texture.data());
++    u[6] = {lighting.material_ambient.r, lighting.material_ambient.g, lighting.material_ambient.b,
++            lighting.material_ambient.a};
++    u[7] = {lighting.material_diffuse.r, lighting.material_diffuse.g, lighting.material_diffuse.b, 0.0f};
++    u[8] = {lighting.material_specular.r, lighting.material_specular.g, lighting.material_specular.b, 0.0f};
++    u[9] = {lighting.emissive.r, lighting.emissive.g, lighting.emissive.b, 0.0f};
++    u[10] = {lighting.global_ambient.r, lighting.global_ambient.g, lighting.global_ambient.b,
++             lighting.global_ambient.a};
++    u[11] = {lighting.specular_exponent, static_cast<float>(lighting.material_update),
++             (data24(commands[0x51u]) & 1u) != 0u ? -1.0f : 1.0f, lighting_on ? 1.0f : 0.0f};
++    const Color constant = material_ambient_color(commands);
++    u[12] = {constant.r / 255.0f, constant.g / 255.0f, constant.b / 255.0f, constant.a / 255.0f};
++    const std::uint32_t shade = data24(commands[0xC1u]);
++    const std::uint32_t uv_mode = data24(commands[0xC0u]);
++    u[13] = {static_cast<float>(uv_mode & 3u), static_cast<float>(shade & 3u),
++             static_cast<float>((shade >> 8u) & 3u), static_cast<float>((uv_mode >> 8u) & 3u)};
++    const auto light_vector = [&](std::uint32_t light) {
++        return normalized_or_001(Vec3{
++            decode_float24(data24(commands[0x63u + light * 3u])),
++            decode_float24(data24(commands[0x64u + light * 3u])),
++            decode_float24(data24(commands[0x65u + light * 3u])),
++        });
++    };
++    const Vec3 shade_s = light_vector(shade & 3u);
++    const Vec3 shade_t = light_vector((shade >> 8u) & 3u);
++    u[62] = {shade_s.x, shade_s.y, shade_s.z, 0.0f};
++    u[63] = {shade_t.x, shade_t.y, shade_t.z, 0.0f};
++    variant.lights = 0u;
++    variant.light_point = variant.light_spot = variant.light_specular = variant.light_pow = false;
++    for (std::size_t i = 0u; i < 4u; ++i) {
++        const PreparedLight &light = lighting.lights[i];
++        if (!lighting_on || !lighting.enabled || !light.enabled) continue;
++        const std::size_t base = kGeGpuRawLightBase + variant.lights * 6u;
++        ++variant.lights;
++        variant.light_point |= light.type != 0u;
++        variant.light_spot |= light.type >= 2u;
++        variant.light_specular |= light.computation == 1u;
++        variant.light_pow |= light.computation == 2u;
++        u[base] = {light.vector.x, light.vector.y, light.vector.z, static_cast<float>(light.type)};
++        u[base + 1u] = {light.attenuation.x, light.attenuation.y, light.attenuation.z,
++                        static_cast<float>(light.computation)};
++        u[base + 2u] = {light.spot_direction.x, light.spot_direction.y, light.spot_direction.z, light.cutoff};
++        u[base + 3u] = {light.ambient.r, light.ambient.g, light.ambient.b, light.exponent};
++        u[base + 4u] = {light.diffuse.r, light.diffuse.g, light.diffuse.b,
++                        lighting.enabled && light.enabled ? 1.0f : 0.0f};
++        u[base + 5u] = {light.specular.r, light.specular.g, light.specular.b, 0.0f};
++    }
++    for (std::size_t bone = 0u; bone < 8u; ++bone)
++        rows(kGeGpuRawBoneBase + bone * 3u, transform.bones.data() + bone * 12u);
++}
++
++// Model-space bounds of raw vertices (positions of any type), for the GE-side
++// cull: scalar, over the positions only.
++bool raw_position_bounds(const std::uint8_t *raw, std::size_t count, std::uint32_t stride,
++                         std::uint32_t offset, std::uint32_t type,
++                         std::array<float, 3> &low, std::array<float, 3> &high) noexcept {
++    if (count == 0u || type == 0u) return false;
++    low = {INFINITY, INFINITY, INFINITY};
++    high = {-INFINITY, -INFINITY, -INFINITY};
++    const std::uint8_t *p = raw + offset;
++    if (type == 2u) {
++        std::int16_t lo[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
++        std::int16_t hi[3] = {INT16_MIN, INT16_MIN, INT16_MIN};
++        for (std::size_t i = 0u; i < count; ++i, p += stride) {
++            std::int16_t v[3];
++            std::memcpy(v, p, sizeof(v));
++            for (int c = 0; c < 3; ++c) {
++                lo[c] = std::min(lo[c], v[c]);
++                hi[c] = std::max(hi[c], v[c]);
++            }
++        }
++        for (int c = 0; c < 3; ++c) {
++            low[c] = lo[c] * (1.0f / 32768.0f);
++            high[c] = hi[c] * (1.0f / 32768.0f);
++        }
++        return true;
++    }
++    if (type == 1u) {
++        std::int8_t lo[3] = {INT8_MAX, INT8_MAX, INT8_MAX};
++        std::int8_t hi[3] = {INT8_MIN, INT8_MIN, INT8_MIN};
++        for (std::size_t i = 0u; i < count; ++i, p += stride) {
++            for (int c = 0; c < 3; ++c) {
++                const std::int8_t v = static_cast<std::int8_t>(p[c]);
++                lo[c] = std::min(lo[c], v);
++                hi[c] = std::max(hi[c], v);
++            }
++        }
++        for (int c = 0; c < 3; ++c) {
++            low[c] = lo[c] * (1.0f / 128.0f);
++            high[c] = hi[c] * (1.0f / 128.0f);
++        }
++        return true;
++    }
++    for (std::size_t i = 0u; i < count; ++i, p += stride) {
++        float v[3];
++        std::memcpy(v, p, sizeof(v));
++        for (int c = 0; c < 3; ++c) {
++            if (!std::isfinite(v[c])) return false;
++            low[c] = std::min(low[c], v[c]);
++            high[c] = std::max(high[c], v[c]);
++        }
++    }
++    return true;
++}
++
++// Bounds per (address, size), kept while the vertex pages are unwritten (the
++// guest memory's page generations); a scan of the positions otherwise.
++struct CachedBounds {
++    std::uint32_t address{};
++    std::uint32_t bytes{};
++    std::uint64_t pages{};
++    std::array<float, 3> low{};
++    std::array<float, 3> high{};
++    bool valid{};
++};
++
++template <typename Scan>
++const CachedBounds &cached_bounds(const psprecomp::GuestMemory &memory, std::uint32_t address,
++                                  std::size_t bytes, Scan scan) {
++    static thread_local std::array<CachedBounds, 4096> cache{};
++    CachedBounds &slot = cache[((address >> 4u) ^ (address >> 16u) ^ static_cast<std::uint32_t>(bytes)) & 4095u];
++    const std::uint64_t pages = memory.range_generation(address, bytes);
++    if (!slot.valid || slot.address != address || slot.bytes != bytes || slot.pages != pages) {
++        slot.valid = scan(slot.low, slot.high);
++        slot.address = address;
++        slot.bytes = static_cast<std::uint32_t>(bytes);
++        slot.pages = pages;
++    }
++    return slot;
++}
++
+ bool decode_vertex(const psprecomp::GuestMemory &memory, std::uint32_t address,
+                    const VertexLayout &layout,
+                    const std::array<std::uint32_t, 256> &commands,
+@@ -4345,29 +4497,13 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+         ge_gpu_backend_active()) {
+         const std::size_t packed_bytes = static_cast<std::size_t>(count) * 10u;
+         if (const std::uint8_t *raw = memory.raw_pointer(vertex_address, packed_bytes)) {
+-            // Model-space bounds per (address, size), kept while the vertex
+-            // pages are unwritten: the scan was ~3% of the GE thread outdoors.
+-            struct PackedBounds {
+-                std::uint32_t address{};
+-                std::uint32_t bytes{};
+-                std::uint64_t pages{};
+-                std::array<float, 3> low{};
+-                std::array<float, 3> high{};
+-                bool valid{};
+-            };
+-            static thread_local std::array<PackedBounds, 4096> bounds_cache{};
+-            PackedBounds &bounds =
+-                bounds_cache[((vertex_address >> 4u) ^ (vertex_address >> 16u) ^ count) & 4095u];
+-            const std::uint64_t pages = memory.range_generation(vertex_address, packed_bytes);
+-            if (!bounds.valid || bounds.address != vertex_address || bounds.bytes != packed_bytes ||
+-                bounds.pages != pages) {
+-                bounds.valid = ge_gpu_backend_packed_0115_bounds(
+-                    std::span<const std::byte>(reinterpret_cast<const std::byte *>(raw), packed_bytes),
+-                    bounds.low, bounds.high);
+-                bounds.address = vertex_address;
+-                bounds.bytes = static_cast<std::uint32_t>(packed_bytes);
+-                bounds.pages = pages;
+-            }
++            // The scan was ~3% of the GE thread outdoors: cached (cached_bounds).
++            const CachedBounds &bounds = cached_bounds(
++                memory, vertex_address, packed_bytes, [&](std::array<float, 3> &low, std::array<float, 3> &high) {
++                    return ge_gpu_backend_packed_0115_bounds(
++                        std::span<const std::byte>(reinterpret_cast<const std::byte *>(raw), packed_bytes),
++                        low, high);
++                });
+             GeGpuDrawDescriptor target{};
+             target.framebuffer_address = framebuffer_address(commands);
+             if (bounds.valid &&
+@@ -4780,10 +4916,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+         hw.index_reuses = count > decode_count
+             ? count - static_cast<std::uint32_t>(decode_count) : 0u;
+ 
+-        const bool packed_0115_candidate = packed_0115_gpu_decode_enabled() &&
+-            fast_0115_raw != nullptr && !cpu_lighting_effective && !flat_shading &&
+-            (!effective_draw.texture_enabled || sampled_texture_ready);
+-        if (packed_0115_candidate) {
++        // The stream's triangle indices for a draw sent as stored (packed 0115
++        // or raw): lists and strips keep the stream, fans become a list.
++        const auto build_stream_indices = [&]() {
+             const auto occurrence_index = [&](std::size_t i) -> std::uint32_t {
+                 if (!indexed) return static_cast<std::uint32_t>(i);
+                 if (contiguous_decode) return occurrence_indices[i] - contiguous_first;
+@@ -4823,6 +4958,13 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                     }
+                 }
+             }
++        };
++
++        const bool packed_0115_candidate = packed_0115_gpu_decode_enabled() &&
++            fast_0115_raw != nullptr && !cpu_lighting_effective && !flat_shading &&
++            (!effective_draw.texture_enabled || sampled_texture_ready);
++        if (packed_0115_candidate) {
++            build_stream_indices();
+             bool accepted = false;
+             {
+                 hw_draw_queue().drain();
+@@ -4840,6 +4982,100 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             triangle_indices.clear();
+         }
+ 
++        // Every other layout as stored, decoded, skinned and lit by the vertex
++        // shader (decode_model_vertex_for_gpu on the CPU otherwise). Not:
++        // morphing, flat shading (the last vertex's colour per triangle),
++        // generated texture coordinates (yet), textures not decoded yet.
++        const std::uint32_t raw_mode = raw_gpu_decode_mode();
++        const bool raw_candidate = raw_mode != 0u && contiguous_raw != nullptr &&
++            !packed_0115_candidate && layout.morph_count == 1u && !flat_shading &&
++            uv_generation <= 2u && layout.position_type != 0u &&
++            (layout.weight_type == 0u || (raw_mode == 1u && layout.weight_count <= 8u)) &&
++            layout.stride <= 255u && decode_count <= 65536u &&
++            (!effective_draw.texture_enabled || sampled_texture_ready);
++        if (raw_candidate) {
++            const std::size_t raw_bytes = static_cast<std::size_t>(decode_count) * layout.stride;
++            const std::uint32_t raw_address = vertex_address + contiguous_first * layout.stride;
++            const GeGpuHardwareTransform &model_hw = plain_transform();
++            const CachedBounds &bounds = cached_bounds(
++                memory, raw_address, raw_bytes, [&](std::array<float, 3> &low, std::array<float, 3> &high) {
++                    // Skinned vertices move with their bones: no model-space box.
++                    if (layout.weight_type != 0u) return false;
++                    return raw_position_bounds(contiguous_raw, decode_count, layout.stride,
++                                               layout.position_offset, layout.position_type, low, high);
++                });
++            if (bounds.valid && !gpu_draw.clear_mode &&
++                ge_gpu_backend_box_off_screen(effective_draw, model_hw, bounds.low, bounds.high, count)) {
++                note_layout_stat(layout.type, lighting_on, 4u, count);
++                advance_stream();
++                return true;
++            }
++            GeGpuRawLayout raw_layout{};
++            raw_layout.stride = layout.stride;
++            raw_layout.position_type = static_cast<std::uint8_t>(layout.position_type);
++            raw_layout.normal_type = static_cast<std::uint8_t>(layout.normal_type);
++            raw_layout.tc_type = static_cast<std::uint8_t>(layout.tc_type);
++            raw_layout.color_type = static_cast<std::uint8_t>(layout.color_type);
++            raw_layout.weight_type = static_cast<std::uint8_t>(layout.weight_type);
++            raw_layout.weight_count = static_cast<std::uint8_t>(layout.weight_type != 0u ? layout.weight_count : 0u);
++            raw_layout.position_offset = static_cast<std::uint8_t>(layout.position_offset);
++            raw_layout.normal_offset = static_cast<std::uint8_t>(layout.normal_offset);
++            raw_layout.tc_offset = static_cast<std::uint8_t>(layout.tc_offset);
++            raw_layout.color_offset = static_cast<std::uint8_t>(layout.color_offset);
++            raw_layout.weight_offset = static_cast<std::uint8_t>(layout.weight_offset);
++            raw_layout.lit = hw_lighting_on_cpu;
++            raw_layout.uv_generation = static_cast<std::uint8_t>(uv_generation);
++
++            // The uniform block is rebuilt only when a register it is built
++            // from was written (the executor's revisions).
++            struct RawStateCache {
++                GeGpuRawState state{};
++                GeGpuRawLayout variant{};  // the light flags only
++                std::uint64_t lighting_revision{};
++                std::uint64_t matrix_revision{};
++                bool has_vertex_color{};
++                bool lit{};
++                bool valid{};
++            };
++            static thread_local RawStateCache raw_cache;
++            const bool has_vertex_color = layout.color_type >= 4u;
++            const bool state_changed = !raw_cache.valid || lighting_state_revision == 0u ||
++                matrix_state_revision == 0u || raw_cache.lighting_revision != lighting_state_revision ||
++                raw_cache.matrix_revision != matrix_state_revision ||
++                raw_cache.has_vertex_color != has_vertex_color || raw_cache.lit != hw_lighting_on_cpu;
++            if (state_changed) {
++                fill_raw_state(raw_cache.state, raw_cache.variant, transform, prepared_lighting,
++                               hw_lighting_on_cpu, commands);
++                raw_cache.lighting_revision = lighting_state_revision;
++                raw_cache.matrix_revision = matrix_state_revision;
++                raw_cache.has_vertex_color = has_vertex_color;
++                raw_cache.lit = hw_lighting_on_cpu;
++                raw_cache.valid = true;
++            }
++            raw_layout.lights = raw_cache.variant.lights;
++            raw_layout.light_point = raw_cache.variant.light_point;
++            raw_layout.light_spot = raw_cache.variant.light_spot;
++            raw_layout.light_specular = raw_cache.variant.light_specular;
++            raw_layout.light_pow = raw_cache.variant.light_pow;
++            GeGpuHardwareTransform raw_hw = model_hw;
++            raw_hw.primitive = primitive == 5u ? 3u : primitive;
++            raw_hw.logical_prim_batches = std::max<std::uint32_t>(1u, logical_primitive_count);
++            raw_hw.unique_vertices_decoded = static_cast<std::uint32_t>(decode_count);
++            raw_hw.index_reuses = count > decode_count ? count - static_cast<std::uint32_t>(decode_count) : 0u;
++            build_stream_indices();
++            hw_draw_queue().drain();
++            const bool accepted = ge_gpu_backend_accumulate_hardware_raw(
++                effective_draw, raw_hw, raw_layout,
++                std::span<const std::byte>(reinterpret_cast<const std::byte *>(contiguous_raw), raw_bytes),
++                static_cast<std::uint32_t>(decode_count), triangle_indices, raw_cache.state, state_changed);
++            if (accepted) {
++                note_layout_stat(layout.type, lighting_on, 5u, count);
++                advance_stream();
++                return true;
++            }
++            triangle_indices.clear();
++        }
++
+         // Draws with vertices outside guest memory run inline to report the error.
+         HwDrawQueue &queue = hw_draw_queue();
+         bool deferred = queue.enabled();
+diff --git a/lcs/host/ge_gpu_backend.hpp b/lcs/host/ge_gpu_backend.hpp
+index 50a7f78..6f9d7f8 100644
+--- a/lcs/host/ge_gpu_backend.hpp
++++ b/lcs/host/ge_gpu_backend.hpp
+@@ -140,6 +140,53 @@ struct GeGpuVertex {
+     std::uint32_t transform_control{};
+ };
+ 
++// A hardware-transform draw whose vertices go to the GPU as the PSP stores
++// them (any layout with one morph frame): the vertex shader decodes, skins
++// and lights them. Element types and offsets as the PSP's vertex type word.
++struct GeGpuRawLayout {
++    std::uint32_t stride{};
++    std::uint8_t position_type{};
++    std::uint8_t normal_type{};
++    std::uint8_t tc_type{};
++    std::uint8_t color_type{};
++    std::uint8_t weight_type{};
++    std::uint8_t weight_count{};
++    std::uint8_t position_offset{};
++    std::uint8_t normal_offset{};
++    std::uint8_t tc_offset{};
++    std::uint8_t color_offset{};
++    std::uint8_t weight_offset{};
++    bool lit{};
++    std::uint8_t uv_generation{};
++    // The lighting the shader variant is built for: the enabled lights,
++    // compacted into uR slots 0..lights-1, and which features any of them use
++    // (the Mali-400 vertex shader holds 512 instruction words; the general
++    // light model with 8-bone skinning did not fit).
++    std::uint8_t lights{};
++    bool light_point{};
++    bool light_spot{};
++    bool light_specular{};
++    bool light_pow{};
++    bool operator==(const GeGpuRawLayout &) const = default;
++};
++
++// The raw path's per-draw state beyond the transform, as the vertex shader's
++// uniform array uR: 0-2 world matrix rows, 3-5 texture matrix rows,
++// 6 material ambient (rgba), 7 diffuse, 8 specular, 9 emissive, 10 global
++// ambient (rgba), 11 (specular exponent, material update bits, normal sign,
++// lighting on), 12 the constant vertex colour (layouts without one), 13 uv
++// generation (mode, light s, light t, source), 14-37 four lights of six
++// (position or direction + type; attenuation + computation; spot direction +
++// cutoff; ambient + spot exponent; diffuse + enabled; specular), 38-61 eight
++// bone matrices of three rows, 62-63 the environment map's two light
++// directions.
++constexpr std::size_t kGeGpuRawUniforms = 64u;
++constexpr std::size_t kGeGpuRawLightBase = 14u;
++constexpr std::size_t kGeGpuRawBoneBase = 38u;
++struct GeGpuRawState {
++    std::array<std::array<float, 4>, kGeGpuRawUniforms> uniforms{};
++};
++
+ // std::vector whose resize() leaves new elements uninitialised: the per-draw
+ // vertex and index buffers are resized and then fully overwritten, and the
+ // zero fill was a measurable share of the GE thread's memset time.
+@@ -412,6 +459,19 @@ void ge_gpu_backend_accumulate_hardware_triangles(
+ 
+ // True when a hardware-transform draw of packed 0115 vertices is entirely
+ // off screen (draws nothing): it can be dropped before any further work.
++// A hardware-transform draw of raw vertices (see GeGpuRawLayout). state_changed:
++// the state differs from the previous raw draw's (the backend keeps one copy
++// per change). False: not taken; the caller decodes on the CPU instead.
++[[nodiscard]] bool ge_gpu_backend_accumulate_hardware_raw(
++    const GeGpuDrawDescriptor &draw,
++    const GeGpuHardwareTransform &transform,
++    const GeGpuRawLayout &layout,
++    std::span<const std::byte> raw_vertices,
++    std::uint32_t vertex_count,
++    std::span<const std::uint32_t> triangle_indices,
++    const GeGpuRawState &state,
++    bool state_changed) noexcept;
++
+ [[nodiscard]] bool ge_gpu_backend_packed_0115_off_screen(
+     const GeGpuDrawDescriptor &draw,
+     const GeGpuHardwareTransform &transform,
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+index 20fa61e..fdf41a7 100644
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -117,6 +117,11 @@ struct Batch {
+     GeGpuHardwareTransform transform{};
+     bool framebuffer_feedback{};
+     std::uint32_t feedback_address{};
++    // Raw vertices (see GeGpuRawLayout): first_vertex is their byte offset in
++    // the frame's packed array; raw_state indexes the frame's raw states.
++    bool raw{};
++    GeGpuRawLayout raw_layout{};
++    std::uint32_t raw_state{};
+ };
+ 
+ // ------------------------------------------------------------------ frames --
+@@ -142,6 +147,7 @@ struct Frame {
+     std::vector<std::uint8_t> packed;  // 0115 vertices, 10 bytes each, as the PSP stores them
+     std::vector<std::uint32_t> indices;
+     std::vector<Batch> batches;
++    std::vector<GeGpuRawState> raw_states;
+     std::vector<TextureUpload> uploads;
+     std::vector<std::uint64_t> deletes;
+     std::vector<TargetSize> targets;
+@@ -162,6 +168,7 @@ struct Frame {
+         vertices.clear();
+         packed.clear();
+         indices.clear();
++        raw_states.clear();
+         batches.clear();
+         uploads.clear();
+         deletes.clear();
+@@ -210,9 +217,12 @@ struct Program {
+     GLuint id{};
+     GLint vertex_location{-1};
+     GLint fragment_location{-1};
++    GLint raw_location{-1};
+     UniformValues sent{};
+     bool vertex_valid{};
+     bool fragment_valid{};
++    std::uint64_t raw_sent_epoch{};  // frame epoch and index of the uR block last sent
++    std::uint32_t raw_sent_state{};
+ };
+ 
+ // Everything on the render thread; nothing else touches it.
+@@ -229,8 +239,9 @@ struct RenderState {
+     bool vsync{true};
+     std::unordered_map<std::uint64_t, GlTexture> textures;
+     std::unordered_map<std::uint32_t, Target> targets;
+-    std::unordered_map<std::uint32_t, Program> programs;
++    std::unordered_map<std::uint64_t, Program> programs;
+     Program present_program{};
++    std::uint32_t attribute_arrays{0xFFFFFFFFu};  // see set_attribute_arrays
+     GLuint guest_texture{};
+     std::uint32_t guest_width{};
+     std::uint32_t guest_height{};
+@@ -298,6 +309,7 @@ struct Gles2State {
+     std::vector<std::uint8_t> packed;
+     std::vector<std::uint32_t> indices;
+     std::vector<Batch> batches;
++    std::vector<GeGpuRawState> raw_states;
+     std::unordered_map<std::uint64_t, TextureInfo> textures;
+     std::size_t texture_bytes{};
+     std::vector<TextureUpload> uploads;
+@@ -369,9 +381,38 @@ constexpr std::uint32_t kAlphaTest = 1u << 9u;
+ constexpr std::uint32_t kAlphaFuncShift = 10u;    // 0..7
+ constexpr std::uint32_t kOpaque = 1u << 13u;      // 565 target: alpha = 1
+ constexpr std::uint32_t kPacked = 1u << 14u;      // vertices in the PSP's 0115 format
++// Mode 3 (raw vertices, GeGpuRawLayout): the layout in the bits above.
++constexpr std::uint32_t kRawLit = 1u << 15u;
++constexpr std::uint32_t kRawPosShift = 16u;       // 2 bits each: position, normal, uv
++constexpr std::uint32_t kRawNormalShift = 18u;
++constexpr std::uint32_t kRawUvShift = 20u;
++constexpr std::uint32_t kRawColorShift = 22u;     // 3 bits
++constexpr std::uint32_t kRawWeightShift = 25u;    // 2 bits: weight type
++constexpr std::uint32_t kRawWeightsShift = 27u;   // 3 bits: weights - 1
++constexpr std::uint32_t kRawUvGenShift = 30u;     // 2 bits
++constexpr std::uint32_t kRawLightsShift = 32u;    // 3 bits: enabled lights
++constexpr std::uint64_t kRawLightPoint = std::uint64_t{1} << 35u;
++constexpr std::uint64_t kRawLightSpot = std::uint64_t{1} << 36u;
++constexpr std::uint64_t kRawLightSpecular = std::uint64_t{1} << 37u;
++constexpr std::uint64_t kRawLightPow = std::uint64_t{1} << 38u;
+ 
+ const char *kVertexShader = R"(
+-#if PACKED
++#if MODE == 3
++// Vertices as the PSP stores them (any layout, one morph frame): decoded,
++// skinned and lit here; the element types, scales and the light model are
++// the GE renderer's CPU path's (decode_model_vertex_for_gpu).
++attribute vec3 aRawPos;
++attribute vec3 aNormal;
++#if RAW_COLOR == 7
++attribute vec4 aRawColor;
++#else
++attribute float aRawColor;
++#endif
++attribute vec2 aRawUv;
++attribute vec4 aW0;
++attribute vec4 aW1;
++uniform vec4 uR[64];
++#elif PACKED
+ // The PSP's 0115 vertex as stored: u8 u/v, a 5551 colour, s16 x/y/z, decoded
+ // here so the GE thread only copies bytes (same scale as the Vulkan GE).
+ attribute vec4 aPacked;   // x, y, z (shorts)
+@@ -398,11 +439,190 @@ uniform vec4 uV[10];
+ varying lowp vec4 vColor;
+ varying mediump vec3 vTex;
+ varying lowp float vFog;
++#if MODE == 3
++float pspPow(float v, float e) {
++    if (e <= 0.0) return 1.0;
++    if (v > 0.0) return pow(v, e);
++    return v;
++}
++vec3 normalizedOr001(vec3 v) {
++    float l2 = dot(v, v);
++    if (!(l2 > 1.0e-30)) return vec3(0.0, 0.0, 1.0);
++    return v * inversesqrt(l2);
++}
++vec3 expand555(vec3 c) { return (c * 8.0 + floor(c / 4.0)) * (1.0 / 255.0); }
++vec3 normalizedOrZero(vec3 v) {
++    float l2 = dot(v, v);
++    if (!(l2 > 1.0e-30)) return vec3(0.0);
++    return v * inversesqrt(l2);
++}
++// The PSP's lighting (apply_prepared_lighting on the CPU), world space.
++vec4 pspLight(vec4 vertex, vec3 wpos, vec3 n) {
++    float update = uR[11].y;
++    bool ambV = mod(update, 2.0) >= 1.0;
++    bool difV = mod(floor(update / 2.0), 2.0) >= 1.0;
++    bool specV = update >= 4.0;
++    vec4 matAmb = ambV ? vertex : uR[6];
++    vec3 matDif = difV ? vertex.rgb : uR[7].rgb;
++    vec3 matSpec = specV ? vertex.rgb : uR[8].rgb;
++    vec4 baseAmb = matAmb * uR[10];
++    vec3 rgb = uR[9].rgb + baseAmb.rgb;
++    float specExp = uR[11].x;
++#if RAW_LIGHTS > 0
++    // The enabled lights, compacted by the GE thread; the variant knows
++    // which features any of them use.
++    for (int i = 0; i < RAW_LIGHTS; ++i) {
++        vec4 L0 = uR[14 + i * 6];
++        vec4 L1 = uR[15 + i * 6];
++        vec4 L3 = uR[17 + i * 6];
++        vec4 L4 = uR[18 + i * 6];
++        vec3 lv = L0.xyz;
++        float att = 1.0;
++#if RAW_LIGHT_POINT
++        if (L0.w > 0.5) {
++            lv = L0.xyz - wpos;
++            float d = sqrt(dot(lv, lv));
++            lv = normalizedOr001(lv);
++            float den = L1.x + L1.y * d + L1.z * d * d;
++            att = den > 0.0 ? clamp(1.0 / den, 0.0, 1.0) : 0.0;
++        }
++#endif
++#if RAW_LIGHT_SPOT
++        if (L0.w > 1.5) {
++            vec4 L2 = uR[16 + i * 6];
++            float rs = dot(L2.xyz, lv);
++            att *= rs >= L2.w ? max(0.0, pspPow(rs, L3.w)) : 0.0;
++        }
++#endif
++        rgb += L3.rgb * matAmb.rgb * att;
++        float df = dot(lv, n);
++#if RAW_LIGHT_POW
++        if (L1.w > 1.5) df = pspPow(df, specExp);
++#endif
++        if (df > 0.0) rgb += L4.rgb * matDif * (att * df);
++#if RAW_LIGHT_SPEC
++        if (L1.w > 0.5 && L1.w < 1.5 && df >= 0.0) {
++            vec3 h = normalizedOr001(lv + vec3(0.0, 0.0, 1.0));
++            float sf = pspPow(dot(h, n), specExp);
++            if (sf > 0.0) rgb += uR[19 + i * 6].rgb * matSpec * (att * sf);
++        }
++#endif
++    }
++#endif
++    return floor(clamp(vec4(rgb, baseAmb.a), 0.0, 1.0) * 255.0 + 0.5) * (1.0 / 255.0);
++}
++#endif
+ void main() {
+     vec4 p;
+     vec2 uv;
+     float fog;
+-#if PACKED
++    float q = aQ;
++#if MODE == 3
++    vec3 mpos = aRawPos * RAW_POS_SCALE;
++#if RAW_NORMAL != 0
++    vec3 mnrm = aNormal * RAW_NRM_SCALE;
++#else
++    vec3 mnrm = vec3(0.0, 0.0, 1.0);
++#endif
++#if RAW_WEIGHTS > 0
++    {
++        // The blended 4x3 skin matrix (the weights' sum of the bone rows, as
++        // compute_skin_matrix_raw on the CPU), then one transform.
++        vec4 w0 = aW0 * RAW_W_SCALE;
++        vec4 w1 = aW1 * RAW_W_SCALE;
++        vec4 r0 = w0.x * uR[38];
++        vec4 r1 = w0.x * uR[39];
++        vec4 r2 = w0.x * uR[40];
++#define SKIN(b, w) r0 += w * uR[b]; r1 += w * uR[b + 1]; r2 += w * uR[b + 2];
++#if RAW_WEIGHTS > 1
++        SKIN(41, w0.y)
++#endif
++#if RAW_WEIGHTS > 2
++        SKIN(44, w0.z)
++#endif
++#if RAW_WEIGHTS > 3
++        SKIN(47, w0.w)
++#endif
++#if RAW_WEIGHTS > 4
++        SKIN(50, w1.x)
++#endif
++#if RAW_WEIGHTS > 5
++        SKIN(53, w1.y)
++#endif
++#if RAW_WEIGHTS > 6
++        SKIN(56, w1.z)
++#endif
++#if RAW_WEIGHTS > 7
++        SKIN(59, w1.w)
++#endif
++        vec4 hp = vec4(mpos, 1.0);
++        mpos = vec3(dot(r0, hp), dot(r1, hp), dot(r2, hp));
++        mnrm = vec3(dot(r0.xyz, mnrm), dot(r1.xyz, mnrm), dot(r2.xyz, mnrm));
++    }
++#endif
++    vec4 aPos = vec4(mpos, 1.0);
++#if RAW_UV == 0
++    vec2 aUv = vec2(0.0, 0.0);
++#else
++    vec2 aUv = aRawUv * RAW_UV_SCALE;
++#endif
++#if RAW_COLOR == 7
++    vec4 color = aRawColor;
++#elif RAW_COLOR == 4
++    float pc = aRawColor;
++    vec3 ch;
++    ch.r = mod(pc, 32.0);
++    pc = floor(pc / 32.0);
++    ch.g = mod(pc, 64.0);
++    ch.b = floor(pc / 64.0);
++    vec4 color = vec4((ch.r * 8.0 + floor(ch.r / 4.0)) * (1.0 / 255.0),
++                      (ch.g * 4.0 + floor(ch.g / 16.0)) * (1.0 / 255.0),
++                      (ch.b * 8.0 + floor(ch.b / 4.0)) * (1.0 / 255.0), 1.0);
++#elif RAW_COLOR == 5
++    float pc = aRawColor;
++    vec4 ch;
++    ch.r = mod(pc, 32.0);
++    pc = floor(pc / 32.0);
++    ch.g = mod(pc, 32.0);
++    pc = floor(pc / 32.0);
++    ch.b = mod(pc, 32.0);
++    ch.a = floor(pc / 32.0);
++    vec4 color = vec4(expand555(ch.rgb), ch.a);
++#elif RAW_COLOR == 6
++    float pc = aRawColor;
++    vec4 ch;
++    ch.r = mod(pc, 16.0);
++    pc = floor(pc / 16.0);
++    ch.g = mod(pc, 16.0);
++    pc = floor(pc / 16.0);
++    ch.b = mod(pc, 16.0);
++    ch.a = floor(pc / 16.0);
++    vec4 color = ch * (17.0 / 255.0);
++#else
++    vec4 color = uR[12];
++#endif
++#if RAW_UVGEN == 1
++    // Texture matrix on the chosen source (position, uv, normalized normal,
++    // normal), as the CPU decoder; the scale/offset registers don't apply.
++    float src = uR[13].w;
++    vec3 sv = src < 0.5 ? mpos : src < 1.5 ? vec3(aUv, 0.0) : src < 2.5 ? normalizedOrZero(mnrm) : mnrm;
++    vec4 sh = vec4(sv, 1.0);
++    vec3 stq = vec3(dot(uR[3], sh), dot(uR[4], sh), dot(uR[5], sh));
++    aUv = stq.xy;
++    q = stq.z;
++#endif
++#if RAW_LIT || RAW_UVGEN == 2
++    vec3 wn = vec3(dot(uR[0].xyz, mnrm), dot(uR[1].xyz, mnrm), dot(uR[2].xyz, mnrm)) * uR[11].z;
++    wn = normalizedOr001(wn);
++#endif
++#if RAW_UVGEN == 2
++    aUv = (vec2(dot(uR[62].xyz, wn), dot(uR[63].xyz, wn)) + 1.0) * 0.5;
++#endif
++#if RAW_LIT
++    vec3 wpos = vec3(dot(uR[0], aPos), dot(uR[1], aPos), dot(uR[2], aPos));
++    color = pspLight(color, wpos, wn);
++#endif
++#elif PACKED
+     vec4 aPos = vec4(aPacked.xyz * (1.0 / 32768.0), 1.0);
+     vec2 aUv = aPackedUv * (1.0 / 128.0);
+     float packedColor = aColor;
+@@ -415,13 +635,21 @@ void main() {
+     channel.a = floor(packedColor / 32.0);
+     vec4 decodedColor = vec4((channel.rgb * 8.0 + floor(channel.rgb / 4.0)) * (1.0 / 255.0), channel.a);
+ #endif
+-#if MODE == 1
++#if MODE == 1 || MODE == 3
+     float w = dot(uRow3, aPos);
+     if (abs(w) < 1.0e-12) w = 1.0;
+     float z = dot(uRow2, aPos);
+     if (uFlags.x < 0.5) z = clamp(z, 0.0, w);
+     p = vec4(dot(uRow0, aPos), dot(uRow1, aPos), z, w);
++#if MODE == 3
++#if RAW_UVGEN != 0
++    uv = aUv;
++#else
++    uv = aUv * uUv.xy + uUv.zw;
++#endif
++#else
+     uv = aUv * uUv.xy + uUv.zw;
++#endif
+     fog = clamp((dot(uViewZ, aPos) + uFog.x) * uFog.y, 0.0, 1.0);
+ #elif MODE == 2
+     float w = aPos.w;
+@@ -435,7 +663,9 @@ void main() {
+     uv = aUv;
+     fog = aFog;
+ #endif
+-#if PACKED
++#if MODE == 3
++    // Lit above.
++#elif PACKED
+     vec4 color = decodedColor;
+ #else
+     vec4 color = aColor;
+@@ -452,7 +682,7 @@ void main() {
+     vColor = color;
+     // The coordinate goes to texture2DProj untouched so Mali interpolates it
+     // at full precision (repeating textures reach large coordinates).
+-    vTex = vec3(uv * aQ, aQ);
++    vTex = vec3(uv * q, q);
+     vFog = fog;
+ }
+ )";
+@@ -581,11 +811,17 @@ bool link_program(Program &program, const std::string &vertex, const std::string
+     glAttachShader(program.id, fs);
+     glBindAttribLocation(program.id, 0, "aPos");
+     glBindAttribLocation(program.id, 0, "aPacked");
++    glBindAttribLocation(program.id, 0, "aRawPos");
+     glBindAttribLocation(program.id, 1, "aColor");
++    glBindAttribLocation(program.id, 1, "aRawColor");
+     glBindAttribLocation(program.id, 2, "aUv");
+     glBindAttribLocation(program.id, 2, "aPackedUv");
++    glBindAttribLocation(program.id, 2, "aRawUv");
+     glBindAttribLocation(program.id, 3, "aQ");
+     glBindAttribLocation(program.id, 4, "aFog");
++    glBindAttribLocation(program.id, 5, "aNormal");
++    glBindAttribLocation(program.id, 6, "aW0");
++    glBindAttribLocation(program.id, 7, "aW1");
+     glLinkProgram(program.id);
+     glDeleteShader(vs);
+     glDeleteShader(fs);
+@@ -601,23 +837,48 @@ bool link_program(Program &program, const std::string &vertex, const std::string
+     }
+     program.vertex_location = glGetUniformLocation(program.id, "uV");
+     program.fragment_location = glGetUniformLocation(program.id, "uF");
++    program.raw_location = glGetUniformLocation(program.id, "uR");
+     glUseProgram(program.id);
+     if (const GLint sampler = glGetUniformLocation(program.id, "uTex"); sampler >= 0) glUniform1i(sampler, 0);
+     return true;
+ }
+ 
+-Program *program_for(RenderState &r, std::uint32_t key) {
++Program *program_for(RenderState &r, std::uint64_t key) {
+     if (const auto found = r.programs.find(key); found != r.programs.end())
+         return found->second.id != 0u ? &found->second : nullptr;
+-    char defines[256];
+-    std::snprintf(defines, sizeof(defines),
++    const auto field = [&](std::uint32_t shift, std::uint64_t mask) {
++        return static_cast<unsigned>((key >> shift) & mask);
++    };
++    char defines[1024];
++    int written = std::snprintf(defines, sizeof(defines),
+                   "#define MODE %u\n#define TEXTURED %d\n#define FUNC %u\n#define USE_ALPHA %d\n"
+                   "#define DOUBLE %d\n#define FOG %d\n#define ALPHA_TEST %d\n#define ALPHA_FUNC %u\n"
+                   "#define OPAQUE %d\n#define PACKED %d\n",
+-                  (key >> kModeShift) & 3u, (key & kTextured) != 0u, (key >> kFuncShift) & 7u,
++                  field(kModeShift, 3u), (key & kTextured) != 0u, field(kFuncShift, 7u),
+                   (key & kUseAlpha) != 0u, (key & kDouble) != 0u, (key & kFog) != 0u,
+-                  (key & kAlphaTest) != 0u, (key >> kAlphaFuncShift) & 7u, (key & kOpaque) != 0u,
++                  (key & kAlphaTest) != 0u, field(kAlphaFuncShift, 7u), (key & kOpaque) != 0u,
+                   (key & kPacked) != 0u);
++    if (field(kModeShift, 3u) == 3u && written > 0) {
++        // Scales as the CPU decoder's: s8 and u8 /128, s16 and u16 /32768, float as is.
++        const auto scale = [](std::uint32_t type) {
++            return type == 1u ? "(1.0 / 128.0)" : type == 2u ? "(1.0 / 32768.0)" : "1.0";
++        };
++        const unsigned weight_type = field(kRawWeightShift, 3u);
++        std::snprintf(defines + written, sizeof(defines) - static_cast<std::size_t>(written),
++                      "#define RAW_LIT %d\n#define RAW_NORMAL %u\n#define RAW_UV %u\n#define RAW_COLOR %u\n"
++                      "#define RAW_WEIGHTS %u\n#define RAW_UVGEN %u\n"
++                      "#define RAW_POS_SCALE %s\n#define RAW_NRM_SCALE %s\n#define RAW_UV_SCALE %s\n"
++                      "#define RAW_W_SCALE %s\n#define RAW_LIGHTS %u\n#define RAW_LIGHT_POINT %d\n"
++                      "#define RAW_LIGHT_SPOT %d\n#define RAW_LIGHT_SPEC %d\n#define RAW_LIGHT_POW %d\n",
++                      (key & kRawLit) != 0u, field(kRawNormalShift, 3u), field(kRawUvShift, 3u),
++                      field(kRawColorShift, 7u),
++                      weight_type == 0u ? 0u : field(kRawWeightsShift, 7u) + 1u,
++                      field(kRawUvGenShift, 3u),
++                      scale(field(kRawPosShift, 3u)), scale(field(kRawNormalShift, 3u)),
++                      scale(field(kRawUvShift, 3u)), scale(weight_type), field(kRawLightsShift, 7u),
++                      (key & kRawLightPoint) != 0u, (key & kRawLightSpot) != 0u,
++                      (key & kRawLightSpecular) != 0u, (key & kRawLightPow) != 0u);
++    }
+     Program &program = r.programs[key];
+     std::string error;
+     if (!link_program(program, std::string(defines) + kVertexShader,
+@@ -957,7 +1218,7 @@ GLenum depth_compare(std::uint32_t function) noexcept {
+ struct DrawState {
+     Target *target{};
+     std::array<GLint, 4> scissor{};
+-    std::uint32_t program{};
++    std::uint64_t program{};
+     Program *program_object{};
+     GLuint texture{};
+     GlTexture *sampled{};      // decoded texture whose sampler parameters apply
+@@ -965,12 +1226,15 @@ struct DrawState {
+     std::uint32_t fixed{};     // depth/blend/colour-mask/cull bits
+     std::uint32_t blend_color{};
+     UniformValues uniforms{};
++    std::uint32_t raw_state{};     // raw draws: index of the frame's uR block
++    GeGpuRawLayout raw_layout{};
+ };
+ 
+ bool same_state(const DrawState &a, const DrawState &b) {
+     return a.target == b.target && a.scissor == b.scissor && a.program == b.program &&
+            a.texture == b.texture && a.sampler == b.sampler && a.fixed == b.fixed &&
+-           a.blend_color == b.blend_color && a.uniforms == b.uniforms;
++           a.blend_color == b.blend_color && a.uniforms == b.uniforms &&
++           a.raw_state == b.raw_state && a.raw_layout == b.raw_layout;
+ }
+ 
+ constexpr std::uint32_t kFixedDepthTest = 1u;
+@@ -1003,10 +1267,29 @@ std::uint32_t blend_color_of(const GeGpuDrawDescriptor &draw) {
+     return blend_variant(draw) == 4u ? (draw.blend_fix_source & 0x00FFFFFFu) : 0u;
+ }
+ 
+-std::uint32_t program_key(const Batch &batch, bool textured) {
++std::uint64_t program_key(const Batch &batch, bool textured) {
+     const GeGpuDrawDescriptor &draw = batch.draw;
+-    std::uint32_t key = batch.pretransformed ? 0u : batch.hardware_transform ? 1u : 2u;
++    std::uint64_t key = batch.pretransformed ? 0u : batch.hardware_transform ? 1u : 2u;
+     if (batch.packed) key |= kPacked;
++    if (batch.raw) {
++        const GeGpuRawLayout &l = batch.raw_layout;
++        key = 3u;
++        if (l.lit) key |= kRawLit;
++        key |= static_cast<std::uint32_t>(l.position_type & 3u) << kRawPosShift;
++        key |= static_cast<std::uint32_t>(l.normal_type & 3u) << kRawNormalShift;
++        key |= static_cast<std::uint32_t>(l.tc_type & 3u) << kRawUvShift;
++        key |= static_cast<std::uint32_t>(l.color_type & 7u) << kRawColorShift;
++        key |= static_cast<std::uint32_t>(l.weight_type & 3u) << kRawWeightShift;
++        key |= static_cast<std::uint32_t>(l.weight_type != 0u && l.weight_count != 0u ? l.weight_count - 1u : 0u) << kRawWeightsShift;
++        key |= static_cast<std::uint32_t>(l.uv_generation & 3u) << kRawUvGenShift;
++        if (l.lit) {
++            key |= static_cast<std::uint64_t>(l.lights & 7u) << kRawLightsShift;
++            if (l.light_point) key |= kRawLightPoint;
++            if (l.light_spot) key |= kRawLightSpot;
++            if (l.light_specular) key |= kRawLightSpecular;
++            if (l.light_pow) key |= kRawLightPow;
++        }
++    }
+     if (textured) {
+         key |= kTextured;
+         key |= (std::min(draw.texture_function & 7u, 4u)) << kFuncShift;
+@@ -1193,21 +1476,76 @@ void apply_fixed(RenderState &r, std::uint32_t bits, std::uint32_t blend_color)
+     r.fixed_valid = true;
+ }
+ 
++// Which attribute arrays are enabled (bit n = location n); the three vertex
++// formats need different sets and the toggles are driver calls.
++void set_attribute_arrays(RenderState &r, std::uint32_t mask) {
++    if (r.attribute_arrays == mask) return;
++    const bool unknown = r.attribute_arrays == 0xFFFFFFFFu;  // set every one
++    for (std::uint32_t i = 0u; i < 8u; ++i) {
++        const std::uint32_t bit = 1u << i;
++        if (!unknown && (mask & bit) == (r.attribute_arrays & bit)) continue;
++        if (mask & bit) glEnableVertexAttribArray(i);
++        else glDisableVertexAttribArray(i);
++    }
++    r.attribute_arrays = mask;
++}
++
+ // base: a pointer into client memory, or an offset into the bound buffer.
+-void bind_packed_vertices(const std::uint8_t *base) {
++void bind_packed_vertices(RenderState &r, const std::uint8_t *base) {
+     // Stride 10: u8 u, u8 v, u16 colour, s16 x, y, z. q and fog are constant.
+     glVertexAttribPointer(0, 3, GL_SHORT, GL_FALSE, 10, base + 4);
+     glVertexAttribPointer(1, 1, GL_UNSIGNED_SHORT, GL_FALSE, 10, base + 2);
+     glVertexAttribPointer(2, 2, GL_UNSIGNED_BYTE, GL_FALSE, 10, base);
+-    glDisableVertexAttribArray(3);
+-    glDisableVertexAttribArray(4);
++    set_attribute_arrays(r, 0x07u);
++    glVertexAttrib1f(3, 1.0f);
++    glVertexAttrib1f(4, 1.0f);
++}
++
++// Raw vertices: each element as its PSP type (the shader scales them).
++void bind_raw_vertices(RenderState &r, const std::uint8_t *base, const GeGpuRawLayout &l) {
++    const auto signed_type = [](std::uint32_t type) {
++        return type == 1u ? GL_BYTE : type == 2u ? GL_SHORT : GL_FLOAT;
++    };
++    const auto unsigned_type = [](std::uint32_t type) {
++        return type == 1u ? GL_UNSIGNED_BYTE : type == 2u ? GL_UNSIGNED_SHORT : GL_FLOAT;
++    };
++    const GLsizei stride = static_cast<GLsizei>(l.stride);
++    std::uint32_t mask = 1u;
++    glVertexAttribPointer(0, 3, signed_type(l.position_type), GL_FALSE, stride, base + l.position_offset);
++    if (l.color_type == 7u) {
++        glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, base + l.color_offset);
++        mask |= 2u;
++    } else if (l.color_type >= 4u) {
++        glVertexAttribPointer(1, 1, GL_UNSIGNED_SHORT, GL_FALSE, stride, base + l.color_offset);
++        mask |= 2u;
++    }
++    if (l.tc_type != 0u) {
++        glVertexAttribPointer(2, 2, unsigned_type(l.tc_type), GL_FALSE, stride, base + l.tc_offset);
++        mask |= 4u;
++    }
++    if (l.normal_type != 0u) {
++        glVertexAttribPointer(5, 3, signed_type(l.normal_type), GL_FALSE, stride, base + l.normal_offset);
++        mask |= 32u;
++    }
++    if (l.weight_type != 0u && l.weight_count != 0u) {
++        const GLenum type = unsigned_type(l.weight_type);
++        const std::uint32_t size = l.weight_type == 1u ? 1u : l.weight_type == 2u ? 2u : 4u;
++        glVertexAttribPointer(6, static_cast<GLint>(std::min<std::uint32_t>(4u, l.weight_count)), type, GL_FALSE,
++                              stride, base + l.weight_offset);
++        mask |= 64u;
++        if (l.weight_count > 4u) {
++            glVertexAttribPointer(7, static_cast<GLint>(l.weight_count - 4u), type, GL_FALSE, stride,
++                                  base + l.weight_offset + 4u * size);
++            mask |= 128u;
++        }
++    }
++    set_attribute_arrays(r, mask);
+     glVertexAttrib1f(3, 1.0f);
+     glVertexAttrib1f(4, 1.0f);
+ }
+ 
+-void bind_vertices(const Vertex *base) {
+-    glEnableVertexAttribArray(3);
+-    glEnableVertexAttribArray(4);
++void bind_vertices(RenderState &r, const Vertex *base) {
++    set_attribute_arrays(r, 0x1Fu);
+     const auto *bytes = reinterpret_cast<const std::byte *>(base);
+     glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), bytes + offsetof(Vertex, x));
+     glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), bytes + offsetof(Vertex, rgba));
+@@ -1216,7 +1554,7 @@ void bind_vertices(const Vertex *base) {
+     glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(Vertex), bytes + offsetof(Vertex, fog));
+ }
+ 
+-void apply_state(RenderState &r, const DrawState &state) {
++void apply_state(RenderState &r, const DrawState &state, const std::vector<GeGpuRawState> &raw_states) {
+     begin_target(r, *state.target);
+     if (!r.scissor_valid || r.scissor != state.scissor) {
+         // Row 0 is the top of the PSP frame (Y is flipped in the shader), so
+@@ -1237,6 +1575,13 @@ void apply_state(RenderState &r, const DrawState &state) {
+         r.current_program = program.id;
+     }
+     upload_uniforms(program, state.uniforms);
++    if (program.raw_location >= 0 && state.raw_state < raw_states.size() &&
++        (program.raw_sent_epoch != r.frame_epoch || program.raw_sent_state != state.raw_state)) {
++        glUniform4fv(program.raw_location, static_cast<GLsizei>(kGeGpuRawUniforms),
++                     raw_states[state.raw_state].uniforms[0].data());
++        program.raw_sent_epoch = r.frame_epoch;
++        program.raw_sent_state = state.raw_state;
++    }
+     apply_fixed(r, state.fixed, state.blend_color);
+ }
+ 
+@@ -1316,11 +1661,8 @@ void draw_to_screen(RenderState &r, GLuint texture, float aspect) {
+     };
+     glUseProgram(r.present_program.id);
+     r.current_program = r.present_program.id;
+-    glEnableVertexAttribArray(0);
+-    glEnableVertexAttribArray(2);
+-    glDisableVertexAttribArray(1);
+-    glDisableVertexAttribArray(3);
+-    glDisableVertexAttribArray(4);
++    r.attribute_arrays = 0xFFFFFFFFu;
++    set_attribute_arrays(r, 0x05u);
+     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
+     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad + 2);
+     glActiveTexture(GL_TEXTURE0);
+@@ -1482,8 +1824,10 @@ void render_frame(RenderState &r, Frame &frame) {
+                 textured = true;
+             }
+         }
+-        if (batch.hardware_transform && !batch.packed && !batch.pretransformed && cpu_transform_enabled())
++        if (batch.hardware_transform && !batch.packed && !batch.raw && !batch.pretransformed && cpu_transform_enabled())
+             pretransform(frame, batch, target->logical_width, target->logical_height);
++        state.raw_state = batch.raw ? batch.raw_state : 0u;
++        if (batch.raw) state.raw_layout = batch.raw_layout;
+         state.program = program_key(batch, textured);
+         state.program_object = program_for(r, state.program);
+         if (state.program_object == nullptr) continue;
+@@ -1493,8 +1837,12 @@ void render_frame(RenderState &r, Frame &frame) {
+ 
+         // Indices are 16-bit offsets from the group's first vertex (decoded
+         // packed vertices sit after the others, so order isn't guaranteed).
++        // Raw batches: first_vertex is a byte offset, so the group's offset must
++        // be whole vertices of the group's stride.
++        const std::uint32_t stride = batch.raw ? std::max<std::uint32_t>(1u, batch.raw_layout.stride) : 1u;
+         const bool fits = batch.first_vertex >= group.base &&
+-                          batch.first_vertex + batch.vertex_count - group.base <= 65536u;
++                          (batch.first_vertex - group.base) % stride == 0u &&
++                          (batch.first_vertex - group.base) / stride + batch.vertex_count <= 65536u;
+         const bool strip = r.strips && batch.hardware_transform && batch.transform.primitive == 4u;
+         if (!(group_open && fits && group.strip == strip && same_state(state, group.state))) {
+             flush();
+@@ -1505,8 +1853,9 @@ void render_frame(RenderState &r, Frame &frame) {
+             group.strip = strip;
+             group_open = true;
+         }
+-        if (strip) append_strip(r.index16, frame, batch, batch.first_vertex - group.base, group.first_index);
+-        else append_triangles(r.index16, frame, batch, batch.first_vertex - group.base);
++        const std::uint32_t offset = (batch.first_vertex - group.base) / stride;
++        if (strip) append_strip(r.index16, frame, batch, offset, group.first_index);
++        else append_triangles(r.index16, frame, batch, offset);
+         if (self_feedback) flush();
+     }
+     flush();
+@@ -1542,11 +1891,8 @@ void render_frame(RenderState &r, Frame &frame) {
+         r.vertex_buffer = set[0];
+         r.packed_buffer = set[1];
+     }
+-    glEnableVertexAttribArray(0);
+-    glEnableVertexAttribArray(1);
+-    glEnableVertexAttribArray(2);
+-    glEnableVertexAttribArray(3);
+-    glEnableVertexAttribArray(4);
++    r.attribute_arrays = 0xFFFFFFFFu;
++    set_attribute_arrays(r, 0x1Fu);
+     glActiveTexture(GL_TEXTURE0);
+     invalidate_state(r);
+     r.current_target = nullptr;
+@@ -1557,19 +1903,25 @@ void render_frame(RenderState &r, Frame &frame) {
+             snapshot_target(r, *command.snapshot);
+             continue;
+         }
+-        apply_state(r, command.state);
+-        if (command.state.program & kPacked) {
++        apply_state(r, command.state, frame.raw_states);
++        if ((command.state.program & 3u) == 3u) {
++            if (r.use_vbo && bound_array != r.packed_buffer) {
++                glBindBuffer(GL_ARRAY_BUFFER, r.packed_buffer);
++                bound_array = r.packed_buffer;
++            }
++            bind_raw_vertices(r, packed_base + command.base, command.state.raw_layout);
++        } else if (command.state.program & kPacked) {
+             if (r.use_vbo && bound_array != r.packed_buffer) {
+                 glBindBuffer(GL_ARRAY_BUFFER, r.packed_buffer);
+                 bound_array = r.packed_buffer;
+             }
+-            bind_packed_vertices(packed_base + static_cast<std::size_t>(command.base) * 10u);
++            bind_packed_vertices(r, packed_base + static_cast<std::size_t>(command.base) * 10u);
+         } else {
+             if (r.use_vbo && bound_array != r.vertex_buffer) {
+                 glBindBuffer(GL_ARRAY_BUFFER, r.vertex_buffer);
+                 bound_array = r.vertex_buffer;
+             }
+-            bind_vertices(reinterpret_cast<const Vertex *>(vertex_base + static_cast<std::size_t>(command.base) * sizeof(Vertex)));
++            bind_vertices(r, reinterpret_cast<const Vertex *>(vertex_base + static_cast<std::size_t>(command.base) * sizeof(Vertex)));
+         }
+         glDrawElements(command.strip ? GL_TRIANGLE_STRIP : GL_TRIANGLES, static_cast<GLsizei>(command.index_count),
+                        GL_UNSIGNED_SHORT,
+@@ -2434,7 +2786,11 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
+         }
+     }
+     const auto *bytes = reinterpret_cast<const std::uint8_t *>(packed_vertices.data());
+-    const std::uint32_t first_vertex = static_cast<std::uint32_t>(s.packed.size() / sizeof(Packed0115));
++    // The array also holds raw blocks of other strides: start on a whole
++    // 10-byte vertex (first_vertex counts those).
++    const std::size_t padded = (s.packed.size() + sizeof(Packed0115) - 1u) / sizeof(Packed0115) * sizeof(Packed0115);
++    s.packed.resize(padded);
++    const std::uint32_t first_vertex = static_cast<std::uint32_t>(padded / sizeof(Packed0115));
+     const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
+     s.packed.insert(s.packed.end(), bytes, bytes + packed_vertices.size());
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+@@ -2456,6 +2812,66 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
+     return true;
+ }
+ 
++bool ge_gpu_backend_accumulate_hardware_raw(
++    const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
++    const GeGpuRawLayout &layout, std::span<const std::byte> raw_vertices, std::uint32_t vertex_count,
++    std::span<const std::uint32_t> triangle_indices, const GeGpuRawState &raw_state,
++    bool state_changed) noexcept {
++    Gles2State &s = state();
++    if (!s.enabled || vertex_count == 0u || layout.stride == 0u ||
++        raw_vertices.size() != static_cast<std::size_t>(vertex_count) * layout.stride)
++        return false;
++    const bool indexed = !triangle_indices.empty();
++    const std::size_t emitted = indexed ? triangle_indices.size() : vertex_count;
++    if (emitted == 0u || (transform.primitive == 4u ? emitted < 3u : (emitted % 3u) != 0u)) return true;
++    if (s.packed.size() + raw_vertices.size() > kMaxFrameVertices * sizeof(Packed0115) || vertex_count > 65536u) {
++        ++s.report.game_vertex_overflows;
++        return true;
++    }
++    if (indexed) {
++        std::uint32_t highest = 0u;
++        for (std::uint32_t index : triangle_indices) highest = std::max(highest, index);
++        if (highest >= vertex_count) {
++            ++s.report.game_vertex_overflows;
++            return true;
++        }
++    }
++    // Each element must stay aligned to its type in the frame array (the
++    // PSP layout aligns them within a vertex): the block starts aligned to
++    // the widest element.
++    const auto width = [](std::uint32_t type) { return type == 3u ? 4u : type == 2u ? 2u : 1u; };
++    std::uint32_t alignment = std::max({width(layout.position_type), width(layout.normal_type),
++                                        width(layout.tc_type), width(layout.weight_type)});
++    if (layout.color_type == 7u) alignment = 4u;
++    else if (layout.color_type >= 4u) alignment = std::max(alignment, 2u);
++    const std::size_t padded = (s.packed.size() + alignment - 1u) & ~static_cast<std::size_t>(alignment - 1u);
++    s.packed.resize(padded);
++    const std::uint32_t first_vertex = static_cast<std::uint32_t>(padded);
++    const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
++    const auto *bytes = reinterpret_cast<const std::uint8_t *>(raw_vertices.data());
++    s.packed.insert(s.packed.end(), bytes, bytes + raw_vertices.size());
++    if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
++    if (state_changed || s.raw_states.empty()) s.raw_states.push_back(raw_state);
++    Batch &batch = s.batches.emplace_back(draw, transform);
++    batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
++    batch.first_vertex = first_vertex;
++    batch.vertex_count = vertex_count;
++    batch.first_index = first_index;
++    batch.index_count = indexed ? static_cast<std::uint32_t>(triangle_indices.size()) : 0u;
++    batch.indexed = indexed;
++    batch.logical_draw_count = std::max<std::uint32_t>(1u, transform.logical_prim_batches);
++    batch.hardware_transform = true;
++    batch.raw = true;
++    batch.raw_layout = layout;
++    batch.raw_state = static_cast<std::uint32_t>(s.raw_states.size() - 1u);
++    batch.feedback_address = draw.texture_address & 0x001FFFF0u;
++    batch.framebuffer_feedback = draw.texture_enabled && is_target(s, batch.feedback_address);
++    s.report.game_draw_calls += batch.logical_draw_count;
++    s.report.hw_transform_draw_calls += batch.logical_draw_count;
++    s.report.game_vertices += emitted;
++    return true;
++}
++
+ void ge_gpu_backend_set_native_window(void *) noexcept {}
+ 
+ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address, std::uint32_t logical_width,
+@@ -2498,6 +2914,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+     frame->packed.swap(s.packed);
+     frame->indices.swap(s.indices);
+     frame->batches.swap(s.batches);
++    frame->raw_states.swap(s.raw_states);
+     frame->uploads.swap(s.uploads);
+     frame->deletes.swap(s.deletes);
+     frame->targets.clear();
+diff --git a/lcs/host/ge_gpu_backend_vulkan.cpp b/lcs/host/ge_gpu_backend_vulkan.cpp
+index 3ede289..55711cb 100644
+--- a/lcs/host/ge_gpu_backend_vulkan.cpp
++++ b/lcs/host/ge_gpu_backend_vulkan.cpp
+@@ -2956,6 +2956,11 @@ bool ge_gpu_backend_packed_0115_bounds(std::span<const std::byte>, std::array<fl
+                                        std::array<float, 3> &) noexcept {
+     return false;
+ }
++bool ge_gpu_backend_accumulate_hardware_raw(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &,
++                                            const GeGpuRawLayout &, std::span<const std::byte>, std::uint32_t,
++                                            std::span<const std::uint32_t>, const GeGpuRawState &, bool) noexcept {
++    return false;
++}
+ bool ge_gpu_backend_box_off_screen(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &,
+                                    const std::array<float, 3> &, const std::array<float, 3> &,
+                                    std::uint32_t) noexcept {
+diff --git a/lcs/host/ge_gpu_backend_dx12.cpp b/lcs/host/ge_gpu_backend_dx12.cpp
+index 5b7712f..f0f2824 100644
+--- a/lcs/host/ge_gpu_backend_dx12.cpp
++++ b/lcs/host/ge_gpu_backend_dx12.cpp
+@@ -3027,6 +3027,11 @@ bool ge_gpu_backend_packed_0115_bounds(std::span<const std::byte>, std::array<fl
+                                        std::array<float, 3> &) noexcept {
+     return false;
+ }
++bool ge_gpu_backend_accumulate_hardware_raw(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &,
++                                            const GeGpuRawLayout &, std::span<const std::byte>, std::uint32_t,
++                                            std::span<const std::uint32_t>, const GeGpuRawState &, bool) noexcept {
++    return false;
++}
+ bool ge_gpu_backend_box_off_screen(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &,
+                                    const std::array<float, 3> &, const std::array<float, 3> &,
+                                    std::uint32_t) noexcept {
+@@ -3634,6 +3639,7 @@ void ge_gpu_backend_accumulate_hardware_triangles(const GeGpuDrawDescriptor &, c
+ bool ge_gpu_backend_accumulate_hardware_packed_0115(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const std::byte>, std::uint32_t, std::span<const std::uint32_t>) noexcept { return false; }
+ bool ge_gpu_backend_packed_0115_off_screen(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const std::byte>) noexcept { return false; }
+ bool ge_gpu_backend_packed_0115_bounds(std::span<const std::byte>, std::array<float, 3> &, std::array<float, 3> &) noexcept { return false; }
++bool ge_gpu_backend_accumulate_hardware_raw(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, const GeGpuRawLayout &, std::span<const std::byte>, std::uint32_t, std::span<const std::uint32_t>, const GeGpuRawState &, bool) noexcept { return false; }
+ bool ge_gpu_backend_box_off_screen(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, const std::array<float, 3> &, const std::array<float, 3> &, std::uint32_t) noexcept { return false; }
+ void ge_gpu_backend_set_native_window(void *) noexcept {}
+ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address, std::uint32_t, std::uint32_t) noexcept { state().display_framebuffer = address & 0x001FFFF0u; }

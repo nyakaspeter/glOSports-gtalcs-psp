@@ -1,0 +1,69 @@
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -4122,26 +4122,29 @@ namespace {
+ // its palette for the texture cache key; with thousands of draws a frame
+ // sharing a few palettes that was ~15% of the GE thread, so each palette is
+ // hashed once per list (lists don't rewrite the palettes they draw with).
++// Direct-mapped by address: GTA draws with hundreds of palettes a frame.
+ struct ClutChecksum {
+     std::uint32_t generation{};
+     std::uint32_t address{};
+     std::uint32_t bytes{};
+     std::uint32_t checksum{};
+ };
+-std::array<ClutChecksum, 16> g_clut_checksums{};
++std::array<ClutChecksum, 1024> g_clut_checksums{};
+ std::uint32_t g_clut_generation = 1u;
+ 
++ClutChecksum &clut_slot(std::uint32_t address) noexcept {
++    return g_clut_checksums[((address >> 4u) ^ (address >> 14u)) & (g_clut_checksums.size() - 1u)];
++}
++
+ const std::uint32_t *cached_clut_checksum(std::uint32_t address, std::uint32_t bytes) noexcept {
+-    for (const ClutChecksum &entry : g_clut_checksums)
+-        if (entry.generation == g_clut_generation && entry.address == address && entry.bytes == bytes)
+-            return &entry.checksum;
++    const ClutChecksum &entry = clut_slot(address);
++    if (entry.generation == g_clut_generation && entry.address == address && entry.bytes == bytes)
++        return &entry.checksum;
+     return nullptr;
+ }
+ 
+ void remember_clut_checksum(std::uint32_t address, std::uint32_t bytes, std::uint32_t checksum) noexcept {
+-    static std::size_t next = 0u;
+-    g_clut_checksums[next] = {g_clut_generation, address, bytes, checksum};
+-    next = (next + 1u) % g_clut_checksums.size();
++    clut_slot(address) = {g_clut_generation, address, bytes, checksum};
+ }
+ 
+ }  // namespace
+@@ -4591,16 +4594,19 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                 const std::size_t triangle_count = primitive == 3u ? count / 3u
+                     : (count > 2u ? count - 2u : 0u);
+                 triangle_indices.reserve(triangle_count * 3u);
+-                if (primitive == 3u) {
+-                    for (std::size_t i = 0u; i + 2u < count; i += 3u) {
+-                        triangle_indices.push_back(occurrence_index(i));
+-                        triangle_indices.push_back(occurrence_index(i + 1u));
+-                        triangle_indices.push_back(occurrence_index(i + 2u));
++                if (primitive == 3u || primitive == 4u) {
++                    // Lists and strips keep the stream as it is (one write each).
++                    const std::size_t n = primitive == 3u ? triangle_count * 3u : count;
++                    triangle_indices.resize(n);
++                    std::uint32_t *out = triangle_indices.data();
++                    if (!indexed) {
++                        for (std::size_t i = 0u; i < n; ++i) out[i] = static_cast<std::uint32_t>(i);
++                    } else if (contiguous_decode) {
++                        const std::uint32_t *in = occurrence_indices.data();
++                        for (std::size_t i = 0u; i < n; ++i) out[i] = in[i] - contiguous_first;
++                    } else {
++                        std::memcpy(out, occurrence_remap.data(), n * sizeof(std::uint32_t));
+                     }
+-                } else if (primitive == 4u) {
+-                    triangle_indices.reserve(count);
+-                    for (std::size_t i = 0u; i < count; ++i)
+-                        triangle_indices.push_back(occurrence_index(i));
+                 } else {
+                     for (std::size_t i = 1u; i + 1u < count; ++i) {
+                         triangle_indices.push_back(occurrence_index(0u));

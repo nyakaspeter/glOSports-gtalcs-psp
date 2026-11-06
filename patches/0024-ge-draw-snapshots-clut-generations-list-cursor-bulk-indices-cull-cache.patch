@@ -1,0 +1,594 @@
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+index 82aecf3..f2ffbcf 100644
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -3811,14 +3811,12 @@ struct HwDrawJob {
+ 
+     // Inputs captured at setup time. The inline job (no decode workers) points
+     // at the executor's own command array, transform state and lighting; a
+-    // deferred job copies them into *_copy first, since the executor moves on.
++    // deferred job points at an HwDrawContext snapshot, since the executor
++    // moves on.
+     const psprecomp::GuestMemory *memory{};
+     const std::array<std::uint32_t, 256> *commands{};
+     const GeTransformState *transform{};
+     const PreparedLighting *prepared_lighting{};
+-    std::array<std::uint32_t, 256> commands_copy{};
+-    GeTransformState transform_copy{};
+-    PreparedLighting lighting_copy{};
+     VertexLayout layout{};
+     GeGpuDrawDescriptor effective_draw{};
+     GeGpuHardwareTransform hw{};
+@@ -3955,8 +3953,43 @@ bool hw_job_prepare(HwDrawJob &job) {
+     const std::uint32_t count = job.count;
+     const std::size_t triangle_count =
+         job.primitive == 3u ? count / 3u : (count > 2u ? count - 2u : 0u);
++    if (!job.flat_shading) {
++        // Straight into the resized vector (the per-index push_back was ~2% of
++        // the GE thread outdoors); strips and fans become lists.
++        job.triangle_indices.resize(triangle_count * 3u);
++        std::uint32_t *out = job.triangle_indices.data();
++        const std::uint32_t *in = job.indexed
++            ? (job.contiguous_decode ? job.occurrence_indices.data() : job.occurrence_remap.data())
++            : nullptr;
++        const std::uint32_t base = job.contiguous_decode ? job.contiguous_first : 0u;
++        const auto at = [&](std::size_t i) -> std::uint32_t {
++            return in != nullptr ? in[i] - base : static_cast<std::uint32_t>(i);
++        };
++        if (job.primitive == 3u) {
++            const std::size_t n = triangle_count * 3u;
++            if (in == nullptr) {
++                for (std::size_t i = 0u; i < n; ++i) out[i] = static_cast<std::uint32_t>(i);
++            } else {
++                for (std::size_t i = 0u; i < n; ++i) out[i] = in[i] - base;
++            }
++        } else if (job.primitive == 4u) {
++            for (std::size_t i = 0u; i < triangle_count; ++i, out += 3u) {
++                out[0] = at((i & 1u) == 0u ? i : i + 1u);
++                out[1] = at((i & 1u) == 0u ? i + 1u : i);
++                out[2] = at(i + 2u);
++            }
++        } else {
++            const std::uint32_t first = at(0u);
++            for (std::size_t i = 0u; i < triangle_count; ++i, out += 3u) {
++                out[0] = first;
++                out[1] = at(i + 1u);
++                out[2] = at(i + 2u);
++            }
++        }
++        return true;
++    }
+     job.triangle_indices.reserve(triangle_count * 3u);
+-    if (job.flat_shading) job.submitted_vertices.reserve(triangle_count * 3u);
++    job.submitted_vertices.reserve(triangle_count * 3u);
+     if (job.primitive == 3u) {
+         for (std::size_t i = 0u; i + 2u < count; i += 3u)
+             emit_triangle(occurrence_index(i), occurrence_index(i + 1u), occurrence_index(i + 2u));
+@@ -4129,11 +4162,15 @@ namespace {
+ // sharing a few palettes that was ~15% of the GE thread, so each palette is
+ // hashed once per list (lists don't rewrite the palettes they draw with).
+ // Direct-mapped by address: GTA draws with hundreds of palettes a frame.
++// Across lists the checksum stays valid while the palette's pages are
++// unwritten (the guest memory's page generations); a palette written by a
++// path that doesn't bump them is still re-hashed within 8 lists.
+ struct ClutChecksum {
+     std::uint32_t generation{};
+     std::uint32_t address{};
+     std::uint32_t bytes{};
+     std::uint32_t checksum{};
++    std::uint64_t pages{};
+ };
+ std::array<ClutChecksum, 1024> g_clut_checksums{};
+ std::uint32_t g_clut_generation = 1u;
+@@ -4143,20 +4180,124 @@ ClutChecksum &clut_slot(std::uint32_t address, std::uint32_t bytes) noexcept {
+     return g_clut_checksums[mixed & (g_clut_checksums.size() - 1u)];
+ }
+ 
+-const std::uint32_t *cached_clut_checksum(std::uint32_t address, std::uint32_t bytes) noexcept {
++const std::uint32_t *cached_clut_checksum(std::uint32_t address, std::uint32_t bytes,
++                                          std::uint64_t pages) noexcept {
+     const ClutChecksum &entry = clut_slot(address, bytes);
+-    if (entry.generation == g_clut_generation && entry.address == address && entry.bytes == bytes)
+-        return &entry.checksum;
++    if (entry.address != address || entry.bytes != bytes || entry.generation == 0u) return nullptr;
++    if (entry.generation == g_clut_generation) return &entry.checksum;
++    if (entry.pages == pages && g_clut_generation - entry.generation < 8u) return &entry.checksum;
+     return nullptr;
+ }
+ 
+-void remember_clut_checksum(std::uint32_t address, std::uint32_t bytes, std::uint32_t checksum) noexcept {
+-    clut_slot(address, bytes) = {g_clut_generation, address, bytes, checksum};
++void remember_clut_checksum(std::uint32_t address, std::uint32_t bytes, std::uint32_t checksum,
++                            std::uint64_t pages) noexcept {
++    clut_slot(address, bytes) = {g_clut_generation, address, bytes, checksum, pages};
++}
++
++// Draw state shared by consecutive deferred jobs. A deferred job used to copy
++// the command array, the transform state and the prepared lighting (~2 KB a
++// draw, ~5% of the GE thread in the open world); consecutive draws mostly
++// share them, so they are snapshotted once per state change (the executor's
++// revisions) and the jobs point at the snapshot. The ring is deeper than the
++// job ring, so no snapshot a pending job still reads is overwritten.
++struct HwDrawContext {
++    std::array<std::uint32_t, 256> commands{};
++    GeTransformState transform{};
++    PreparedLighting lighting{};
++    std::uint64_t transform_revision{};
++    std::uint64_t lighting_revision{};
++    std::uint64_t matrix_revision{};
++    bool has_vertex_color{};
++    bool lighting_prepared{};
++    bool valid{};
++};
++
++const HwDrawContext &hw_draw_context(const std::array<std::uint32_t, 256> &commands,
++                                     const GeTransformState &transform,
++                                     const PreparedLighting &lighting,
++                                     bool lighting_prepared,
++                                     std::uint64_t transform_revision,
++                                     std::uint64_t lighting_revision,
++                                     std::uint64_t matrix_revision,
++                                     bool has_vertex_color) {
++    constexpr std::size_t kContexts = 2u * HwDrawQueue::kSlots;
++    static thread_local std::vector<HwDrawContext> ring(kContexts);
++    static thread_local std::size_t index = 0u;
++    HwDrawContext &last = ring[index];
++    if (last.valid && transform_revision != 0u && lighting_revision != 0u && matrix_revision != 0u &&
++        last.transform_revision == transform_revision && last.lighting_revision == lighting_revision &&
++        last.matrix_revision == matrix_revision && last.has_vertex_color == has_vertex_color &&
++        last.lighting_prepared == lighting_prepared)
++        return last;
++    index = (index + 1u) % kContexts;
++    HwDrawContext &next = ring[index];
++    next.commands = commands;
++    next.transform = transform;
++    next.lighting = lighting;
++    next.lighting_prepared = lighting_prepared;
++    next.transform_revision = transform_revision;
++    next.lighting_revision = lighting_revision;
++    next.matrix_revision = matrix_revision;
++    next.has_vertex_color = has_vertex_color;
++    next.valid = true;
++    return next;
++}
++
++// LCS_GE_LAYOUT_STATS=1: draws and vertices a list by vertex layout, lighting
++// and path (0 packed 0115, 1 decoded unlit, 2 decoded and lit on the CPU,
++// 3 software, 4 culled), printed every 300 lists, to see what the GE thread
++// spends its decode time on.
++struct LayoutStat {
++    std::uint64_t key{};
++    std::uint64_t draws{};
++    std::uint64_t vertices{};
++};
++std::vector<LayoutStat> g_layout_stats;  // GE thread only
++std::uint32_t g_layout_stat_lists = 0u;
++
++bool layout_stats_enabled() noexcept {
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_GE_LAYOUT_STATS");
++        return text != nullptr && *text != '\0' && *text != '0';
++    }();
++    return enabled;
++}
++
++void note_layout_stat(std::uint32_t layout_type, bool lighting_on, std::uint32_t path,
++                      std::uint32_t count) {
++    if (!layout_stats_enabled()) return;
++    const std::uint64_t key = (layout_type & 0xFFFFFFu) |
++        (static_cast<std::uint64_t>(lighting_on) << 24u) | (static_cast<std::uint64_t>(path) << 25u);
++    for (LayoutStat &stat : g_layout_stats) {
++        if (stat.key == key) {
++            ++stat.draws;
++            stat.vertices += count;
++            return;
++        }
++    }
++    g_layout_stats.push_back({key, 1u, count});
++}
++
++void flush_layout_stats() {
++    if (!layout_stats_enabled() || ++g_layout_stat_lists % 300u != 0u) return;
++    std::sort(g_layout_stats.begin(), g_layout_stats.end(),
++              [](const LayoutStat &a, const LayoutStat &b) { return a.vertices > b.vertices; });
++    for (const LayoutStat &stat : g_layout_stats) {
++        std::fprintf(stderr, "ge-layouts: type %06llx lit %llu path %llu draws %.1f vertices %.0f per list\n",
++                     static_cast<unsigned long long>(stat.key & 0xFFFFFFu),
++                     static_cast<unsigned long long>((stat.key >> 24u) & 1u),
++                     static_cast<unsigned long long>(stat.key >> 25u),
++                     static_cast<double>(stat.draws) / 300.0, static_cast<double>(stat.vertices) / 300.0);
++    }
++    g_layout_stats.clear();
+ }
+ 
+ }  // namespace
+ 
+-void begin_ge_list() noexcept { ++g_clut_generation; }
++void begin_ge_list() noexcept {
++    ++g_clut_generation;
++    flush_layout_stats();
++}
+ 
+ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                          const std::array<std::uint32_t, 256> &commands,
+@@ -4169,7 +4310,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                          std::uint32_t logical_primitive_count,
+                          std::uint64_t draw_state_revision,
+                          std::uint64_t camera_state_revision,
+-                         std::uint64_t lighting_state_revision) {
++                         std::uint64_t lighting_state_revision,
++                         std::uint64_t matrix_state_revision) {
+     stats.next_vertex_address = vertex_address;
+     stats.next_index_address = index_address;
+     const std::uint32_t primitive = (primitive_data >> 16u) & 7u;
+@@ -4201,13 +4343,36 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+     if (layout.type == 0x000115u && layout.stride == 10u && !layout.through && primitive >= 3u &&
+         primitive <= 5u && (data24(commands[0xC0u]) & 3u) == 0u && (data24(commands[0xD3u]) & 1u) == 0u &&
+         ge_gpu_backend_active()) {
+-        if (const std::uint8_t *raw = memory.raw_pointer(vertex_address, static_cast<std::size_t>(count) * 10u)) {
++        const std::size_t packed_bytes = static_cast<std::size_t>(count) * 10u;
++        if (const std::uint8_t *raw = memory.raw_pointer(vertex_address, packed_bytes)) {
++            // Model-space bounds per (address, size), kept while the vertex
++            // pages are unwritten: the scan was ~3% of the GE thread outdoors.
++            struct PackedBounds {
++                std::uint32_t address{};
++                std::uint32_t bytes{};
++                std::uint64_t pages{};
++                std::array<float, 3> low{};
++                std::array<float, 3> high{};
++                bool valid{};
++            };
++            static thread_local std::array<PackedBounds, 4096> bounds_cache{};
++            PackedBounds &bounds =
++                bounds_cache[((vertex_address >> 4u) ^ (vertex_address >> 16u) ^ count) & 4095u];
++            const std::uint64_t pages = memory.range_generation(vertex_address, packed_bytes);
++            if (!bounds.valid || bounds.address != vertex_address || bounds.bytes != packed_bytes ||
++                bounds.pages != pages) {
++                bounds.valid = ge_gpu_backend_packed_0115_bounds(
++                    std::span<const std::byte>(reinterpret_cast<const std::byte *>(raw), packed_bytes),
++                    bounds.low, bounds.high);
++                bounds.address = vertex_address;
++                bounds.bytes = static_cast<std::uint32_t>(packed_bytes);
++                bounds.pages = pages;
++            }
+             GeGpuDrawDescriptor target{};
+             target.framebuffer_address = framebuffer_address(commands);
+-            if (ge_gpu_backend_packed_0115_off_screen(
+-                    target, plain_transform(),
+-                    std::span<const std::byte>(reinterpret_cast<const std::byte *>(raw),
+-                                               static_cast<std::size_t>(count) * 10u))) {
++            if (bounds.valid &&
++                ge_gpu_backend_box_off_screen(target, plain_transform(), bounds.low, bounds.high, count)) {
++                note_layout_stat(layout.type, false, 4u, count);
+                 stats.next_vertex_address = vertex_address + count * 10u;
+                 return true;
+             }
+@@ -4324,7 +4489,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             const std::uint32_t offset_bytes = first * entry_bytes;
+             const std::uint32_t clut_bytes = (last - first + 1u) * entry_bytes;
+             const std::uint32_t clut_start = gpu_draw.clut_address + offset_bytes;
+-            if (const std::uint32_t *cached = cached_clut_checksum(clut_start, clut_bytes)) {
++            const std::uint64_t clut_pages = memory.range_generation(clut_start, clut_bytes);
++            if (const std::uint32_t *cached = cached_clut_checksum(clut_start, clut_bytes, clut_pages)) {
+                 gpu_draw.clut_checksum = *cached;
+             } else if (const std::uint8_t *clut = memory.raw_pointer(clut_start, clut_bytes)) {
+                 // Two 32-bit lanes over whole words (~400 palettes, ~400 KB a
+@@ -4341,7 +4507,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                 for (; offset < clut_bytes; ++offset) lane0 = (lane0 ^ clut[offset]) * 16777619u;
+                 std::uint32_t checksum = lane0 ^ (lane1 * 0xC2B2AE35u) ^ (lane1 >> 16u);
+                 gpu_draw.clut_checksum = checksum;
+-                remember_clut_checksum(clut_start, clut_bytes, checksum);
++                remember_clut_checksum(clut_start, clut_bytes, checksum, clut_pages);
+             }
+         }
+         ge_gpu_backend_prepare_texture_keys(gpu_draw);
+@@ -4667,6 +4833,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                     static_cast<std::uint32_t>(decode_count), triangle_indices);
+             }
+             if (accepted) {
++                note_layout_stat(layout.type, lighting_on, 0u, count);
+                 advance_stream();
+                 return true;
+             }
+@@ -4702,12 +4869,12 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+         }
+         job.memory = &memory;
+         if (deferred) {
+-            job.commands_copy = commands;
+-            job.transform_copy = transform;
+-            job.lighting_copy = prepared_lighting;
+-            job.commands = &job.commands_copy;
+-            job.transform = &job.transform_copy;
+-            job.prepared_lighting = &job.lighting_copy;
++            const HwDrawContext &context = hw_draw_context(
++                commands, transform, prepared_lighting, hw_lighting_on_cpu, camera_state_revision,
++                lighting_state_revision, matrix_state_revision, layout.color_type >= 4u);
++            job.commands = &context.commands;
++            job.transform = &context.transform;
++            job.prepared_lighting = &context.lighting;
+         } else {
+             job.commands = &commands;
+             job.transform = &transform;
+@@ -4736,6 +4903,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+         job.sampled_texture_ready = sampled_texture_ready;
+         job.failed = false;
+         job.error.clear();
++        note_layout_stat(layout.type, lighting_on, cpu_lighting_effective ? 2u : 1u, count);
+ 
+         if (deferred) {
+             queue.publish(framebuffer_address(commands) & 0x001FFFF0u);
+@@ -4752,6 +4920,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+     }
+ 
+     hw_draw_queue().drain();
++    note_layout_stat(layout.type, lighting_on, 3u, count);
+ 
+     FragmentSetup setup = make_fragment_setup_cached(commands);
+     bind_fragment_buffers(setup, memory, commands);
+diff --git a/lcs/host/ge_renderer.hpp b/lcs/host/ge_renderer.hpp
+index df192db..d727bc2 100644
+--- a/lcs/host/ge_renderer.hpp
++++ b/lcs/host/ge_renderer.hpp
+@@ -57,7 +57,8 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                          std::uint32_t logical_primitive_count = 1u,
+                          std::uint64_t draw_state_revision = 0u,
+                          std::uint64_t camera_state_revision = 0u,
+-                         std::uint64_t lighting_state_revision = 0u);
++                         std::uint64_t lighting_state_revision = 0u,
++                         std::uint64_t matrix_state_revision = 0u);
+ 
+ void flush_ge_deferred_rasterization(psprecomp::GuestMemory &memory);
+ // A display list starts: palette checksums cached during the previous one
+diff --git a/lcs/host/lcs_ge_exec.cpp b/lcs/host/lcs_ge_exec.cpp
+index 7c54c7e..707f1eb 100644
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -48,12 +48,16 @@ constexpr std::array<std::uint8_t, 256> kCommandClass = [] {
+     for (std::uint32_t op = 0x17u; op <= 0x1Bu; ++op) c[op] |= kLighting;
+     for (std::uint32_t op = 0x50u; op <= 0x5Du; ++op) c[op] |= kLighting;
+     for (std::uint32_t op = 0x5Fu; op <= 0x9Au; ++op) c[op] |= kLighting;
++    // Texture-coordinate generation mode and its light sources: read by the
++    // vertex decoders, so a change must also drop the shared draw snapshot.
++    for (std::uint32_t op : {0xC0u, 0xC1u}) c[op] |= kLighting;
+     return c;
+ }();
+ // Bumped when a register of that group is written; render_ge_primitive's
+ // lighting and transform caches compare them. Start at 1: 0 means "no cache".
+ std::uint64_t ge_lighting_revision = 1u;
+ std::uint64_t ge_transform_revision = 1u;
++std::uint64_t ge_matrix_revision = 1u;  // any matrix or morph word (bones and texture matrix included)
+ 
+ std::uint32_t relative_address(std::uint32_t data24) {
+     const std::uint32_t extended = ((ge_base_register & 0x000F0000u) << 8u) | (data24 & 0x00FFFFFFu);
+@@ -94,6 +98,30 @@ struct ListReader {
+         word = memory.load32(address);
+         return true;
+     }
++
++    // The words from `address` to the end of its RAM or VRAM buffer, for the
++    // executor to read through one pointer until the next jump (fetch above
++    // tested two ranges for every word: ~4% of the GE thread outdoors).
++    bool locate(std::uint32_t address, const std::uint8_t *&cursor,
++                const std::uint8_t *&end) const noexcept {
++        const std::uint32_t canonical = address & 0x1FFFFFFFu;
++        const std::uint32_t offset = canonical - Memory::kPhysicalBase;
++        if (ram != nullptr && ram_size >= 4u && offset <= ram_size - 4u) {
++            cursor = ram + offset;
++            end = ram + (ram_size & ~3u);
++            return true;
++        }
++        if (const std::uint32_t window = canonical - Memory::kVramPhysicalBase;
++            vram != nullptr && window < Memory::kVramAddressSpan) {
++            const std::uint32_t vram_offset = window & (Memory::kVramSize - 1u);
++            if (vram_size >= 4u && vram_offset <= vram_size - 4u) {
++                cursor = vram + vram_offset;
++                end = vram + (vram_size & ~3u);
++                return true;
++            }
++        }
++        return false;
++    }
+ };
+ 
+ }  // namespace
+@@ -108,10 +136,17 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
+     std::uint32_t call_depth = 0u;
+     std::uint32_t pc = list_address;
+     const ListReader reader(memory);
++    const std::uint8_t *cursor = nullptr;
++    const std::uint8_t *end = nullptr;
+ 
+     for (std::uint32_t executed = 0u; executed < kMaxCommands; ++executed) {
+         std::uint32_t word;
+-        if (!reader.fetch(pc, word)) break;
++        if (cursor != end || reader.locate(pc, cursor, end)) {
++            std::memcpy(&word, cursor, sizeof(word));
++            cursor += 4u;
++        } else if (!reader.fetch(pc, word)) {
++            break;
++        }
+         const std::uint32_t op_pc = pc;
+         pc = (pc + 4u) & 0x0FFFFFFFu;
+         const std::uint32_t command = word >> 24u;
+@@ -119,7 +154,10 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
+         ge_commands[command] = data;
+         const std::uint8_t cls = kCommandClass[command];
+         if (cls == 0u) continue;
+-        if (cls & kMatrix) update_ge_transform_state(ge_transform, command, data);
++        if (cls & kMatrix) {
++            update_ge_transform_state(ge_transform, command, data);
++            ++ge_matrix_revision;
++        }
+         if (cls & kLighting) ++ge_lighting_revision;
+         if (cls & kTransform) ++ge_transform_revision;
+         if (!(cls & kSwitch)) continue;
+@@ -143,15 +181,18 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
+             break;
+         case 0x08u:
+             pc = relative_address(data);
++            cursor = end;
+             break;
+         case 0x09u:
+             break;
+         case 0x0Au:
+             if (call_depth < call_stack.size()) call_stack[call_depth++] = pc;
+             pc = relative_address(data);
++            cursor = end;
+             break;
+         case 0x0Bu:
+             if (call_depth != 0u) pc = call_stack[--call_depth];
++            cursor = end;
+             break;
+         case 0x0Fu:
+             ge_finish_seen = true;
+@@ -166,7 +207,8 @@ void execute_ge_list_rendered(psprecomp::GuestMemory &memory, std::uint32_t list
+             lcs_set_ge_command(op_pc);
+             if (!render_ge_primitive(memory, ge_commands, ge_transform, ge_vertex_address,
+                                      ge_index_address, data, stats, error, 1u, 0u,
+-                                     ge_transform_revision, ge_lighting_revision)) {
++                                     ge_transform_revision, ge_lighting_revision,
++                                     ge_matrix_revision)) {
+                 flush_ge_deferred_rasterization(memory);
+                 return;
+             }
+diff --git a/lcs/host/ge_gpu_backend.hpp b/lcs/host/ge_gpu_backend.hpp
+index acd7275..50a7f78 100644
+--- a/lcs/host/ge_gpu_backend.hpp
++++ b/lcs/host/ge_gpu_backend.hpp
+@@ -417,6 +417,18 @@ void ge_gpu_backend_accumulate_hardware_triangles(
+     const GeGpuHardwareTransform &transform,
+     std::span<const std::byte> packed_vertices) noexcept;
+ 
++// The model-space bounds of packed 0115 vertices (false: nothing to cull
++// with), and whether a draw of a box with those bounds is entirely off
++// screen; the renderer caches the bounds across frames.
++[[nodiscard]] bool ge_gpu_backend_packed_0115_bounds(
++    std::span<const std::byte> packed_vertices,
++    std::array<float, 3> &low, std::array<float, 3> &high) noexcept;
++[[nodiscard]] bool ge_gpu_backend_box_off_screen(
++    const GeGpuDrawDescriptor &draw,
++    const GeGpuHardwareTransform &transform,
++    const std::array<float, 3> &low, const std::array<float, 3> &high,
++    std::uint32_t vertex_count) noexcept;
++
+ void ge_gpu_backend_set_native_window(void *native_window) noexcept;
+ 
+ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address,
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+index 51aa967..20fa61e 100644
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -1872,6 +1872,16 @@ bool create_backend(Gles2State &s, std::string &error) {
+               << r.screen_height << ", " << reinterpret_cast<const char *>(glGetString(GL_RENDERER))
+               << ", targets " << r.target_width << 'x' << r.target_height
+               << (r.depth24 ? ", depth24" : ", depth16") << ", render thread\n" << std::flush;
++    {
++        GLint vertex_uniforms = 0, fragment_uniforms = 0, varyings = 0, attributes = 0;
++        glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &vertex_uniforms);
++        glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_VECTORS, &fragment_uniforms);
++        glGetIntegerv(GL_MAX_VARYING_VECTORS, &varyings);
++        glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &attributes);
++        std::cout << "[gles2] limits: vertex uniform vectors " << vertex_uniforms << ", fragment "
++                  << fragment_uniforms << ", varyings " << varyings << ", attributes " << attributes
++                  << '\n' << std::flush;
++    }
+     // The render thread owns the context from here on.
+     eglMakeCurrent(r.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+     const char *log = std::getenv("LCS_FPS_LOG");
+@@ -2334,9 +2344,9 @@ void ge_gpu_backend_accumulate_hardware_triangles(
+ 
+ // Called by the GE renderer before any other work on the draw (so the packed
+ // path in accumulate below doesn't test again).
+-bool ge_gpu_backend_packed_0115_off_screen(const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
+-                                           std::span<const std::byte> packed_vertices) noexcept {
+-    if (!cull_enabled() || draw.clear_mode || packed_vertices.size() < sizeof(Packed0115)) return false;
++bool ge_gpu_backend_packed_0115_bounds(std::span<const std::byte> packed_vertices,
++                                       std::array<float, 3> &low_out, std::array<float, 3> &high_out) noexcept {
++    if (packed_vertices.size() < sizeof(Packed0115)) return false;
+     const auto *bytes = reinterpret_cast<const std::uint8_t *>(packed_vertices.data());
+     const std::size_t count = packed_vertices.size() / sizeof(Packed0115);
+     std::int16_t low[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
+@@ -2375,15 +2385,30 @@ bool ge_gpu_backend_packed_0115_off_screen(const GeGpuDrawDescriptor &draw, cons
+         }
+     }
+     constexpr float k = 1.0f / 32768.0f;
++    low_out = {low[0] * k, low[1] * k, low[2] * k};
++    high_out = {high[0] * k, high[1] * k, high[2] * k};
++    return true;
++}
++
++bool ge_gpu_backend_box_off_screen(const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
++                                   const std::array<float, 3> &low, const std::array<float, 3> &high,
++                                   std::uint32_t vertex_count) noexcept {
++    if (!cull_enabled() || draw.clear_mode) return false;
+     Gles2State &s = state();
+-    if (!s.enabled ||
+-        !off_screen(s, draw, transform, {low[0] * k, low[1] * k, low[2] * k}, {high[0] * k, high[1] * k, high[2] * k}))
+-        return false;
++    if (!s.enabled || !off_screen(s, draw, transform, low, high)) return false;
+     ++s.culled_draws;
+-    s.culled_vertices += count;
++    s.culled_vertices += vertex_count;
+     return true;
+ }
+ 
++bool ge_gpu_backend_packed_0115_off_screen(const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
++                                           std::span<const std::byte> packed_vertices) noexcept {
++    std::array<float, 3> low{}, high{};
++    return ge_gpu_backend_packed_0115_bounds(packed_vertices, low, high) &&
++           ge_gpu_backend_box_off_screen(draw, transform, low, high,
++                                         static_cast<std::uint32_t>(packed_vertices.size() / sizeof(Packed0115)));
++}
++
+ bool ge_gpu_backend_accumulate_hardware_packed_0115(
+     const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
+     std::span<const std::byte> packed_vertices, std::uint32_t vertex_count,
+diff --git a/lcs/host/ge_gpu_backend_vulkan.cpp b/lcs/host/ge_gpu_backend_vulkan.cpp
+index 152d66e..3ede289 100644
+--- a/lcs/host/ge_gpu_backend_vulkan.cpp
++++ b/lcs/host/ge_gpu_backend_vulkan.cpp
+@@ -2952,6 +2952,15 @@ bool ge_gpu_backend_packed_0115_off_screen(const GeGpuDrawDescriptor &, const Ge
+                                            std::span<const std::byte>) noexcept {
+     return false;
+ }
++bool ge_gpu_backend_packed_0115_bounds(std::span<const std::byte>, std::array<float, 3> &,
++                                       std::array<float, 3> &) noexcept {
++    return false;
++}
++bool ge_gpu_backend_box_off_screen(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &,
++                                   const std::array<float, 3> &, const std::array<float, 3> &,
++                                   std::uint32_t) noexcept {
++    return false;
++}
+ 
+ bool ge_gpu_backend_accumulate_hardware_packed_0115(
+     const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
+diff --git a/lcs/host/ge_gpu_backend_dx12.cpp b/lcs/host/ge_gpu_backend_dx12.cpp
+index 99becc0..5b7712f 100644
+--- a/lcs/host/ge_gpu_backend_dx12.cpp
++++ b/lcs/host/ge_gpu_backend_dx12.cpp
+@@ -3023,6 +3023,15 @@ bool ge_gpu_backend_packed_0115_off_screen(const GeGpuDrawDescriptor &, const Ge
+                                            std::span<const std::byte>) noexcept {
+     return false;
+ }
++bool ge_gpu_backend_packed_0115_bounds(std::span<const std::byte>, std::array<float, 3> &,
++                                       std::array<float, 3> &) noexcept {
++    return false;
++}
++bool ge_gpu_backend_box_off_screen(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &,
++                                   const std::array<float, 3> &, const std::array<float, 3> &,
++                                   std::uint32_t) noexcept {
++    return false;
++}
+ 
+ bool ge_gpu_backend_accumulate_hardware_packed_0115(
+     const GeGpuDrawDescriptor &draw,
+@@ -3624,6 +3633,8 @@ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &, std:
+ void ge_gpu_backend_accumulate_hardware_triangles(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const GeGpuVertex>, std::span<const std::uint32_t>) noexcept {}
+ bool ge_gpu_backend_accumulate_hardware_packed_0115(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const std::byte>, std::uint32_t, std::span<const std::uint32_t>) noexcept { return false; }
+ bool ge_gpu_backend_packed_0115_off_screen(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const std::byte>) noexcept { return false; }
++bool ge_gpu_backend_packed_0115_bounds(std::span<const std::byte>, std::array<float, 3> &, std::array<float, 3> &) noexcept { return false; }
++bool ge_gpu_backend_box_off_screen(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, const std::array<float, 3> &, const std::array<float, 3> &, std::uint32_t) noexcept { return false; }
+ void ge_gpu_backend_set_native_window(void *) noexcept {}
+ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address, std::uint32_t, std::uint32_t) noexcept { state().display_framebuffer = address & 0x001FFFF0u; }
+ void ge_gpu_backend_display_logical_size(std::uint32_t &width, std::uint32_t &height) noexcept { width = 480u; height = 272u; }

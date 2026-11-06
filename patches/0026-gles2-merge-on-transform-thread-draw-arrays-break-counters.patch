@@ -1,0 +1,601 @@
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+index fdf41a7..29a8767 100644
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -122,6 +122,58 @@ struct Batch {
+     bool raw{};
+     GeGpuRawLayout raw_layout{};
+     std::uint32_t raw_state{};
++    // The texture is uploaded (or in this frame's uploads): the merge loop
++    // picks the textured program without the render thread's map.
++    bool texture_ready{};
++};
++
++// Uniforms: the vertex shader's are the array uV[UVertexCount], the fragment
++// shader's uF (UFragmentCount), each sent with one call and only when changed
++// (driver calls per draw are what the Mali-400 path pays for).
++enum Uniform : int {
++    URow0, URow1, URow2, URow3, UViewZ, UUv, UFog, UMul, UAdd, UFlags,
++    UEnv, UFogColor, UAlphaRef, UTexture
++};
++constexpr int UVertexCount = UEnv;
++constexpr int UFragmentCount = UTexture - UEnv;
++using UniformValues = std::array<std::array<float, 4>, UTexture>;
++
++// Keys only, no GL objects: the merge loop that builds these runs on the
++// transform thread; the render thread resolves them when it draws.
++enum TextureKind : std::uint8_t { TexNone, TexKey, TexFeedback, TexSnapshot };
++struct DrawState {
++    std::uint32_t target{};          // PSP framebuffer address
++    std::array<GLint, 4> scissor{};
++    std::uint64_t program{};
++    std::uint8_t texture_kind{};     // TextureKind
++    std::uint64_t texture_key{};     // TexKey: the decoded texture; TexFeedback: its target address
++    std::uint32_t sampler{};         // wrap/filter bits
++    std::uint32_t fixed{};           // depth/blend/colour-mask/cull bits
++    std::uint32_t blend_color{};
++    UniformValues uniforms{};
++    std::uint32_t raw_state{};       // raw draws: index of the frame's uR block
++    GeGpuRawLayout raw_layout{};
++};
++
++bool same_state(const DrawState &a, const DrawState &b) {
++    return a.target == b.target && a.scissor == b.scissor && a.program == b.program &&
++           a.texture_kind == b.texture_kind && a.texture_key == b.texture_key &&
++           a.sampler == b.sampler && a.fixed == b.fixed &&
++           a.blend_color == b.blend_color && a.uniforms == b.uniforms &&
++           a.raw_state == b.raw_state && a.raw_layout == b.raw_layout;
++}
++
++// One step of a frame: a merged draw, or a snapshot of a target that a later
++// draw samples while rendering to it.
++struct Command {
++    DrawState state{};
++    std::uint32_t snapshot{0xFFFFFFFFu};  // set: copy this target to its snapshot texture
++    std::uint32_t base{};     // first vertex (in the packed or float array)
++    std::uint32_t first_index{};
++    std::uint32_t index_count{};
++    std::uint32_t first_vertex{};  // arrays: the run starts here (relative to base)
++    bool strip{};             // one triangle strip (draws joined by degenerate triangles)
++    bool arrays{};            // the indices are one sequential run: glDrawArrays
+ };
+ 
+ // ------------------------------------------------------------------ frames --
+@@ -162,6 +214,13 @@ struct Frame {
+     std::vector<std::byte> guest_rgba;
+     std::uint32_t guest_width{};
+     std::uint32_t guest_height{};
++    // The merge loop's output (merge_frame): GL draws and their 16-bit
++    // indices, built on the transform thread.
++    std::vector<Command> commands;
++    Index16Vector index16;
++    std::array<std::uint64_t, 13> breaks{};
++    bool merged{};
++    bool touched_display{};
+ 
+     void clear() {
+         guest = false;
+@@ -170,6 +229,11 @@ struct Frame {
+         indices.clear();
+         raw_states.clear();
+         batches.clear();
++        commands.clear();
++        index16.clear();
++        breaks = {};
++        merged = false;
++        touched_display = false;
+         uploads.clear();
+         deletes.clear();
+         targets.clear();
+@@ -202,17 +266,6 @@ struct GlTexture {
+     GLint mag_filter{};
+ };
+ 
+-// Uniforms: the vertex shader's are the array uV[UVertexCount], the fragment
+-// shader's uF (UFragmentCount), each sent with one call and only when changed
+-// (driver calls per draw are what the Mali-400 path pays for).
+-enum Uniform : int {
+-    URow0, URow1, URow2, URow3, UViewZ, UUv, UFog, UMul, UAdd, UFlags,
+-    UEnv, UFogColor, UAlphaRef, UTexture
+-};
+-constexpr int UVertexCount = UEnv;
+-constexpr int UFragmentCount = UTexture - UEnv;
+-using UniformValues = std::array<std::array<float, 4>, UTexture>;
+-
+ struct Program {
+     GLuint id{};
+     GLint vertex_location{-1};
+@@ -245,7 +298,6 @@ struct RenderState {
+     GLuint guest_texture{};
+     std::uint32_t guest_width{};
+     std::uint32_t guest_height{};
+-    Index16Vector index16;
+     // LCS_GLES_VBO: 1 (default) the frame's vertices go to the GPU in one
+     // upload, from a ring of buffers; 2 the indices too (slower on ARM's
+     // driver: it reads each draw's indices back from uncached memory); 0
+@@ -284,6 +336,10 @@ struct RenderState {
+     std::array<std::uint64_t, 4> fps_bytes{};
+     std::uint64_t fps_culled{};
+     std::uint64_t fps_culled_vertices{};
++    // Why a batch could not join the previous GL draw (LCS_FPS_LOG=1): target,
++    // scissor, program, texture, sampler, fixed state, blend colour, uniforms,
++    // raw state, raw layout, strip/list, index range, first of frame.
++    std::array<std::uint64_t, 13> fps_breaks{};
+ };
+ 
+ // -------------------------------------------------------------- GE side --
+@@ -1215,28 +1271,6 @@ GLenum depth_compare(std::uint32_t function) noexcept {
+ // Everything a draw's GL state depends on. Consecutive PSP draws with equal
+ // state go out as one glDrawElements: on the Mali-400 each GL draw costs the
+ // driver and kernel more than the vertices it carries.
+-struct DrawState {
+-    Target *target{};
+-    std::array<GLint, 4> scissor{};
+-    std::uint64_t program{};
+-    Program *program_object{};
+-    GLuint texture{};
+-    GlTexture *sampled{};      // decoded texture whose sampler parameters apply
+-    std::uint32_t sampler{};   // wrap/filter bits
+-    std::uint32_t fixed{};     // depth/blend/colour-mask/cull bits
+-    std::uint32_t blend_color{};
+-    UniformValues uniforms{};
+-    std::uint32_t raw_state{};     // raw draws: index of the frame's uR block
+-    GeGpuRawLayout raw_layout{};
+-};
+-
+-bool same_state(const DrawState &a, const DrawState &b) {
+-    return a.target == b.target && a.scissor == b.scissor && a.program == b.program &&
+-           a.texture == b.texture && a.sampler == b.sampler && a.fixed == b.fixed &&
+-           a.blend_color == b.blend_color && a.uniforms == b.uniforms &&
+-           a.raw_state == b.raw_state && a.raw_layout == b.raw_layout;
+-}
+-
+ constexpr std::uint32_t kFixedDepthTest = 1u;
+ constexpr std::uint32_t kFixedDepthFuncShift = 1u;  // 3 bits
+ constexpr std::uint32_t kFixedDepthWrite = 1u << 4u;
+@@ -1554,8 +1588,9 @@ void bind_vertices(RenderState &r, const Vertex *base) {
+     glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(Vertex), bytes + offsetof(Vertex, fog));
+ }
+ 
+-void apply_state(RenderState &r, const DrawState &state, const std::vector<GeGpuRawState> &raw_states) {
+-    begin_target(r, *state.target);
++void apply_state(RenderState &r, const DrawState &state, Target &target, GLuint texture, GlTexture *sampled,
++                 Program &program, const std::vector<GeGpuRawState> &raw_states) {
++    begin_target(r, target);
+     if (!r.scissor_valid || r.scissor != state.scissor) {
+         // Row 0 is the top of the PSP frame (Y is flipped in the shader), so
+         // the PSP's scissor rows are GL's rows as they are.
+@@ -1564,12 +1599,11 @@ void apply_state(RenderState &r, const DrawState &state, const std::vector<GeGpu
+         r.scissor = state.scissor;
+         r.scissor_valid = true;
+     }
+-    if (state.texture != 0u && state.texture != r.bound_texture) {
+-        glBindTexture(GL_TEXTURE_2D, state.texture);
+-        r.bound_texture = state.texture;
++    if (texture != 0u && texture != r.bound_texture) {
++        glBindTexture(GL_TEXTURE_2D, texture);
++        r.bound_texture = texture;
+     }
+-    if (state.sampled != nullptr) apply_sampler(*state.sampled, state.sampler);
+-    Program &program = *state.program_object;
++    if (sampled != nullptr) apply_sampler(*sampled, state.sampler);
+     if (r.current_program != program.id) {
+         glUseProgram(program.id);
+         r.current_program = program.id;
+@@ -1724,6 +1758,15 @@ void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
+     if (r.log_fps)
+         std::fprintf(stderr, "glos: culled draws %.0f vertices %.0f\n", r.fps_culled / frames,
+                      r.fps_culled_vertices / frames);
++    if (r.log_fps) {
++        std::fprintf(stderr, "glos: breaks/frame target %.0f scissor %.0f program %.0f texture %.0f sampler %.0f fixed %.0f blend %.0f uniforms %.0f rawstate %.0f rawlayout %.0f strip %.0f range %.0f first %.0f\n",
++                     r.fps_breaks[0] / frames, r.fps_breaks[1] / frames, r.fps_breaks[2] / frames,
++                     r.fps_breaks[3] / frames, r.fps_breaks[4] / frames, r.fps_breaks[5] / frames,
++                     r.fps_breaks[6] / frames, r.fps_breaks[7] / frames, r.fps_breaks[8] / frames,
++                     r.fps_breaks[9] / frames, r.fps_breaks[10] / frames, r.fps_breaks[11] / frames,
++                     r.fps_breaks[12] / frames);
++        r.fps_breaks = {};
++    }
+     r.fps_culled = r.fps_culled_vertices = 0u;
+     r.fps_frames = 0u;
+     r.fps_psp_draws = 0u;
+@@ -1733,107 +1776,113 @@ void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
+ 
+ // ------------------------------------------------------------ render thread --
+ 
+-// One step of a frame: a merged draw, or a snapshot of a target that a later
+-// draw samples while rendering to it.
+-struct Command {
+-    DrawState state{};
+-    Target *snapshot{};       // set: copy this target to its snapshot texture
+-    std::uint32_t base{};     // first vertex (in the packed or float array)
+-    std::uint32_t first_index{};
+-    std::uint32_t index_count{};
+-    bool strip{};             // one triangle strip (draws joined by degenerate triangles)
++// What the merge loop needs of the render state: fixed after start-up, so
++// the transform thread can read it.
++struct MergeSettings {
++    std::uint32_t target_width{};
++    std::uint32_t target_height{};
++    bool strips{};
++    bool log_fps{};
+ };
+ 
+-void render_frame(RenderState &r, Frame &frame) {
+-    r.display_framebuffer = frame.display_framebuffer;
+-    for (std::uint64_t key : frame.deletes) delete_texture(r, key);
+-    for (TextureUpload &upload : frame.uploads) {
+-        r.fps_bytes[3] += upload.rgba8.size();
+-        upload_texture(r, upload);
+-    }
+-    for (const TargetSize &size : frame.targets) {
+-        Target *target = ensure_target(r, size.address);
+-        if (target == nullptr) continue;
+-        target->logical_width = size.logical_width;
+-        target->logical_height = size.logical_height;
+-    }
+-    if (frame.batches.empty()) {
+-        ++r.frame_epoch;
+-        return;
+-    }
+-    // Pass 1: merge draws into commands; all indices into one array.
+-    static thread_local std::vector<Command> commands;
++MergeSettings merge_settings(const RenderState &r) {
++    return {r.target_width, r.target_height, r.strips, r.log_fps};
++}
++
++// Pass 1: merge a frame's draws into GL draws (frame.commands) with all
++// their 16-bit indices in frame.index16. Keys only: it runs on the transform
++// thread while the render thread draws the previous frame.
++void merge_frame(const MergeSettings &m, Frame &frame) {
++    std::vector<Command> &commands = frame.commands;
++    Index16Vector &index16 = frame.index16;
+     commands.clear();
+-    r.index16.clear();
+-    bool touched_display = false;
++    index16.clear();
++    frame.breaks = {};
++    frame.touched_display = false;
++    frame.merged = true;
++    if (frame.batches.empty()) return;
+     Command group{};
+     bool group_open = false;
+     const auto flush = [&]() {
+         if (!group_open) return;
+         group_open = false;
+-        group.index_count = static_cast<std::uint32_t>(r.index16.size()) - group.first_index;
+-        if (group.index_count != 0u) commands.push_back(group);
++        group.index_count = static_cast<std::uint32_t>(index16.size()) - group.first_index;
++        if (group.index_count == 0u) return;
++        // One sequential run of vertices draws without indices (no index
++        // copy through the driver): most non-indexed lists and lone strips.
++        const std::uint16_t *indices = index16.data() + group.first_index;
++        bool sequential = true;
++        for (std::uint32_t i = 1u; i < group.index_count && sequential; ++i)
++            sequential = indices[i] == static_cast<std::uint16_t>(indices[0] + i);
++        group.arrays = sequential;
++        group.first_vertex = indices[0];
++        commands.push_back(group);
++    };
++    // Logical sizes of the frame's targets (the render thread sets the same
++    // on its Target objects).
++    std::uint32_t size_address = 0xFFFFFFFFu;
++    std::uint32_t logical_width = kReferenceWidth;
++    std::uint32_t logical_height = kReferenceHeight;
++    const auto scale = [](std::int32_t value, std::uint32_t logical, std::uint32_t size) {
++        return static_cast<GLint>(std::clamp<std::int64_t>(
++            static_cast<std::int64_t>(value) * size / std::max<std::uint32_t>(1u, logical), 0, size));
+     };
+     for (Batch &batch : frame.batches) {
+-        Target *target = find_target(r, batch.draw.framebuffer_address);
+-        if (target == nullptr) target = ensure_target(r, batch.draw.framebuffer_address);
+-        if (target == nullptr || batch.vertex_count > 65536u) continue;
+-        const auto scale = [](std::int32_t value, std::uint32_t logical, std::uint32_t size) {
+-            return static_cast<GLint>(std::clamp<std::int64_t>(
+-                static_cast<std::int64_t>(value) * size / std::max<std::uint32_t>(1u, logical), 0, size));
+-        };
+-        const GLint x0 = scale(batch.draw.scissor_x0, target->logical_width, r.target_width);
+-        const GLint y0 = scale(batch.draw.scissor_y0, target->logical_height, r.target_height);
+-        const GLint x1 = scale(batch.draw.scissor_x1 + 1, target->logical_width, r.target_width);
+-        const GLint y1 = scale(batch.draw.scissor_y1 + 1, target->logical_height, r.target_height);
++        const std::uint32_t address = batch.draw.framebuffer_address & 0x001FFFF0u;
++        if (batch.vertex_count > 65536u) continue;
++        if (address != size_address) {
++            size_address = address;
++            logical_width = kReferenceWidth;
++            logical_height = kReferenceHeight;
++            for (const TargetSize &target : frame.targets)
++                if (target.address == address) {
++                    logical_width = std::max<std::uint32_t>(1u, target.logical_width);
++                    logical_height = std::max<std::uint32_t>(1u, target.logical_height);
++                    break;
++                }
++        }
++        const GLint x0 = scale(batch.draw.scissor_x0, logical_width, m.target_width);
++        const GLint y0 = scale(batch.draw.scissor_y0, logical_height, m.target_height);
++        const GLint x1 = scale(batch.draw.scissor_x1 + 1, logical_width, m.target_width);
++        const GLint y1 = scale(batch.draw.scissor_y1 + 1, logical_height, m.target_height);
+         if (x1 <= x0 || y1 <= y0) continue;
+-        if (target->address == r.display_framebuffer) touched_display = true;
++        if (address == frame.display_framebuffer) frame.touched_display = true;
+ 
+         DrawState state{};
+-        state.target = target;
++        state.target = address;
+         state.scissor = {x0, y0, x1 - x0, y1 - y0};
+         bool textured = false;
+         bool self_feedback = false;
+         if (batch.draw.texture_enabled) {
+-            if (batch.framebuffer_feedback && batch.feedback_address == target->address) {
++            if (batch.framebuffer_feedback && batch.feedback_address == address) {
+                 // Reads what was drawn so far: everything before it goes first.
+                 flush();
+-                if (target->snapshot == 0u) {
+-                    target->snapshot = make_target_texture(r.target_width, r.target_height);
+-                    r.current_target = nullptr;
+-                    invalidate_state(r);
+-                }
+                 Command snapshot{};
+-                snapshot.snapshot = target;
++                snapshot.snapshot = address;
+                 commands.push_back(snapshot);
+-                state.texture = target->snapshot;
++                state.texture_kind = TexSnapshot;
++                state.texture_key = address;
+                 textured = true;
+                 self_feedback = true;
+             } else if (batch.framebuffer_feedback) {
+-                Target *feedback = find_target(r, batch.feedback_address);
+-                if (feedback == nullptr) feedback = ensure_target(r, batch.feedback_address);
+-                if (feedback != nullptr && feedback->color != 0u) {
+-                    state.texture = feedback->color;
+-                    textured = true;
+-                }
+-            } else if (const auto found = r.textures.find(batch.texture_key);
+-                       found != r.textures.end() && found->second.id != 0u) {
+-                state.texture = found->second.id;
+-                state.sampled = &found->second;
++                state.texture_kind = TexFeedback;
++                state.texture_key = batch.feedback_address;
++                textured = true;
++            } else if (batch.texture_ready) {
++                state.texture_kind = TexKey;
++                state.texture_key = batch.texture_key;
+                 state.sampler = sampler_bits(batch.draw);
+                 textured = true;
+             }
+         }
+         if (batch.hardware_transform && !batch.packed && !batch.raw && !batch.pretransformed && cpu_transform_enabled())
+-            pretransform(frame, batch, target->logical_width, target->logical_height);
++            pretransform(frame, batch, logical_width, logical_height);
+         state.raw_state = batch.raw ? batch.raw_state : 0u;
+         if (batch.raw) state.raw_layout = batch.raw_layout;
+         state.program = program_key(batch, textured);
+-        state.program_object = program_for(r, state.program);
+-        if (state.program_object == nullptr) continue;
+         state.fixed = fixed_bits(batch);
+         state.blend_color = blend_color_of(batch.draw);
+-        fill_uniforms(state.uniforms, batch, target->logical_width, target->logical_height);
++        fill_uniforms(state.uniforms, batch, logical_width, logical_height);
+ 
+         // Indices are 16-bit offsets from the group's first vertex (decoded
+         // packed vertices sit after the others, so order isn't guaranteed).
+@@ -1843,32 +1892,64 @@ void render_frame(RenderState &r, Frame &frame) {
+         const bool fits = batch.first_vertex >= group.base &&
+                           (batch.first_vertex - group.base) % stride == 0u &&
+                           (batch.first_vertex - group.base) / stride + batch.vertex_count <= 65536u;
+-        const bool strip = r.strips && batch.hardware_transform && batch.transform.primitive == 4u;
++        const bool strip = m.strips && batch.hardware_transform && batch.transform.primitive == 4u;
+         if (!(group_open && fits && group.strip == strip && same_state(state, group.state))) {
++            if (m.log_fps) {
++                const DrawState &g = group.state;
++                const std::size_t why = !group_open ? 12u : !fits ? 11u : group.strip != strip ? 10u :
++                    g.target != state.target ? 0u : g.scissor != state.scissor ? 1u :
++                    g.program != state.program ? 2u :
++                    (g.texture_kind != state.texture_kind || g.texture_key != state.texture_key) ? 3u :
++                    g.sampler != state.sampler ? 4u : g.fixed != state.fixed ? 5u :
++                    g.blend_color != state.blend_color ? 6u : g.uniforms != state.uniforms ? 7u :
++                    g.raw_state != state.raw_state ? 8u : 9u;
++                ++frame.breaks[why];
++            }
+             flush();
+             group = {};
+             group.state = state;
+             group.base = batch.first_vertex;
+-            group.first_index = static_cast<std::uint32_t>(r.index16.size());
++            group.first_index = static_cast<std::uint32_t>(index16.size());
+             group.strip = strip;
+             group_open = true;
+         }
+         const std::uint32_t offset = (batch.first_vertex - group.base) / stride;
+-        if (strip) append_strip(r.index16, frame, batch, offset, group.first_index);
+-        else append_triangles(r.index16, frame, batch, offset);
++        if (strip) append_strip(index16, frame, batch, offset, group.first_index);
++        else append_triangles(index16, frame, batch, offset);
+         if (self_feedback) flush();
+     }
+     flush();
++}
+ 
++void render_frame(RenderState &r, Frame &frame) {
++    r.display_framebuffer = frame.display_framebuffer;
++    for (std::uint64_t key : frame.deletes) delete_texture(r, key);
++    for (TextureUpload &upload : frame.uploads) {
++        r.fps_bytes[3] += upload.rgba8.size();
++        upload_texture(r, upload);
++    }
++    for (const TargetSize &size : frame.targets) {
++        Target *target = ensure_target(r, size.address);
++        if (target == nullptr) continue;
++        target->logical_width = size.logical_width;
++        target->logical_height = size.logical_height;
++    }
++    if (!frame.merged) merge_frame(merge_settings(r), frame);  // no transform thread
++    if (frame.batches.empty()) {
++        ++r.frame_epoch;
++        return;
++    }
++    for (std::size_t i = 0u; i < frame.breaks.size(); ++i) r.fps_breaks[i] += frame.breaks[i];
+     r.fps_culled += frame.culled_draws;
+     r.fps_culled_vertices += frame.culled_vertices;
+     r.fps_bytes[0] += frame.vertices.size() * sizeof(Vertex);
+     r.fps_bytes[1] += frame.packed.size();
+-    r.fps_bytes[2] += r.index16.size() * sizeof(std::uint16_t);
+-    // Pass 2: upload the frame's geometry once, then replay the commands.
++    r.fps_bytes[2] += frame.index16.size() * sizeof(std::uint16_t);
++    // Pass 2: upload the frame's geometry once, then replay the commands,
++    // resolving their keys to this thread's GL objects.
+     const std::uint8_t *vertex_base = reinterpret_cast<const std::uint8_t *>(frame.vertices.data());
+     const std::uint8_t *packed_base = frame.packed.data();
+-    const std::uint8_t *index_base = reinterpret_cast<const std::uint8_t *>(r.index16.data());
++    const std::uint8_t *index_base = reinterpret_cast<const std::uint8_t *>(frame.index16.data());
+     if (r.use_vbo) {
+         std::array<GLuint, 3> &set = r.buffers[r.ring];
+         r.ring = (r.ring + 1u) % static_cast<std::uint32_t>(r.buffers.size());
+@@ -1883,8 +1964,8 @@ void render_frame(RenderState &r, Frame &frame) {
+         }
+         if (r.index_vbo) {
+             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, set[2]);
+-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(r.index16.size() * sizeof(std::uint16_t)),
+-                         r.index16.data(), GL_STREAM_DRAW);
++            glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(frame.index16.size() * sizeof(std::uint16_t)),
++                         frame.index16.data(), GL_STREAM_DRAW);
+             index_base = nullptr;
+         }
+         vertex_base = packed_base = nullptr;  // offsets from here on
+@@ -1898,19 +1979,59 @@ void render_frame(RenderState &r, Frame &frame) {
+     r.current_target = nullptr;
+     std::uint64_t gl_draws = 0u;
+     GLuint bound_array = 0xFFFFFFFFu;
+-    for (const Command &command : commands) {
+-        if (command.snapshot != nullptr) {
+-            snapshot_target(r, *command.snapshot);
++    Target *target = nullptr;
++    std::uint32_t target_address = 0xFFFFFFFFu;
++    Program *program = nullptr;
++    std::uint64_t program_key_cached = ~std::uint64_t{0};
++    for (const Command &command : frame.commands) {
++        if (command.snapshot != 0xFFFFFFFFu) {
++            if (Target *snapshot = ensure_target(r, command.snapshot)) snapshot_target(r, *snapshot);
++            target = nullptr;  // begin_target again after the copy
++            target_address = 0xFFFFFFFFu;
+             continue;
+         }
+-        apply_state(r, command.state, frame.raw_states);
+-        if ((command.state.program & 3u) == 3u) {
++        const DrawState &state = command.state;
++        if (state.target != target_address || target == nullptr) {
++            target = ensure_target(r, state.target);
++            target_address = state.target;
++        }
++        if (target == nullptr) continue;
++        GLuint texture = 0u;
++        GlTexture *sampled = nullptr;
++        switch (state.texture_kind) {
++        case TexKey: {
++            const auto found = r.textures.find(state.texture_key);
++            if (found == r.textures.end() || found->second.id == 0u) continue;
++            texture = found->second.id;
++            sampled = &found->second;
++            break;
++        }
++        case TexFeedback: {
++            Target *feedback = ensure_target(r, static_cast<std::uint32_t>(state.texture_key));
++            if (feedback == nullptr || feedback->color == 0u) continue;
++            texture = feedback->color;
++            break;
++        }
++        case TexSnapshot:
++            if (target->snapshot == 0u) continue;
++            texture = target->snapshot;
++            break;
++        default:
++            break;
++        }
++        if (state.program != program_key_cached || program == nullptr) {
++            program = program_for(r, state.program);
++            program_key_cached = state.program;
++        }
++        if (program == nullptr) continue;
++        apply_state(r, state, *target, texture, sampled, *program, frame.raw_states);
++        if ((state.program & 3u) == 3u) {
+             if (r.use_vbo && bound_array != r.packed_buffer) {
+                 glBindBuffer(GL_ARRAY_BUFFER, r.packed_buffer);
+                 bound_array = r.packed_buffer;
+             }
+-            bind_raw_vertices(r, packed_base + command.base, command.state.raw_layout);
+-        } else if (command.state.program & kPacked) {
++            bind_raw_vertices(r, packed_base + command.base, state.raw_layout);
++        } else if (state.program & kPacked) {
+             if (r.use_vbo && bound_array != r.packed_buffer) {
+                 glBindBuffer(GL_ARRAY_BUFFER, r.packed_buffer);
+                 bound_array = r.packed_buffer;
+@@ -1923,9 +2044,13 @@ void render_frame(RenderState &r, Frame &frame) {
+             }
+             bind_vertices(r, reinterpret_cast<const Vertex *>(vertex_base + static_cast<std::size_t>(command.base) * sizeof(Vertex)));
+         }
+-        glDrawElements(command.strip ? GL_TRIANGLE_STRIP : GL_TRIANGLES, static_cast<GLsizei>(command.index_count),
+-                       GL_UNSIGNED_SHORT,
+-                       index_base + static_cast<std::size_t>(command.first_index) * sizeof(std::uint16_t));
++        const GLenum mode = command.strip ? GL_TRIANGLE_STRIP : GL_TRIANGLES;
++        if (command.arrays) {
++            glDrawArrays(mode, static_cast<GLint>(command.first_vertex), static_cast<GLsizei>(command.index_count));
++        } else {
++            glDrawElements(mode, static_cast<GLsizei>(command.index_count), GL_UNSIGNED_SHORT,
++                           index_base + static_cast<std::size_t>(command.first_index) * sizeof(std::uint16_t));
++        }
+         ++gl_draws;
+     }
+     if (r.use_vbo) {
+@@ -1936,7 +2061,7 @@ void render_frame(RenderState &r, Frame &frame) {
+     invalidate_state(r);
+ 
+     Target *display = find_target(r, r.display_framebuffer);
+-    if (frame.publish && touched_display && display != nullptr && display->color != 0u) {
++    if (frame.publish && frame.touched_display && display != nullptr && display->color != 0u) {
+         // The target texture holds the logical frame stretched to its size. With
+         // Widescreen.AspectRatio set the game drew for that aspect instead
+         // (e.g. 4:3 to fill a 4:3 screen without bars).
+@@ -2136,7 +2261,10 @@ void transform_thread_main(Gles2State *s) {
+             frame = std::move(s->to_transform);
+         }
+         s->queue_cv.notify_all();  // the GE thread may hand over the next frame
+-        if (!frame->guest) pretransform_frame(*frame);
++        if (!frame->guest) {
++            pretransform_frame(*frame);
++            merge_frame(merge_settings(s->render), *frame);
++        }
+         submit_to_render(*s, std::move(frame));
+     }
+ }
+@@ -2560,6 +2688,7 @@ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
+         *out++ = {v.x, v.y, v.z, v.w, v.rgba, v.u * su, v.v * sv, v.q, v.fog_factor};
+     Batch &batch = s.batches.emplace_back(draw);
+     batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
++    batch.texture_ready = batch.texture_key != 0u && find_texture(s, batch.texture_key) != nullptr;
+     batch.first_vertex = first;
+     batch.vertex_count = static_cast<std::uint32_t>(triangle_vertices.size());
+     batch.feedback_address = draw.texture_address & 0x001FFFF0u;
+@@ -2667,6 +2796,7 @@ void append_hardware_batch(Gles2State &s, const GeGpuDrawDescriptor &draw, const
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+     Batch &batch = s.batches.emplace_back(draw, transform);
+     batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
++    batch.texture_ready = batch.texture_key != 0u && find_texture(s, batch.texture_key) != nullptr;
+     batch.first_vertex = first_vertex;
+     batch.vertex_count = static_cast<std::uint32_t>(vertex_count);
+     batch.first_index = first_index;
+@@ -2796,6 +2926,7 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+     Batch &batch = s.batches.emplace_back(draw, transform);
+     batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
++    batch.texture_ready = batch.texture_key != 0u && find_texture(s, batch.texture_key) != nullptr;
+     batch.first_vertex = first_vertex;
+     batch.vertex_count = vertex_count;
+     batch.first_index = first_index;
+@@ -2854,6 +2985,7 @@ bool ge_gpu_backend_accumulate_hardware_raw(
+     if (state_changed || s.raw_states.empty()) s.raw_states.push_back(raw_state);
+     Batch &batch = s.batches.emplace_back(draw, transform);
+     batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
++    batch.texture_ready = batch.texture_key != 0u && find_texture(s, batch.texture_key) != nullptr;
+     batch.first_vertex = first_vertex;
+     batch.vertex_count = vertex_count;
+     batch.first_index = first_index;

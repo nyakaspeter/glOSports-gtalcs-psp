@@ -1,0 +1,151 @@
+diff --git a/lcs/host/lcs_profile.cpp b/lcs/host/lcs_profile.cpp
+index c01e1c7..710738c 100644
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -25,6 +25,7 @@
+ #include <functional>
+ #include <mutex>
+ #include <thread>
++#include <future>
+ #include <cstdlib>
+ #include <cstring>
+ #include <ctime>
+@@ -558,10 +559,31 @@ struct AtracContextState {
+     std::filesystem::path source_path;
+     AudioStreamDecoder decoder;
+     bool decoder_eof{};
++    // The next frame, decoded ahead on a worker (the decode was 4.7% of the
++    // game thread); dropped whenever the decoder is closed or reset.
++    std::future<std::size_t> prefetch;
++    std::vector<std::uint8_t> prefetch_buffer;
++    std::size_t prefetch_got{};
++    std::size_t prefetch_consumed{};
+ };
+ 
+ std::array<AtracContextState, 6> atrac_contexts{};
+ 
++// PSPRECOMP_ATRAC_PREFETCH=0 decodes on the game thread as before.
++bool atrac_prefetch_enabled() {
++    static const bool enabled = [] {
++        const char *text = std::getenv("PSPRECOMP_ATRAC_PREFETCH");
++        return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
++    }();
++    return enabled;
++}
++
++void atrac_prefetch_drop(AtracContextState &state) {
++    if (state.prefetch.valid()) (void)state.prefetch.get();
++    state.prefetch_got = 0u;
++    state.prefetch_consumed = 0u;
++}
++
+ std::uint16_t read_le16(std::span<const std::uint8_t> bytes, std::size_t offset) {
+     return static_cast<std::uint16_t>(bytes[offset]) |
+         static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[offset + 1u]) << 8u);
+@@ -669,6 +691,7 @@ std::filesystem::path identify_atrac_source(const std::filesystem::path &disc_ro
+ constexpr std::uint32_t kAtracOutputChannels = 2u;
+ 
+ void close_atrac_decoder(AtracContextState &state) {
++    atrac_prefetch_drop(state);
+     state.decoder.close();
+     state.decoder_eof = false;
+ }
+@@ -688,8 +711,33 @@ bool open_atrac_decoder(AtracContextState &state) {
+ 
+ std::size_t read_atrac_pcm(AtracContextState &state, std::span<std::uint8_t> output) {
+     if (!open_atrac_decoder(state)) return 0u;
+-    const std::size_t total = state.decoder.read(output);
+-    if (total < output.size()) state.decoder_eof = true;
++    if (!atrac_prefetch_enabled()) {
++        const std::size_t total = state.decoder.read(output);
++        if (total < output.size()) state.decoder_eof = true;
++        return total;
++    }
++    std::size_t total = 0u;
++    if (state.prefetch.valid()) {
++        state.prefetch_got = state.prefetch.get();
++        state.prefetch_consumed = 0u;
++    }
++    if (state.prefetch_got > state.prefetch_consumed) {
++        const std::size_t n = std::min(output.size(), state.prefetch_got - state.prefetch_consumed);
++        std::memcpy(output.data(), state.prefetch_buffer.data() + state.prefetch_consumed, n);
++        state.prefetch_consumed += n;
++        total = n;
++    }
++    if (total < output.size()) total += state.decoder.read(output.subspan(total));
++    if (total < output.size()) {
++        state.decoder_eof = true;
++    } else if (state.prefetch_consumed >= state.prefetch_got) {
++        // Decode the next frame of this size while the game runs.
++        state.prefetch_buffer.resize(output.size());
++        state.prefetch_got = state.prefetch_consumed = 0u;
++        state.prefetch = std::async(std::launch::async, [&state] {
++            return state.decoder.read(std::span<std::uint8_t>(state.prefetch_buffer));
++        });
++    }
+     return total;
+ }
+ 
+@@ -4076,10 +4124,17 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+         const std::uint64_t start_us = audio_queue_buffer(state, frames);
+         if (buffer != 0u && frames != 0u &&
+             rt.memory().contains(buffer, samples * sizeof(std::int16_t))) {
+-            std::vector<std::int16_t> pcm(samples);
+-            for (std::size_t index = 0; index < samples; ++index) {
+-                pcm[index] = static_cast<std::int16_t>(
+-                    rt.memory().load16(buffer + static_cast<std::uint32_t>(index * 2u)));
++            // One copy of the little-endian samples (the per-sample guest load
++            // was 1.2% of the game thread).
++            static std::vector<std::int16_t> pcm;
++            pcm.resize(samples);
++            if (const std::uint8_t *raw = rt.memory().raw_pointer(buffer, samples * sizeof(std::int16_t))) {
++                std::memcpy(pcm.data(), raw, samples * sizeof(std::int16_t));
++            } else {
++                for (std::size_t index = 0; index < samples; ++index) {
++                    pcm[index] = static_cast<std::int16_t>(
++                        rt.memory().load16(buffer + static_cast<std::uint32_t>(index * 2u)));
++                }
+             }
+             audio_output_submit(pcm, frames, stereo, left, right, 44100u, channel, start_us,
+                                 virtual_time_us);
+diff --git a/lcs/host/lcs_ge_exec.cpp b/lcs/host/lcs_ge_exec.cpp
+index 707f1eb..cf4e804 100644
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -237,22 +237,34 @@ GeListPrescan prescan_ge_list(psprecomp::GuestMemory &memory, std::uint32_t list
+     std::uint32_t call_depth = 0u;
+     std::uint32_t pc = list_address;
+     const ListReader reader(memory);
++    const std::uint8_t *cursor = nullptr;
++    const std::uint8_t *end = nullptr;
+     for (std::uint32_t executed = 0u; executed < kMaxCommands; ++executed) {
+         std::uint32_t word;
+-        if (!reader.fetch(pc, word)) break;
++        if (cursor != end || reader.locate(pc, cursor, end)) {
++            std::memcpy(&word, cursor, sizeof(word));
++            cursor += 4u;
++        } else if (!reader.fetch(pc, word)) {
++            break;
++        }
+         pc = (pc + 4u) & 0x0FFFFFFFu;
+         const std::uint32_t command = word >> 24u;
+         const std::uint32_t data = word & 0x00FFFFFFu;
+         switch (command) {
+         case 0x10u: base_register = data; break;
+         case 0x13u: offset_address = data << 8u; break;
+-        case 0x08u: pc = relative(data); break;
++        case 0x08u:
++            pc = relative(data);
++            cursor = end;
++            break;
+         case 0x0Au:
+             if (call_depth < call_stack.size()) call_stack[call_depth++] = pc;
+             pc = relative(data);
++            cursor = end;
+             break;
+         case 0x0Bu:
+             if (call_depth != 0u) pc = call_stack[--call_depth];
++            cursor = end;
+             break;
+         case 0x0Fu:
+             result.finished = true;

@@ -1,0 +1,137 @@
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <chrono>
++#include <cstdlib>
+ #include <string>
+ 
+ namespace lcs {
+@@ -223,9 +225,23 @@
+     flush_ge_deferred_rasterization(memory);
+ }
+ 
++std::atomic<std::uint64_t> g_prescan_nanoseconds{0u};
++
++std::uint64_t ge_prescan_nanoseconds_take() {
++    return g_prescan_nanoseconds.exchange(0u, std::memory_order_relaxed);
++}
++
+ GeListPrescan prescan_ge_list(psprecomp::GuestMemory &memory, std::uint32_t list_address) {
+     GeListPrescan result{};
+     if (list_address == 0u) return result;
++    const auto started = std::chrono::steady_clock::now();
++    struct Timer {
++        std::chrono::steady_clock::time_point start;
++        ~Timer() {
++            g_prescan_nanoseconds.fetch_add(static_cast<std::uint64_t>(
++                (std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
++        }
++    } timer{started};
+     const std::uint64_t snapshot = ge_base_offset_snapshot.load(std::memory_order_relaxed);
+     std::uint32_t base_register = static_cast<std::uint32_t>(snapshot >> 32u);
+     std::uint32_t offset_address = static_cast<std::uint32_t>(snapshot);
+@@ -237,22 +253,33 @@
+     std::uint32_t call_depth = 0u;
+     std::uint32_t pc = list_address;
+     const ListReader reader(memory);
++    // Through one pointer until the next jump, as the executor reads (fetch
++    // tested two ranges for every word; the scan was 3.7% of the game thread
++    // while driving).
++    const std::uint8_t *cursor = nullptr;
++    const std::uint8_t *end = nullptr;
+     for (std::uint32_t executed = 0u; executed < kMaxCommands; ++executed) {
+         std::uint32_t word;
+-        if (!reader.fetch(pc, word)) break;
++        if (cursor != end || reader.locate(pc, cursor, end)) {
++            std::memcpy(&word, cursor, sizeof(word));
++            cursor += 4u;
++        } else if (!reader.fetch(pc, word)) {
++            break;
++        }
+         pc = (pc + 4u) & 0x0FFFFFFFu;
+         const std::uint32_t command = word >> 24u;
+         const std::uint32_t data = word & 0x00FFFFFFu;
+         switch (command) {
+         case 0x10u: base_register = data; break;
+         case 0x13u: offset_address = data << 8u; break;
+-        case 0x08u: pc = relative(data); break;
++        case 0x08u: pc = relative(data); cursor = end; break;
+         case 0x0Au:
+             if (call_depth < call_stack.size()) call_stack[call_depth++] = pc;
+             pc = relative(data);
++            cursor = end;
+             break;
+         case 0x0Bu:
+-            if (call_depth != 0u) pc = call_stack[--call_depth];
++            if (call_depth != 0u) { pc = call_stack[--call_depth]; cursor = end; }
+             break;
+         case 0x0Fu:
+             result.finished = true;
+--- a/lcs/host/lcs_ge_exec.hpp
++++ b/lcs/host/lcs_ge_exec.hpp
+@@ -12,6 +12,8 @@
+     std::uint32_t finish_argument{};
+ };
+ GeListPrescan prescan_ge_list(psprecomp::GuestMemory &memory, std::uint32_t list_address);
++// Nanoseconds the game thread spent in prescan_ge_list since the last call (LCS_FPS_LOG).
++std::uint64_t ge_prescan_nanoseconds_take();
+ 
+ bool rendered_list_finished();
+ std::uint32_t rendered_finish_argument();
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -3677,15 +3677,26 @@
+             if (!from_vblank) cap_frame_rate(list_address);
+             bool list_finished = false;
+             std::uint32_t finish_argument = 0u;
++            // The scan of the whole list (every word, following jumps and
++            // calls) only feeds the FINISH callback below; without a callback
++            // with a finish function for this cbid it has nothing to find.
++            const auto callback_cbid = static_cast<std::int32_t>(ctx.gpr[6]);
++            const auto callback_found = ge_callback_table.callbacks.find(callback_cbid);
++            const bool wants_finish = callback_found != ge_callback_table.callbacks.end() &&
++                                      callback_found->second.finish_function != 0u;
+             if (from_vblank) {
+-                const GeListPrescan scan = prescan_ge_list(rt.memory(), list_address);
+-                list_finished = scan.finished;
+-                finish_argument = scan.finish_argument;
++                if (wants_finish) {
++                    const GeListPrescan scan = prescan_ge_list(rt.memory(), list_address);
++                    list_finished = scan.finished;
++                    finish_argument = scan.finish_argument;
++                }
+             } else if (ge_worker_wait_idle(); ge_async_enabled()) {
+                 lcs_menu_enqueue();
+-                const GeListPrescan scan = prescan_ge_list(rt.memory(), list_address);
+-                list_finished = scan.finished;
+-                finish_argument = scan.finish_argument;
++                if (wants_finish) {
++                    const GeListPrescan scan = prescan_ge_list(rt.memory(), list_address);
++                    list_finished = scan.finished;
++                    finish_argument = scan.finish_argument;
++                }
+                 const std::uint64_t vblank = display_vblank_index;
+                 ge_worker_submit([&rt, list_address, vblank] {
+                     execute_ge_list_frame(rt, list_address, vblank);
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -1,4 +1,5 @@
+ #include "ge_gpu_backend.hpp"
++#include "lcs_ge_exec.hpp"
+ 
+ // GE backend on OpenGL ES 2.0 for GPUs without Vulkan, written for ARM's
+ // closed Mali-400 driver (r6p2), whose only output is EGL on /dev/fb0.
+@@ -1780,8 +1781,8 @@
+                      r.fps_bytes[2] / frames / 1024.0, r.fps_bytes[3] / frames / 1024.0);
+     r.fps_bytes = {};
+     if (r.log_fps)
+-        std::fprintf(stderr, "glos: culled draws %.0f vertices %.0f\n", r.fps_culled / frames,
+-                     r.fps_culled_vertices / frames);
++        std::fprintf(stderr, "glos: culled draws %.0f vertices %.0f  prescan us/frame %.0f\n", r.fps_culled / frames,
++                     r.fps_culled_vertices / frames, static_cast<double>(ge_prescan_nanoseconds_take()) / frames / 1000.0);
+     if (r.log_fps) {
+         std::fprintf(stderr, "glos: breaks/frame target %.0f scissor %.0f program %.0f texture %.0f sampler %.0f fixed %.0f blend %.0f uniforms %.0f rawstate %.0f rawlayout %.0f strip %.0f range %.0f first %.0f  gl arrays %.0f elements %.0f index bytes %.0f\n",
+                      r.fps_breaks[0] / frames, r.fps_breaks[1] / frames, r.fps_breaks[2] / frames,

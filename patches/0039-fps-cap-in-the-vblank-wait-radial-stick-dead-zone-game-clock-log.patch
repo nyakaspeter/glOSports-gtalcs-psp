@@ -1,0 +1,209 @@
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -2002,20 +2002,46 @@
+ 
+ double wall_clock_limit_seconds = 0.0;
+ std::chrono::steady_clock::time_point wall_clock_start;
++
++// LCS_FPS_CAP=N (with [Timing] FrameRate=60, one vblank wait a frame): the
++// wait also waits for a 1/N s deadline that carries over, so a frame that
++// ran late shortens the next wait instead of adding to it. A sleep before
++// the display list (the old place) sat in series with the 60 Hz wait and
++// the GE work and cost 3 fps standing (25.5 against 28.5).
++std::uint32_t frame_cap() {
++    static const std::uint32_t fps = [] {
++        const char *text = std::getenv("LCS_FPS_CAP");
++        if (text == nullptr || *text == '\0') return 0u;
++        return static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
++    }();
++    return fps;
++}
+ 
+ std::uint32_t throttle_vblank_to_real_time() {
+     static const bool uncapped = std::getenv("LCS_UNCAPPED") != nullptr;
+     if (uncapped) return 0u;
+     constexpr std::uint32_t kMaxSkippedVblanks = 6u;
+     static std::chrono::steady_clock::time_point next_vblank{};
++    static std::chrono::steady_clock::time_point cap_deadline{};
+     const auto period = std::chrono::microseconds(kVblankPeriodUs);
+-    const auto now = std::chrono::steady_clock::now();
++    auto now = std::chrono::steady_clock::now();
+     if (next_vblank == std::chrono::steady_clock::time_point{}) {
+         next_vblank = now + period;
++        cap_deadline = now;
+         return 0u;
+     }
++    auto wake = next_vblank;
++    if (const std::uint32_t cap = frame_cap(); cap != 0u && lcs::lcs_frame_limiter_unlocked()) {
++        const auto cap_period = std::chrono::microseconds(1000000u / cap);
++        if (now > cap_deadline + cap_period * 4) cap_deadline = now;  // a long stall: start over
++        cap_deadline += cap_period;
++        if (cap_deadline > wake) wake = cap_deadline;
++    }
++    if (now < wake) {
++        precise_sleep_until(wake);
++        now = wake;
++    }
+     if (now < next_vblank) {
+-        precise_sleep_until(next_vblank);
+         next_vblank += period;
+         return 0u;
+     }
+@@ -2023,6 +2049,38 @@
+     const auto skipped = static_cast<std::uint32_t>(std::min<std::uint64_t>(behind, kMaxSkippedVblanks));
+     next_vblank = behind > kMaxSkippedVblanks ? now + period : next_vblank + period * (skipped + 1u);
+     return skipped;
++}
++
++std::uint64_t g_ge_wait_microseconds = 0u;  // the game thread's waits for the GE worker
++std::uint32_t g_ge_waits = 0u;
++
++// LCS_FPS_LOG: once a second, how fast the guest clock (virtual_time_us,
++// what the game's timer reads) ran against real time over that second.
++void log_game_clock() {
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_FPS_LOG");
++        return text != nullptr && *text != '\0' && *text != '0';
++    }();
++    if (!enabled) return;
++    static std::chrono::steady_clock::time_point real_start = std::chrono::steady_clock::now();
++    static std::uint64_t virtual_start = virtual_time_us;
++    static std::uint32_t waits = 0u;
++    ++waits;
++    const auto now = std::chrono::steady_clock::now();
++    const auto real_us = std::chrono::duration_cast<std::chrono::microseconds>(now - real_start).count();
++    if (real_us < 1000000) return;
++    const std::uint64_t virtual_us = virtual_time_us - virtual_start;
++    std::printf("glos: game clock %.3f of real (%llu ms virtual / %lld ms real, %u vblank waits, "
++                "%llu ms in %u GE waits)\n",
++                static_cast<double>(virtual_us) / static_cast<double>(real_us),
++                static_cast<unsigned long long>(virtual_us / 1000u), static_cast<long long>(real_us / 1000),
++                waits, static_cast<unsigned long long>(g_ge_wait_microseconds / 1000u), g_ge_waits);
++    std::fflush(stdout);
++    real_start = now;
++    virtual_start = virtual_time_us;
++    waits = 0u;
++    g_ge_wait_microseconds = 0u;
++    g_ge_waits = 0u;
+ }
+ 
+ struct GeWorker {
+@@ -2086,7 +2144,11 @@
+     std::unique_lock lock(ge_worker.mutex);
+     if (!ge_worker.started) return;
+     if (ge_worker.tasks.empty() && !ge_worker.busy) return;
++    const auto started = std::chrono::steady_clock::now();
+     ge_worker.cv.wait(lock, [] { return ge_worker.tasks.empty() && !ge_worker.busy; });
++    g_ge_wait_microseconds += static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
++    ++g_ge_waits;
+ }
+ 
+ void ge_worker_stop() {
+@@ -2121,28 +2183,6 @@
+     std::uint32_t game_width{};
+     std::uint32_t game_height{};
+ };
+-
+-void cap_frame_rate(std::uint32_t list_address) {
+-    static const std::uint32_t fps = [] {
+-        const char *text = std::getenv("LCS_FPS_CAP");
+-        if (text == nullptr || *text == '\0') return 0u;
+-        return static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
+-    }();
+-    if (fps == 0u) return;
+-    static std::uint32_t last_address = 0u;
+-    static std::chrono::steady_clock::time_point deadline{};
+-    if (list_address == last_address) return;
+-    last_address = list_address;
+-    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+-        std::chrono::duration<double>(1.0 / static_cast<double>(fps)));
+-    const auto now = std::chrono::steady_clock::now();
+-    if (deadline == std::chrono::steady_clock::time_point{} || now > deadline + period * 4) {
+-        deadline = now + period;
+-        return;
+-    }
+-    if (now < deadline) precise_sleep_until(deadline);
+-    deadline += period;
+-}
+ 
+ bool g_ge_list_since_finish = false;
+ std::uint32_t g_ge_last_list_address = 0u;
+@@ -3657,6 +3697,7 @@
+             virtual_time_us += static_cast<std::uint64_t>(skipped) * kVblankPeriodUs;
+             display_vblank_index += skipped;
+         }
++        log_game_clock();
+         const std::uint32_t vblank_delay = static_cast<std::uint32_t>(
+             (virtual_time_us / kVblankPeriodUs + 1u) * kVblankPeriodUs - virtual_time_us);
+         if (deliver_pending_ge_callback(ctx, vblank_delay, true)) return;
+@@ -3674,7 +3715,6 @@
+         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+             const std::uint32_t list_address = ctx.gpr[4];
+             const bool from_vblank = in_vblank_interrupt();
+-            if (!from_vblank) cap_frame_rate(list_address);
+             bool list_finished = false;
+             std::uint32_t finish_argument = 0u;
+             // The scan of the whole list (every word, following jumps and
+--- a/lcs/host/lcs_key_bindings.hpp
++++ b/lcs/host/lcs_key_bindings.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <array>
+ #include <cctype>
+ #include <cstdint>
+@@ -598,21 +599,43 @@
+         }
+     }
+     return sample;
++}
++
++// A stick as a direction and a deflection: the dead zone is on the
++// deflection (radial), so a small push keeps its angle. stick_to_psp's
++// per-axis dead zone (24% of each axis) zeroed the smaller component of
++// any push near an axis, which turned the stick into eight directions
++// (GA36-MB, 2026-10-30). Outputs -127..127 each.
++inline void stick_radial(std::int16_t raw_x, std::int16_t raw_y, int &out_x, int &out_y) noexcept {
++    constexpr float kDeadZone = 0.20f;  // of full deflection; the GA36-MB rests up to 8% off centre
++    const float x = static_cast<float>(raw_x) / 32767.0f;
++    const float y = static_cast<float>(raw_y) / 32767.0f;
++    const float deflection = std::sqrt(x * x + y * y);
++    if (deflection <= kDeadZone) {
++        out_x = out_y = 0;
++        return;
++    }
++    const float scale = std::min(1.0f, (deflection - kDeadZone) / (1.0f - kDeadZone)) / deflection;
++    out_x = std::clamp(static_cast<int>(std::lround(x * scale * 127.0f)), -127, 127);
++    out_y = std::clamp(static_cast<int>(std::lround(y * scale * 127.0f)), -127, 127);
+ }
+ 
+ inline StickReading interpret_stick(StickRole role, std::int16_t raw_x, std::int16_t raw_y,
+                                     bool y_positive_up, bool invert_camera_y) noexcept {
+     StickReading reading;
++    int x = 0, y = 0;
++    stick_radial(raw_x, raw_y, x, y);
+     if (role == StickRole::Move) {
+-        reading.move_x = stick_to_psp(raw_x, false);
+-        reading.move_y = stick_to_psp(raw_y, y_positive_up);
+-        reading.move = reading.move_x != 128u || reading.move_y != 128u;
++        if (y_positive_up) y = -y;
++        reading.move_x = static_cast<std::uint8_t>(128 + x);
++        reading.move_y = static_cast<std::uint8_t>(128 + y);
++        reading.move = x != 0 || y != 0;
+     } else if (role == StickRole::Camera) {
+-        reading.camera_x = std::clamp(static_cast<int>(stick_to_psp(raw_x, false)) - 128, -127, 127);
+-        int camera_y = static_cast<int>(stick_to_psp(raw_y, !y_positive_up)) - 128;
+-        if (invert_camera_y) camera_y = -camera_y;
+-        reading.camera_y = std::clamp(camera_y, -127, 127);
+-        reading.camera = reading.camera_x != 0 || reading.camera_y != 0;
++        if (!y_positive_up) y = -y;
++        if (invert_camera_y) y = -y;
++        reading.camera_x = x;
++        reading.camera_y = y;
++        reading.camera = x != 0 || y != 0;
+     }
+     return reading;
+ }

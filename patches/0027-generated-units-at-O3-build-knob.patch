@@ -1,0 +1,15 @@
+--- a/lcs/CMakeLists.txt
++++ b/lcs/CMakeLists.txt
+@@ -160,7 +160,11 @@
+         target_compile_options(lcs_generated PRIVATE /bigobj ${PSPRECOMP_MSVC_MP_FLAG}
+             $<$<CONFIG:Release,RelWithDebInfo>:/O2>)
+     else()
+-        target_compile_options(lcs_generated PRIVATE -O2)
++        # LCS_GENERATED_OPT: optimisation level of the generated units. -O3
++        # measured +0.5-1 fps over -O2 on the A33 (GTA street scene); the
++        # instrumented (PGO) builds of the big units then need ~1.5 GB each.
++        set(LCS_GENERATED_OPT "3" CACHE STRING "-O level for the generated units")
++        target_compile_options(lcs_generated PRIVATE -O${LCS_GENERATED_OPT})
+         # Thumb-2 conditional branches reach +-1 MB; these units' largest
+         # functions exceed that once instrumented for PGO, so they are ARM code
+         # (in every build, so the profile matches the code it is applied to).

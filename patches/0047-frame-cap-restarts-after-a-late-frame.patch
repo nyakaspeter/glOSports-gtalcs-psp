@@ -1,0 +1,27 @@
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -2126,8 +2126,9 @@
+ std::chrono::steady_clock::time_point wall_clock_start;
+ 
+ // LCS_FPS_CAP=N (with [Timing] FrameRate=60, one vblank wait a frame): the
+-// wait also waits for a 1/N s deadline that carries over, so a frame that
+-// ran late shortens the next wait instead of adding to it. A sleep before
++// wait also waits for a 1/N s deadline on a grid that a late frame starts
++// again (0047; it used to carry over, so the frames after a dip ran above the
++// cap to win the time back). A sleep before
+ // the display list (the old place) sat in series with the 60 Hz wait and
+ // the GE work and cost 3 fps standing (25.5 against 28.5).
+ std::uint32_t frame_cap() {
+@@ -2155,8 +2156,11 @@
+     auto wake = next_vblank;
+     if (const std::uint32_t cap = frame_cap(); cap != 0u && lcs::lcs_frame_limiter_unlocked()) {
+         const auto cap_period = std::chrono::microseconds(1000000u / cap);
+-        if (now > cap_deadline + cap_period * 4) cap_deadline = now;  // a long stall: start over
++        // A frame that ran late starts the grid again from now: no quick
++        // frames after it to win the time back (the game's step follows the
++        // real time anyway), so the rate never goes over the cap.
+         cap_deadline += cap_period;
++        if (cap_deadline < now) cap_deadline = now;
+         if (cap_deadline > wake) wake = cap_deadline;
+     }
+     if (now < wake) {

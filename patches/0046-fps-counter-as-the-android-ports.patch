@@ -1,0 +1,83 @@
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -2056,32 +2056,56 @@
+     invalidate_state(r);
+ }
+ 
+-// "FPS nn" in the top-left corner, drawn with scissored clears (one per lit
+-// pixel of the 5x7 font), so it needs no texture or shader.
++// "28 fps" in the top-left corner, drawn as the goodluckOS Android ports do:
++// a 5x9 font at 2 pixels a dot, off-white over a dark copy 2 pixels down and
++// right, drawn with scissored clears (one per run of lit dots in a row), so
++// it needs no texture or shader.
+ void draw_fps(RenderState &r) {
+-    if (!r.show_fps) return;
+-    char text[16];
+-    std::snprintf(text, sizeof(text), "FPS %.0f", std::min(r.fps, 999.0));
+-    const int scale = std::max(2, static_cast<int>(r.screen_height) / 240);
+-    const int margin = 4 * scale;
+-    const int length = static_cast<int>(std::strlen(text));
+-    const int top = static_cast<int>(r.screen_height) - margin;  // GL rows count from the bottom
++    if (!r.show_fps || r.fps <= 0.0) return;
++    // Glyphs 0-9, f, p, s; bit 4 is the left column, rows 7-8 for descenders.
++    static constexpr std::uint8_t kGlyphs[13][9] = {
++        {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e},
++        {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}, {0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e},
++        {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}, {0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e},
++        {0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e}, {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
++        {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}, {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c},
++        {0x06, 0x09, 0x08, 0x1c, 0x08, 0x08, 0x08}, {0, 0, 0x1e, 0x11, 0x11, 0x11, 0x1e, 0x10, 0x10},
++        {0, 0, 0x0f, 0x10, 0x0e, 0x01, 0x1e},
++    };
++    constexpr int kDot = 2;
++    constexpr int kAdvance = 6 * kDot;
++    const int fps = std::min(999, static_cast<int>(r.fps + 0.5));
++    int glyphs[6];
++    int count = 0;
++    if (fps >= 100) glyphs[count++] = fps / 100;
++    if (fps >= 10) glyphs[count++] = fps / 10 % 10;
++    glyphs[count++] = fps % 10;
++    const int digits = count;
++    glyphs[count++] = 10;
++    glyphs[count++] = 11;
++    glyphs[count++] = 12;
++    const int screen_height = static_cast<int>(r.screen_height);
++    const int top = 6;
++    const int x0 = 6;  // the top-left corner, where the counter has always been
+     glEnable(GL_SCISSOR_TEST);
+-    glScissor(margin, top - 9 * scale, (length * 6 + 3) * scale, 9 * scale);
+-    glClearColor(0.03f, 0.05f, 0.11f, 1.0f);
+-    glClear(GL_COLOR_BUFFER_BIT);
+-    glClearColor(0.91f, 0.97f, 1.0f, 1.0f);
+-    for (int c = 0; c < length; ++c) {
+-        const char ch = text[c];
+-        int glyph = 0;  // space
+-        if (ch >= '0' && ch <= '9') glyph = 1 + (ch - '0');
+-        else if (ch >= 'A' && ch <= 'Z') glyph = 11 + (ch - 'A');
+-        for (int row = 0; row < 7; ++row) {
+-            const std::uint8_t bits = kGlyph5x7[static_cast<std::size_t>(glyph)][static_cast<std::size_t>(row)];
+-            for (int column = 0; column < 5; ++column) {
+-                if ((bits & (0x10u >> column)) == 0u) continue;
+-                glScissor(margin + (2 + c * 6 + column) * scale, top - (2 + row + 1) * scale, scale, scale);
+-                glClear(GL_COLOR_BUFFER_BIT);
++    for (int pass = 0; pass < 3; ++pass) {
++        const int offset = 2 - pass;  // two shadow passes, then the text
++        if (offset != 0) glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
++        else glClearColor(0.94f, 0.94f, 0.9f, 1.0f);
++        for (int i = 0, x = x0; i < count; ++i, x += kAdvance) {
++            if (i == digits) x += kAdvance / 2;  // the space
++            for (int row = 0; row < 9; ++row) {
++                const unsigned bits = kGlyphs[glyphs[i]][row];
++                for (int column = 0; column < 5; ++column) {
++                    if ((bits & (0x10u >> column)) == 0u) continue;
++                    int run = 1;
++                    while (column + run < 5 && (bits & (0x10u >> (column + run))) != 0u) ++run;
++                    const int px = x + offset + column * kDot;
++                    const int py = top + offset + row * kDot;  // from the top; GL counts from the bottom
++                    glScissor(px, screen_height - py - kDot, run * kDot, kDot);
++                    glClear(GL_COLOR_BUFFER_BIT);
++                    column += run;
++                }
+             }
+         }
+     }

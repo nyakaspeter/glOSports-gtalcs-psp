@@ -1,0 +1,46 @@
+diff --git a/lcs/host/lcs_ge_exec.cpp b/lcs/host/lcs_ge_exec.cpp
+--- a/lcs/host/lcs_ge_exec.cpp
++++ b/lcs/host/lcs_ge_exec.cpp
+@@ -27,22 +27,36 @@ std::uint32_t relative_address(std::uint32_t data24) {
+     return (ge_offset_address + extended) & 0x0FFFFFFFu;
+ }
+ 
+-// Display-list words straight from main RAM (a list is thousands of words a
+-// frame); anything outside it through the checked accessors.
++// Display-list words straight from main RAM or VRAM (where GTA builds some
++// of its lists; a list is thousands of words a frame); anything else through
++// the checked accessors.
+ struct ListReader {
+-    const psprecomp::GuestMemory &memory;
++    using Memory = psprecomp::GuestMemory;
++    const Memory &memory;
+     const std::uint8_t *ram;
+     std::uint32_t ram_size;
++    const std::uint8_t *vram;
++    std::uint32_t vram_size;
+ 
+-    explicit ListReader(const psprecomp::GuestMemory &m)
+-        : memory(m), ram(m.raw_pointer(psprecomp::GuestMemory::kPhysicalBase, m.size())), ram_size(m.size()) {}
++    explicit ListReader(const Memory &m)
++        : memory(m), ram(m.raw_pointer(Memory::kPhysicalBase, m.size())), ram_size(m.size()),
++          vram(m.raw_pointer(Memory::kVramPhysicalBase, m.vram_size())), vram_size(m.vram_size()) {}
+ 
+     bool fetch(std::uint32_t address, std::uint32_t &word) const {
+-        const std::uint32_t offset = (address & 0x1FFFFFFFu) - psprecomp::GuestMemory::kPhysicalBase;
++        const std::uint32_t canonical = address & 0x1FFFFFFFu;
++        const std::uint32_t offset = canonical - Memory::kPhysicalBase;
+         if (ram != nullptr && ram_size >= 4u && offset <= ram_size - 4u) {
+             std::memcpy(&word, ram + offset, sizeof(word));
+             return true;
+         }
++        if (const std::uint32_t window = canonical - Memory::kVramPhysicalBase;
++            vram != nullptr && window < Memory::kVramAddressSpan) {
++            const std::uint32_t vram_offset = window & (Memory::kVramSize - 1u);
++            if (vram_size >= 4u && vram_offset <= vram_size - 4u) {
++                std::memcpy(&word, vram + vram_offset, sizeof(word));
++                return true;
++            }
++        }
+         if (!memory.contains(address, 4u)) return false;
+         word = memory.load32(address);
+         return true;

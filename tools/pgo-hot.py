@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""pgo-hot.py [count]: rank functions by the committed PGO profile (pgo/*.gcda),
+the counters the instrumented build collected on the console in tools/pgo.sh's
+run (intro, 60 s in the safehouse, 60 s on the street): a profile without the
+console.
+
+The arc counters of a function sum to about the number of its basic blocks run,
+so out-of-line helpers that loop over a few lanes look bigger than their share
+of the time; the max column (the busiest arc) is the call count of a function
+without loops. A gcda names a function by the CRC GCC computes from its mangled
+name (coverage_compute_profile_id): externally visible functions are matched
+against the symbols of the build's objects, static ones stay "?".
+
+Needs a build in build/ (the objects for the names) and the builder image.
+"""
+import collections
+import os
+import re
+import subprocess
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+root = os.path.abspath(os.path.join(here, ".."))
+image = os.environ.get("IMAGE", "lcs-recomp-builder")
+count = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+
+script = r'''
+for f in pgo/*.gcda; do gcov-dump-12 -l "$f"; done > /tmp/gcda.txt 2>&1
+for f in $(find build -name '*.o'); do arm-linux-gnueabihf-nm --defined-only "$f" 2>/dev/null; done > /tmp/nm.txt
+cat /tmp/gcda.txt; echo '=====NM====='; cat /tmp/nm.txt
+'''
+out = subprocess.run(["docker", "run", "--rm", "-v", f"{root}:/w", "-w", "/w", image, "sh", "-c", script],
+                     capture_output=True, text=True, check=True).stdout
+gcda, nm = out.split("=====NM=====\n", 1)
+
+
+def crc32_string(chk, s):  # gcc/crc32.cc, the terminating NUL included
+    for ch in s.encode() + b"\0":
+        value = ch << 24
+        for _ in range(8):
+            feedback = 0x04C11DB7 if (value ^ chk) & 0x80000000 else 0
+            chk = ((chk << 1) & 0xFFFFFFFF) ^ feedback
+            value = (value << 1) & 0xFFFFFFFF
+    return chk
+
+
+names = {}
+for line in nm.splitlines():
+    parts = line.split()
+    if len(parts) == 3 and parts[1] in "TW":
+        c = crc32_string(0, parts[2]) & 0x7FFFFFFF
+        names[c + (c == 0)] = parts[2]
+
+total = collections.Counter()
+busiest = collections.Counter()
+current = None
+mode = None
+for line in gcda.splitlines():
+    m = re.search(r"(\S+\.gcda):\s+01000000:\s+\d+:FUNCTION ident=(\d+)", line)
+    if m:
+        current = (m.group(1).split("#")[-1].replace(".gcda", ""), int(m.group(2)))
+        mode = None
+        continue
+    if "COUNTERS arcs" in line:
+        mode = "arcs"
+        continue
+    if "COUNTERS" in line:
+        mode = None
+        continue
+    m = re.match(r".*gcda:\s+\d+: ([\d ]+)$", line)
+    if m and current and mode == "arcs":
+        values = [int(x) for x in m.group(1).split()]
+        total[current] += sum(values)
+        busiest[current] = max(busiest[current], max(values))
+
+grand = sum(total.values())
+wanted = [names.get(i, "?") for (_, i), _ in total.most_common(count)]
+plain = subprocess.run(["c++filt"], input="\n".join(wanted), capture_output=True, text=True).stdout.splitlines()
+demangled = dict(zip(wanted, plain))
+print(f"{'share':>6} {'busiest arc':>12}  file / function")
+for (unit, ident), value in total.most_common(count):
+    name = names.get(ident, "?")
+    print(f"{100 * value / grand:5.2f}% {busiest[(unit, ident)]:12}  {unit}  {demangled.get(name, name)[:110]}")

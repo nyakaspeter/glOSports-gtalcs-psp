@@ -1,0 +1,456 @@
+diff --git a/lcs/host/ge_gpu_backend.hpp b/lcs/host/ge_gpu_backend.hpp
+--- a/lcs/host/ge_gpu_backend.hpp
++++ b/lcs/host/ge_gpu_backend.hpp
+@@ -152,6 +152,14 @@
+ };
+ using GeGpuVertexVector = std::vector<GeGpuVertex, DefaultInitAllocator<GeGpuVertex>>;
+ using GeIndexVector = std::vector<std::uint32_t, DefaultInitAllocator<std::uint32_t>>;
++
++// Texel layout of a decoded texture handed to the backend. The 16-bit ones use
++// GL's component order (GL_UNSIGNED_SHORT_5_6_5 / 5_5_5_1 / 4_4_4_4) so the
++// upload is a plain copy and the GPU samples half the bytes.
++enum class GeGpuTexelFormat : std::uint8_t { Rgba8, Rgb565, Rgba5551, Rgba4444 };
++constexpr std::uint32_t ge_gpu_texel_bytes(GeGpuTexelFormat format) noexcept {
++    return format == GeGpuTexelFormat::Rgba8 ? 4u : 2u;
++}
+ 
+ struct GeGpuDecodedMipLevel {
+     std::uint32_t width{};
+@@ -385,10 +393,16 @@
+     const GeGpuDrawDescriptor &draw,
+     std::span<const GeGpuDecodedMipLevel> levels) noexcept;
+ 
++// The texel format the backend wants a texture of the given PSP pixel format
++// (and palette format, for CLUT textures) decoded into.
++[[nodiscard]] GeGpuTexelFormat ge_gpu_backend_texel_format(
++    std::uint32_t texture_format, std::uint32_t clut_format) noexcept;
++
+ [[nodiscard]] bool ge_gpu_backend_upload_decoded_texture_chain_packed(
+     const GeGpuDrawDescriptor &draw,
+     std::uint32_t base_width, std::uint32_t base_height,
+-    std::uint32_t mip_levels, std::vector<std::byte> rgba8) noexcept;
++    std::uint32_t mip_levels, std::vector<std::byte> texels,
++    GeGpuTexelFormat format = GeGpuTexelFormat::Rgba8) noexcept;
+ 
+ [[nodiscard]] bool ge_gpu_backend_copy_last_texture_rgba(
+     std::span<std::byte> destination) noexcept;
+diff --git a/lcs/host/ge_gpu_backend_vulkan.cpp b/lcs/host/ge_gpu_backend_vulkan.cpp
+--- a/lcs/host/ge_gpu_backend_vulkan.cpp
++++ b/lcs/host/ge_gpu_backend_vulkan.cpp
+@@ -2839,12 +2839,18 @@
+     VulkanState &s = state();
+     std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     return prepare_texture(s, draw, width, height, static_cast<std::uint32_t>(levels.size()), std::move(packed));
++}
++
++GeGpuTexelFormat ge_gpu_backend_texel_format(std::uint32_t, std::uint32_t) noexcept {
++    return GeGpuTexelFormat::Rgba8;
+ }
+ 
+ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescriptor &draw,
+                                                         std::uint32_t width, std::uint32_t height,
+                                                         std::uint32_t mip_levels,
+-                                                        std::vector<std::byte> packed) noexcept {
++                                                        std::vector<std::byte> packed,
++                                                        GeGpuTexelFormat format) noexcept {
++    if (format != GeGpuTexelFormat::Rgba8) return false;
+     VulkanState &s = state();
+     std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     return prepare_texture(s, draw, width, height, mip_levels, std::move(packed));
+diff --git a/lcs/host/ge_gpu_backend_dx12.cpp b/lcs/host/ge_gpu_backend_dx12.cpp
+--- a/lcs/host/ge_gpu_backend_dx12.cpp
++++ b/lcs/host/ge_gpu_backend_dx12.cpp
+@@ -2890,10 +2890,16 @@
+                                   static_cast<std::uint32_t>(levels.size()), std::move(packed));
+ }
+ 
++GeGpuTexelFormat ge_gpu_backend_texel_format(std::uint32_t, std::uint32_t) noexcept {
++    return GeGpuTexelFormat::Rgba8;
++}
++
+ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescriptor &draw,
+                                                         std::uint32_t width, std::uint32_t height,
+                                                         std::uint32_t mip_levels,
+-                                                        std::vector<std::byte> packed) noexcept {
++                                                        std::vector<std::byte> packed,
++                                                        GeGpuTexelFormat format) noexcept {
++    if (format != GeGpuTexelFormat::Rgba8) return false;
+     return prepare_texture_upload(state(), draw, width, height, mip_levels, std::move(packed));
+ }
+ bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte> destination) noexcept {
+@@ -3618,7 +3624,8 @@
+ bool ge_gpu_backend_texture_available(const GeGpuDrawDescriptor &) noexcept { return false; }
+ bool ge_gpu_backend_upload_decoded_texture(const GeGpuDrawDescriptor &, std::uint32_t, std::uint32_t, std::span<const std::byte>) noexcept { return false; }
+ bool ge_gpu_backend_upload_decoded_texture_chain(const GeGpuDrawDescriptor &, std::span<const GeGpuDecodedMipLevel>) noexcept { return false; }
+-bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescriptor &, std::uint32_t, std::uint32_t, std::uint32_t, std::vector<std::byte>) noexcept { return false; }
++GeGpuTexelFormat ge_gpu_backend_texel_format(std::uint32_t, std::uint32_t) noexcept { return GeGpuTexelFormat::Rgba8; }
++bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescriptor &, std::uint32_t, std::uint32_t, std::uint32_t, std::vector<std::byte>, GeGpuTexelFormat) noexcept { return false; }
+ bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte>) noexcept { return false; }
+ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &, std::span<const GeGpuVertex>) noexcept {}
+ void ge_gpu_backend_accumulate_hardware_triangles(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const GeGpuVertex>, std::span<const std::uint32_t>) noexcept {}
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -2439,8 +2439,103 @@
+         }, useful_participants);
+     }
+     return true;
++}
++
++// GL 16-bit texel packing (GL_UNSIGNED_SHORT_5_6_5 / 5_5_5_1 / 4_4_4_4 order).
++// Exact for texels that were 16-bit on the PSP: unpack16 only replicates bits.
++inline std::uint16_t pack_gl16(Color c, GeGpuTexelFormat format) noexcept {
++    switch (format) {
++    case GeGpuTexelFormat::Rgb565:
++        return static_cast<std::uint16_t>(((c.r >> 3u) << 11u) | ((c.g >> 2u) << 5u) | (c.b >> 3u));
++    case GeGpuTexelFormat::Rgba5551:
++        return static_cast<std::uint16_t>(((c.r >> 3u) << 11u) | ((c.g >> 3u) << 6u) | ((c.b >> 3u) << 1u) |
++                                          (c.a >= 128u ? 1u : 0u));
++    case GeGpuTexelFormat::Rgba4444:
++        return static_cast<std::uint16_t>(((c.r >> 4u) << 12u) | ((c.g >> 4u) << 8u) | ((c.b >> 4u) << 4u) |
++                                          (c.a >> 4u));
++    default:
++        return 0u;
++    }
+ }
++
++// Decode a texture level into `out` in the backend's texel format. The 16-bit
++// formats have a direct path for CLUT4/CLUT8 textures (the palette packed once,
++// one 16-bit store per texel); everything else goes through the generic
++// sampler.
++bool decode_texture_into(const psprecomp::GuestMemory &memory, const TextureSetup &texture,
++                         std::span<std::byte> out, GeGpuTexelFormat format) {
++    if (format == GeGpuTexelFormat::Rgba8) return decode_texture_rgba_into(memory, texture, out);
++    if (texture.format > 10u || texture.width == 0u || texture.height == 0u ||
++        texture.width > 2048u || texture.height > 2048u) return false;
++    if (static_cast<std::uint64_t>(texture.width) * texture.height * 2ull != out.size()) return false;
++    std::uint16_t *const dst16 = reinterpret_cast<std::uint16_t *>(out.data());
+ 
++    const bool clut4 = texture.format == 4u;
++    const bool clut8 = texture.format == 5u;
++    const bool fast_clut = (clut4 || clut8) && texture.pixels != nullptr;
++    std::array<std::uint16_t, 256> palette{};
++    if (fast_clut) {
++        const std::uint32_t entries = clut4 ? 16u : 256u;
++        for (std::uint32_t i = 0u; i < entries; ++i)
++            palette[i] = pack_gl16(read_clut_fast(memory, texture, i), format);
++    }
++
++    auto decode_rows = [&](std::uint32_t first_row, std::uint32_t last_row) {
++        if (fast_clut) {
++            const std::uint32_t row_bytes = clut4 ? (texture.buffer_width + 1u) >> 1u : texture.buffer_width;
++            const std::uint32_t blocks_per_row = (row_bytes + 15u) >> 4u;
++            for (std::uint32_t y = first_row; y <= last_row; ++y) {
++                std::uint16_t *dst = dst16 + static_cast<std::size_t>(y) * texture.width;
++                const auto source_offset = [&](std::uint32_t byte_x) noexcept {
++                    if (!texture.swizzled)
++                        return static_cast<std::size_t>(y) * row_bytes + byte_x;
++                    return static_cast<std::size_t>(
++                        (((y >> 3u) * blocks_per_row + (byte_x >> 4u)) << 7u) +
++                        ((y & 7u) << 4u) + (byte_x & 15u));
++                };
++                if (clut4) {
++                    for (std::uint32_t x = 0u; x < texture.width; x += 2u) {
++                        const std::uint8_t packed = texture.pixels[source_offset(x >> 1u)];
++                        *dst++ = palette[packed & 0x0Fu];
++                        if (x + 1u < texture.width) *dst++ = palette[packed >> 4u];
++                    }
++                } else {
++                    for (std::uint32_t x = 0u; x < texture.width; ++x)
++                        *dst++ = palette[texture.pixels[source_offset(x)]];
++                }
++            }
++            return;
++        }
++        std::uint16_t *dst = dst16 + static_cast<std::size_t>(first_row) * texture.width;
++        for (std::uint32_t y = first_row; y <= last_row; ++y)
++            for (std::uint32_t x = 0u; x < texture.width; ++x)
++                *dst++ = pack_gl16(sample_texture_wrapped(memory, texture, x, y), format);
++    };
++
++    static const bool parallel_texture_decode = [] {
++        const char *text = std::getenv("PSPRECOMP_GE_PARALLEL_TEXTURE_DECODE");
++        return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
++    }();
++    RowWorkerPool &pool = RowWorkerPool::instance();
++    const std::uint64_t texels = static_cast<std::uint64_t>(texture.width) * texture.height;
++    const std::uint64_t threshold = fast_clut ? 32768u : 16384u;
++    if (!parallel_texture_decode || pool.worker_count() <= 1u ||
++        texels < threshold || texture.height < 2u) {
++        decode_rows(0u, texture.height - 1u);
++    } else {
++        const std::uint64_t texels_per_participant = fast_clut ? 8192u : 4096u;
++        const unsigned useful_participants = std::max(2u, std::min<unsigned>(
++            pool.worker_count(), static_cast<unsigned>((texels + texels_per_participant - 1u) /
++                                                       texels_per_participant)));
++        pool.run(0, static_cast<std::int32_t>(texture.height) - 1,
++                 [&decode_rows](unsigned, std::int32_t begin, std::int32_t end) {
++            decode_rows(static_cast<std::uint32_t>(begin),
++                        static_cast<std::uint32_t>(end));
++        }, useful_participants);
++    }
++    return true;
++}
++
+ bool decode_texture_rgba(const psprecomp::GuestMemory &memory,
+                          const TextureSetup &texture,
+                          std::vector<std::byte> &rgba8) {
+@@ -4410,12 +4505,16 @@
+             (gpu_draw.texture_mipmap_enabled
+                 ? std::min<std::uint32_t>(8u, gpu_draw.texture_max_level + 1u) : 1u);
+         std::array<TextureSetup, 8> mip_setups{};
++        for (std::uint32_t level = 0u; level < level_count; ++level)
++            mip_setups[level] = make_texture_setup_for_level(memory, commands, level);
++        const GeGpuTexelFormat texel_format = framebuffer_feedback ? GeGpuTexelFormat::Rgba8
++            : ge_gpu_backend_texel_format(mip_setups[0].format, mip_setups[0].clut_format);
++        const std::uint32_t texel_bytes = ge_gpu_texel_bytes(texel_format);
+         std::size_t total_bytes = 0u;
+         bool all = true;
+         for (std::uint32_t level = 0u; level < level_count; ++level) {
+-            mip_setups[level] = make_texture_setup_for_level(memory, commands, level);
+             const std::uint64_t bytes = static_cast<std::uint64_t>(mip_setups[level].width) *
+-                                        mip_setups[level].height * 4ull;
++                                        mip_setups[level].height * texel_bytes;
+             if (bytes > std::numeric_limits<std::size_t>::max() - total_bytes) {
+                 all = false;
+                 break;
+@@ -4429,9 +4528,9 @@
+         std::size_t offset = 0u;
+         for (std::uint32_t level = 0u; all && level < level_count; ++level) {
+             const std::size_t bytes = static_cast<std::size_t>(mip_setups[level].width) *
+-                                      mip_setups[level].height * 4u;
+-            if (!decode_texture_rgba_into(memory, mip_setups[level],
+-                                          std::span<std::byte>(decoded).subspan(offset, bytes))) {
++                                      mip_setups[level].height * texel_bytes;
++            if (!decode_texture_into(memory, mip_setups[level],
++                                     std::span<std::byte>(decoded).subspan(offset, bytes), texel_format)) {
+                 all = false;
+                 break;
+             }
+@@ -4440,7 +4539,7 @@
+         if (all) {
+             (void)ge_gpu_backend_upload_decoded_texture_chain_packed(
+                 gpu_draw, mip_setups[0].width, mip_setups[0].height,
+-                level_count, std::move(decoded));
++                level_count, std::move(decoded), texel_format);
+         } else {
+             (void)ge_gpu_backend_upload_decoded_texture(gpu_draw, 0u, 0u, {});
+         }
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -132,7 +132,8 @@
+     std::uint32_t width{};
+     std::uint32_t height{};
+     std::uint32_t mip_levels{1u};
+-    std::vector<std::byte> rgba8;
++    std::vector<std::byte> rgba8;  // texels in `format` (the name predates the 16-bit ones)
++    GeGpuTexelFormat format{GeGpuTexelFormat::Rgba8};
+ };
+ 
+ // One frame, handed from the GE thread to the render thread.
+@@ -690,25 +691,52 @@
+ 
+ bool power_of_two(std::uint32_t value) noexcept { return value != 0u && (value & (value - 1u)) == 0u; }
+ 
++// Channel layout of each texel format: bit width and shift per channel
++// (zero width: the channel is absent).
++struct TexelLayout {
++    std::uint32_t bytes;
++    std::array<std::uint32_t, 4> width;
++    std::array<std::uint32_t, 4> shift;
++};
++constexpr TexelLayout texel_layout(GeGpuTexelFormat format) noexcept {
++    switch (format) {
++    case GeGpuTexelFormat::Rgb565: return {2u, {5u, 6u, 5u, 0u}, {11u, 5u, 0u, 0u}};
++    case GeGpuTexelFormat::Rgba5551: return {2u, {5u, 5u, 5u, 1u}, {11u, 6u, 1u, 0u}};
++    case GeGpuTexelFormat::Rgba4444: return {2u, {4u, 4u, 4u, 4u}, {12u, 8u, 4u, 0u}};
++    default: return {4u, {8u, 8u, 8u, 8u}, {0u, 8u, 16u, 24u}};
++    }
++}
++
+ // 2x2 box filter, for the levels a PSP chain leaves out: GLES 2 samples an
+-// incomplete mip chain as black.
+-std::vector<std::byte> half_size(const std::byte *source, std::uint32_t width, std::uint32_t height) {
++// incomplete mip chain as black. Works in the texel format's own channel depths.
++std::vector<std::byte> half_size(const std::byte *source, std::uint32_t width, std::uint32_t height,
++                                 GeGpuTexelFormat format) {
++    const TexelLayout layout = texel_layout(format);
+     const std::uint32_t w = std::max(1u, width >> 1u);
+     const std::uint32_t h = std::max(1u, height >> 1u);
+-    std::vector<std::byte> out(static_cast<std::size_t>(w) * h * 4u);
++    std::vector<std::byte> out(static_cast<std::size_t>(w) * h * layout.bytes);
++    const auto load = [&](std::uint32_t px, std::uint32_t py) {
++        const std::byte *p = source + (static_cast<std::size_t>(py) * width + px) * layout.bytes;
++        std::uint32_t v = 0u;
++        std::memcpy(&v, p, layout.bytes);
++        return v;
++    };
+     for (std::uint32_t y = 0u; y < h; ++y) {
+         const std::uint32_t y0 = std::min(y * 2u, height - 1u);
+         const std::uint32_t y1 = std::min(y * 2u + 1u, height - 1u);
+         for (std::uint32_t x = 0u; x < w; ++x) {
+             const std::uint32_t x0 = std::min(x * 2u, width - 1u);
+             const std::uint32_t x1 = std::min(x * 2u + 1u, width - 1u);
++            const std::uint32_t t[4] = {load(x0, y0), load(x1, y0), load(x0, y1), load(x1, y1)};
++            std::uint32_t packed = 0u;
+             for (std::uint32_t c = 0u; c < 4u; ++c) {
+-                const auto at = [&](std::uint32_t px, std::uint32_t py) {
+-                    return static_cast<std::uint32_t>(source[(static_cast<std::size_t>(py) * width + px) * 4u + c]);
+-                };
+-                out[(static_cast<std::size_t>(y) * w + x) * 4u + c] =
+-                    static_cast<std::byte>((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2u) / 4u);
++                if (layout.width[c] == 0u) continue;
++                const std::uint32_t mask = (1u << layout.width[c]) - 1u;
++                std::uint32_t sum = 2u;
++                for (const std::uint32_t v : t) sum += (v >> layout.shift[c]) & mask;
++                packed |= ((sum / 4u) & mask) << layout.shift[c];
+             }
++            std::memcpy(out.data() + (static_cast<std::size_t>(y) * w + x) * layout.bytes, &packed, layout.bytes);
+         }
+     }
+     return out;
+@@ -730,7 +758,16 @@
+     texture.wrap_s = texture.wrap_t = texture.min_filter = texture.mag_filter = 0;
+     glBindTexture(GL_TEXTURE_2D, texture.id);
+     r.bound_texture = texture.id;
+-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    const std::uint32_t texel_bytes = ge_gpu_texel_bytes(upload.format);
++    GLenum gl_format = GL_RGBA;
++    GLenum gl_type = GL_UNSIGNED_BYTE;
++    switch (upload.format) {
++    case GeGpuTexelFormat::Rgb565: gl_format = GL_RGB; gl_type = GL_UNSIGNED_SHORT_5_6_5; break;
++    case GeGpuTexelFormat::Rgba5551: gl_type = GL_UNSIGNED_SHORT_5_5_5_1; break;
++    case GeGpuTexelFormat::Rgba4444: gl_type = GL_UNSIGNED_SHORT_4_4_4_4; break;
++    default: break;
++    }
++    glPixelStorei(GL_UNPACK_ALIGNMENT, texel_bytes == 2u ? 2 : 4);
+     std::uint32_t width = upload.width;
+     std::uint32_t height = upload.height;
+     std::size_t offset = 0u;
+@@ -739,11 +776,11 @@
+     std::uint32_t last_width = 0u;
+     std::uint32_t last_height = 0u;
+     while (uploaded < levels) {
+-        const std::size_t level_bytes = static_cast<std::size_t>(width) * height * 4u;
++        const std::size_t level_bytes = static_cast<std::size_t>(width) * height * texel_bytes;
+         if (offset + level_bytes > upload.rgba8.size()) break;
+         last = upload.rgba8.data() + offset;
+-        glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(uploaded), GL_RGBA, static_cast<GLsizei>(width),
+-                     static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, last);
++        glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(uploaded), static_cast<GLint>(gl_format),
++                     static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, gl_format, gl_type, last);
+         offset += level_bytes;
+         last_width = width;
+         last_height = height;
+@@ -760,11 +797,12 @@
+         // Complete the chain down to 1x1 from the last level the game gave.
+         std::vector<std::byte> generated;
+         while (!(last_width == 1u && last_height == 1u)) {
+-            generated = half_size(last, last_width, last_height);
++            generated = half_size(last, last_width, last_height, upload.format);
+             last_width = std::max(1u, last_width >> 1u);
+             last_height = std::max(1u, last_height >> 1u);
+-            glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(uploaded), GL_RGBA, static_cast<GLsizei>(last_width),
+-                         static_cast<GLsizei>(last_height), 0, GL_RGBA, GL_UNSIGNED_BYTE, generated.data());
++            glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(uploaded), static_cast<GLint>(gl_format),
++                         static_cast<GLsizei>(last_width), static_cast<GLsizei>(last_height), 0, gl_format, gl_type,
++                         generated.data());
+             last = generated.data();
+             ++uploaded;
+         }
+@@ -1003,6 +1041,26 @@
+     return blend_variant(draw) == 4u ? (draw.blend_fix_source & 0x00FFFFFFu) : 0u;
+ }
+ 
++// Whether the draw's alpha test can reject anything. A test no 8-bit alpha can
++// fail (GEQUAL 0, LEQUAL 255, or a zero mask with EQUAL/LEQUAL/GEQUAL) gets the
++// plain shader: on Mali-400 a discard anywhere in a shader turns off early
++// depth rejection for the whole draw. LCS_GLES_ALPHA_TRIVIAL=0 keeps them.
++bool alpha_test_can_fail(const GeGpuDrawDescriptor &draw) noexcept {
++    static const bool trim = [] {
++        const char *text = std::getenv("LCS_GLES_ALPHA_TRIVIAL");
++        return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
++    }();
++    const std::uint32_t function = draw.alpha_function & 7u;
++    if (function == 1u) return false;
++    if (!trim) return true;
++    const std::uint32_t mask = draw.alpha_mask & 0xFFu;
++    const std::uint32_t reference = draw.alpha_reference & mask;
++    if (mask == 0u) return !(function == 2u || function == 5u || function == 7u);
++    if (function == 7u && reference == 0u) return false;
++    if (function == 5u && reference == 255u) return false;
++    return true;
++}
++
+ std::uint32_t program_key(const Batch &batch, bool textured) {
+     const GeGpuDrawDescriptor &draw = batch.draw;
+     std::uint32_t key = batch.pretransformed ? 0u : batch.hardware_transform ? 1u : 2u;
+@@ -1014,7 +1072,7 @@
+         if (draw.texture_double_color) key |= kDouble;
+     }
+     if (draw.fog_enabled) key |= kFog;
+-    if (draw.alpha_test_enabled && (draw.alpha_function & 7u) != 1u) {
++    if (draw.alpha_test_enabled && alpha_test_can_fail(draw)) {
+         key |= kAlphaTest;
+         key |= (draw.alpha_function & 7u) << kAlphaFuncShift;
+     }
+@@ -1932,7 +1990,8 @@
+ }
+ 
+ bool prepare_texture(Gles2State &s, const GeGpuDrawDescriptor &draw, std::uint32_t width,
+-                     std::uint32_t height, std::uint32_t mips, std::vector<std::byte> rgba) {
++                     std::uint32_t height, std::uint32_t mips, std::vector<std::byte> rgba,
++                     GeGpuTexelFormat format = GeGpuTexelFormat::Rgba8) {
+     if (width == 0u) width = draw.texture_width;
+     if (height == 0u) height = draw.texture_height;
+     if (width == 0u || height == 0u || rgba.empty() || mips == 0u) return false;
+@@ -1944,9 +2003,12 @@
+     texture.signature_epoch = s.frame_epoch;
+     texture.last_used_epoch = s.frame_epoch;
+     s.texture_bytes += texture.bytes;
+-    s.last_texture_rgba.assign(rgba.begin(),
+-                               rgba.begin() + std::min(rgba.size(), static_cast<std::size_t>(width) * height * 4u));
+-    s.uploads.push_back({key, width, height, mips, std::move(rgba)});
++    if (format == GeGpuTexelFormat::Rgba8)
++        s.last_texture_rgba.assign(rgba.begin(),
++                                   rgba.begin() + std::min(rgba.size(), static_cast<std::size_t>(width) * height * 4u));
++    else
++        s.last_texture_rgba.clear();
++    s.uploads.push_back({key, width, height, mips, std::move(rgba), format});
+     ++s.report.decoded_texture_uploads;
+     s.report.unique_texture_keys = s.textures.size();
+     return true;
+@@ -2164,12 +2226,30 @@
+                            static_cast<std::uint32_t>(levels.size()), std::move(packed));
+ }
+ 
++// LCS_GLES_TEXTURE16=0 keeps every texture RGBA8 (for A/B runs).
++GeGpuTexelFormat ge_gpu_backend_texel_format(std::uint32_t texture_format, std::uint32_t clut_format) noexcept {
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_GLES_TEXTURE16");
++        return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
++    }();
++    if (!enabled) return GeGpuTexelFormat::Rgba8;
++    const std::uint32_t color = texture_format <= 3u ? texture_format
++        : (texture_format == 4u || texture_format == 5u) ? clut_format : 3u;
++    switch (color) {
++    case 0u: return GeGpuTexelFormat::Rgb565;
++    case 1u: return GeGpuTexelFormat::Rgba5551;
++    case 2u: return GeGpuTexelFormat::Rgba4444;
++    default: return GeGpuTexelFormat::Rgba8;
++    }
++}
++
+ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescriptor &draw,
+                                                         std::uint32_t width, std::uint32_t height,
+                                                         std::uint32_t mip_levels,
+-                                                        std::vector<std::byte> packed) noexcept {
++                                                        std::vector<std::byte> packed,
++                                                        GeGpuTexelFormat format) noexcept {
+     Gles2State &s = state();
+-    return prepare_texture(s, draw, width, height, mip_levels, std::move(packed));
++    return prepare_texture(s, draw, width, height, mip_levels, std::move(packed), format);
+ }
+ 
+ bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte> destination) noexcept {

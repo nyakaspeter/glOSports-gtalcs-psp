@@ -1,0 +1,2371 @@
+diff --git a/lcs/host/ge_gpu_backend_dx12.cpp b/lcs/host/ge_gpu_backend_dx12.cpp
+index 4a87bb4..1909fe2 100644
+--- a/lcs/host/ge_gpu_backend_dx12.cpp
++++ b/lcs/host/ge_gpu_backend_dx12.cpp
+@@ -3581,7 +3581,7 @@ GeGpuBackendReport ge_gpu_backend_report() {
+     return report;
+ }
+ 
+-#elif !defined(LCS_VULKAN_GE_BACKEND)
++#elif !defined(LCS_VULKAN_GE_BACKEND) && !defined(LCS_GLES2_GE_BACKEND)
+ 
+ namespace {
+ struct Dx12StubState { std::uint32_t display_framebuffer{}; };
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+new file mode 100644
+index 0000000..d51e51b
+--- /dev/null
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -0,0 +1,2333 @@
++#include "ge_gpu_backend.hpp"
++
++// GE backend on OpenGL ES 2.0 for GPUs without Vulkan, written for ARM's
++// closed Mali-400 driver (r6p2), whose only output is EGL on /dev/fb0.
++// It follows the Vulkan backend's model: one render target (colour texture,
++// depth renderbuffer, FBO) per PSP framebuffer address, the frame's draws
++// replayed at the frame's end, and the display target scaled onto the screen.
++// It only starts when /dev/mali exists (ARM's driver loaded, as under
++// "glos-gpu run mali"); otherwise the software rasterizer stays active.
++//
++// Two threads. The GE thread (the backend API) only collects a frame:
++// vertices, draws, decoded textures, render-target sizes. At the frame's end
++// it hands the whole frame to the render thread, which owns the EGL context
++// and every GL object, and goes on with the next frame while that one is
++// drawn: on the Mali-400 the driver work per frame is as large as the GE
++// work, so the two overlap. Nothing is shared between them but the frame
++// queue (one frame waiting, one drawing); guest frames (movies) go through it
++// too, so they stay in order.
++#if defined(LCS_GLES2_GE_BACKEND)
++
++#include "host_font_5x7.hpp"
++#include "lcs_render_config.hpp"
++#include "lcs_runtime_log.hpp"
++
++#define EGL_NO_X11 1
++#include <EGL/egl.h>
++#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
++
++#include <fcntl.h>
++#include <linux/fb.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++namespace lcs {
++namespace {
++
++constexpr std::uint32_t kReferenceWidth = 480u;
++constexpr std::uint32_t kReferenceHeight = 272u;
++constexpr std::size_t kMaxFrameVertices = 1u << 20u;
++// Decoded textures kept on the GPU before least-recently-used ones go.
++constexpr std::size_t kTextureBudgetBytes = 48u * 1024u * 1024u;
++
++// ARM's fbdev native window type (EGL/fbdev_window.h).
++struct FbdevWindow {
++    unsigned short width;
++    unsigned short height;
++};
++
++struct Vertex {
++    float x{};
++    float y{};
++    float z{};
++    float w{1.0f};
++    std::uint32_t rgba{0xFFFFFFFFu};
++    float u{};
++    float v{};
++    float q{1.0f};
++    float fog{1.0f};
++};
++static_assert(sizeof(Vertex) == 36u);
++
++#pragma pack(push, 1)
++struct Packed0115 {
++    std::uint8_t u{};
++    std::uint8_t v{};
++    std::uint16_t color{};
++    std::int16_t x{};
++    std::int16_t y{};
++    std::int16_t z{};
++};
++#pragma pack(pop)
++static_assert(sizeof(Packed0115) == 10u);
++
++struct Batch {
++    GeGpuDrawDescriptor draw{};
++    std::uint64_t texture_key{};
++    std::uint32_t first_vertex{};
++    std::uint32_t vertex_count{};
++    std::uint32_t first_index{};
++    std::uint32_t index_count{};
++    bool indexed{};
++    std::uint32_t logical_draw_count{1u};
++    bool hardware_transform{};
++    // first_vertex/vertex_count index the frame's packed 0115 vertices.
++    bool packed{};
++    // Hardware-transform vertices already transformed to clip space on the
++    // CPU (see pretransform), so the draw needs no per-draw matrices.
++    bool pretransformed{};
++    GeGpuHardwareTransform transform{};
++    bool framebuffer_feedback{};
++    std::uint32_t feedback_address{};
++};
++
++// ------------------------------------------------------------------ frames --
++
++struct TargetSize {
++    std::uint32_t address{};
++    std::uint32_t logical_width{kReferenceWidth};
++    std::uint32_t logical_height{kReferenceHeight};
++};
++
++struct TextureUpload {
++    std::uint64_t key{};
++    std::uint32_t width{};
++    std::uint32_t height{};
++    std::uint32_t mip_levels{1u};
++    std::vector<std::byte> rgba8;
++};
++
++// One frame, handed from the GE thread to the render thread.
++struct Frame {
++    bool guest{};  // a guest (movie) frame: only guest_rgba
++    std::vector<Vertex> vertices;
++    std::vector<std::uint8_t> packed;  // 0115 vertices, 10 bytes each, as the PSP stores them
++    std::vector<std::uint32_t> indices;
++    std::vector<Batch> batches;
++    std::vector<TextureUpload> uploads;
++    std::vector<std::uint64_t> deletes;
++    std::vector<TargetSize> targets;
++    std::uint32_t display_framebuffer{};
++    std::uint32_t display_logical_width{kReferenceWidth};
++    std::uint32_t display_logical_height{kReferenceHeight};
++    bool publish{};
++    float display_aspect{};  // >0: the aspect to show the frame at (Widescreen.AspectRatio)
++    std::uint64_t psp_draws{};
++    std::vector<std::byte> guest_rgba;
++    std::uint32_t guest_width{};
++    std::uint32_t guest_height{};
++
++    void clear() {
++        guest = false;
++        vertices.clear();
++        packed.clear();
++        indices.clear();
++        batches.clear();
++        uploads.clear();
++        deletes.clear();
++        targets.clear();
++        psp_draws = 0u;
++        guest_rgba.clear();
++    }
++};
++
++// ------------------------------------------------------------ render side --
++
++struct Target {
++    std::uint32_t address{};
++    std::uint32_t logical_width{kReferenceWidth};
++    std::uint32_t logical_height{kReferenceHeight};
++    GLuint color{};
++    GLuint snapshot{};
++    GLuint depth{};
++    GLuint fbo{};
++    std::uint64_t last_render_epoch{};
++};
++
++struct GlTexture {
++    GLuint id{};
++    std::uint32_t mip_levels{1u};
++    bool pot{};
++    // Texture parameters last set on it (GLES 2 has no sampler objects).
++    GLint wrap_s{};
++    GLint wrap_t{};
++    GLint min_filter{};
++    GLint mag_filter{};
++};
++
++// Uniforms: the vertex shader's are the array uV[UVertexCount], the fragment
++// shader's uF (UFragmentCount), each sent with one call and only when changed
++// (driver calls per draw are what the Mali-400 path pays for).
++enum Uniform : int {
++    URow0, URow1, URow2, URow3, UViewZ, UUv, UFog, UMul, UAdd, UFlags,
++    UEnv, UFogColor, UAlphaRef, UTexture
++};
++constexpr int UVertexCount = UEnv;
++constexpr int UFragmentCount = UTexture - UEnv;
++using UniformValues = std::array<std::array<float, 4>, UTexture>;
++
++struct Program {
++    GLuint id{};
++    GLint vertex_location{-1};
++    GLint fragment_location{-1};
++    UniformValues sent{};
++    bool vertex_valid{};
++    bool fragment_valid{};
++};
++
++// Everything on the render thread; nothing else touches it.
++struct RenderState {
++    EGLDisplay display{EGL_NO_DISPLAY};
++    EGLSurface surface{EGL_NO_SURFACE};
++    EGLContext context{EGL_NO_CONTEXT};
++    FbdevWindow window{};
++    std::uint32_t screen_width{640u};
++    std::uint32_t screen_height{480u};
++    std::uint32_t target_width{kReferenceWidth};
++    std::uint32_t target_height{kReferenceHeight};
++    bool depth24{};
++    bool vsync{true};
++    std::unordered_map<std::uint64_t, GlTexture> textures;
++    std::unordered_map<std::uint32_t, Target> targets;
++    std::unordered_map<std::uint32_t, Program> programs;
++    Program present_program{};
++    GLuint guest_texture{};
++    std::uint32_t guest_width{};
++    std::uint32_t guest_height{};
++    std::vector<std::uint16_t> index16;
++    // LCS_GLES_VBO: 1 (default) the frame's vertices go to the GPU in one
++    // upload, from a ring of buffers; 2 the indices too (slower on ARM's
++    // driver: it reads each draw's indices back from uncached memory); 0
++    // client-side arrays per draw.
++    bool use_vbo{true};
++    bool index_vbo{};
++    std::array<std::array<GLuint, 3>, 3> buffers{};  // [ring][vertices, packed, indices]
++    std::uint32_t ring{};
++    GLuint vertex_buffer{};
++    GLuint packed_buffer{};
++    std::uint32_t display_framebuffer{};
++    std::uint64_t frame_epoch{1u};
++    Target *current_target{};
++    GLuint current_program{};
++    // GL state as last set (see invalidate_state).
++    bool fixed_valid{};
++    std::uint32_t fixed_state{};
++    std::uint32_t blend_color{};
++    bool scissor_valid{};
++    std::array<GLint, 4> scissor{};
++    GLuint bound_texture{0xFFFFFFFFu};
++    // FPS counter: screen presents per second; drawn top left (Display.ShowFPS),
++    // logged with PSP and GL draws per frame (LCS_FPS_LOG).
++    bool show_fps{};
++    double fps{};
++    bool log_fps{};
++    std::chrono::steady_clock::time_point fps_start{};
++    std::uint32_t fps_frames{};
++    std::uint64_t fps_psp_draws{};
++    std::uint64_t fps_gl_draws{};
++};
++
++// -------------------------------------------------------------- GE side --
++
++struct TextureInfo {
++    GeGpuDrawDescriptor descriptor{};
++    std::size_t bytes{};
++    std::uint64_t signature_epoch{};
++    std::uint64_t last_used_epoch{};
++};
++
++struct Gles2State {
++    std::recursive_mutex mutex;
++    GeGpuBackendReport report{};
++    bool enabled{};
++    std::vector<Vertex> vertices;
++    std::vector<std::uint8_t> packed;
++    std::vector<std::uint32_t> indices;
++    std::vector<Batch> batches;
++    std::unordered_map<std::uint64_t, TextureInfo> textures;
++    std::size_t texture_bytes{};
++    std::vector<TextureUpload> uploads;
++    std::vector<std::uint64_t> deletes;
++    std::unordered_map<std::uint32_t, TargetSize> targets;
++    std::vector<std::byte> last_texture_rgba;
++    std::uint32_t display_framebuffer{};
++    std::uint32_t display_logical_width{kReferenceWidth};
++    std::uint32_t display_logical_height{kReferenceHeight};
++    std::uint64_t frame_epoch{1u};
++
++    // The frame queues and threads: GE thread -> transform worker -> render
++    // thread (one frame waiting at each step).
++    std::mutex queue_mutex;
++    std::condition_variable queue_cv;
++    std::unique_ptr<Frame> to_transform;
++    std::unique_ptr<Frame> queued;
++    std::vector<std::unique_ptr<Frame>> spare;
++    bool stop{};
++    bool use_transform_thread{};
++    std::thread transform_thread;
++    std::thread render_thread;
++    RenderState render;
++
++    ~Gles2State() { stop_render_thread(); }
++    void stop_render_thread();
++};
++
++Gles2State &state() {
++    static Gles2State s;
++    return s;
++}
++
++bool fbdev_size(std::uint32_t &width, std::uint32_t &height) {
++    const int fd = open("/dev/fb0", O_RDONLY);
++    if (fd < 0) return false;
++    fb_var_screeninfo info{};
++    const bool ok = ioctl(fd, FBIOGET_VSCREENINFO, &info) == 0;
++    close(fd);
++    if (!ok || info.xres == 0u || info.yres == 0u) return false;
++    width = info.xres;
++    height = info.yres;
++    return true;
++}
++
++bool has_extension(const char *name) {
++    const char *list = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
++    return list != nullptr && std::strstr(list, name) != nullptr;
++}
++
++// ---------------------------------------------------------------- shaders --
++
++// Variant key bits.
++constexpr std::uint32_t kModeShift = 0u;          // 0 raw, 1 hardware transform, 2 through
++constexpr std::uint32_t kTextured = 1u << 2u;
++constexpr std::uint32_t kFuncShift = 3u;          // texture function 0..4
++constexpr std::uint32_t kUseAlpha = 1u << 6u;
++constexpr std::uint32_t kDouble = 1u << 7u;
++constexpr std::uint32_t kFog = 1u << 8u;
++constexpr std::uint32_t kAlphaTest = 1u << 9u;
++constexpr std::uint32_t kAlphaFuncShift = 10u;    // 0..7
++constexpr std::uint32_t kOpaque = 1u << 13u;      // 565 target: alpha = 1
++constexpr std::uint32_t kPacked = 1u << 14u;      // vertices in the PSP's 0115 format
++
++const char *kVertexShader = R"(
++#if PACKED
++// The PSP's 0115 vertex as stored: u8 u/v, a 5551 colour, s16 x/y/z, decoded
++// here so the GE thread only copies bytes (same scale as the Vulkan GE).
++attribute vec4 aPacked;   // x, y, z (shorts)
++attribute float aColor;   // 5551 colour (unsigned short)
++attribute vec2 aPackedUv; // u, v (bytes)
++#else
++attribute vec4 aPos;
++attribute vec4 aColor;
++attribute vec2 aUv;
++#endif
++attribute float aQ;
++attribute float aFog;
++uniform vec4 uV[10];
++#define uRow0 uV[0]
++#define uRow1 uV[1]
++#define uRow2 uV[2]
++#define uRow3 uV[3]
++#define uViewZ uV[4]
++#define uUv uV[5]
++#define uFog uV[6]
++#define uMul uV[7]
++#define uAdd uV[8]
++#define uFlags uV[9]   // x: depth clip, y: affine vertex colour
++varying lowp vec4 vColor;
++varying mediump vec3 vTex;
++varying lowp float vFog;
++void main() {
++    vec4 p;
++    vec2 uv;
++    float fog;
++#if PACKED
++    vec4 aPos = vec4(aPacked.xyz * (1.0 / 32768.0), 1.0);
++    vec2 aUv = aPackedUv * (1.0 / 128.0);
++    float packedColor = aColor;
++    vec4 channel;
++    channel.r = mod(packedColor, 32.0);
++    packedColor = floor(packedColor / 32.0);
++    channel.g = mod(packedColor, 32.0);
++    packedColor = floor(packedColor / 32.0);
++    channel.b = mod(packedColor, 32.0);
++    channel.a = floor(packedColor / 32.0);
++    vec4 decodedColor = vec4((channel.rgb * 8.0 + floor(channel.rgb / 4.0)) * (1.0 / 255.0), channel.a);
++#endif
++#if MODE == 1
++    float w = dot(uRow3, aPos);
++    if (abs(w) < 1.0e-12) w = 1.0;
++    float z = dot(uRow2, aPos);
++    if (uFlags.x < 0.5) z = clamp(z, 0.0, w);
++    p = vec4(dot(uRow0, aPos), dot(uRow1, aPos), z, w);
++    uv = aUv * uUv.xy + uUv.zw;
++    fog = clamp((dot(uViewZ, aPos) + uFog.x) * uFog.y, 0.0, 1.0);
++#elif MODE == 2
++    float w = aPos.w;
++    if (abs(w) < 1.0e-12) w = 1.0;
++    p = vec4((aPos.x * uUv.x - 1.0) * w, (1.0 - aPos.y * uUv.y) * w,
++             clamp(aPos.z * uUv.z, 0.0, 1.0) * w, w);
++    uv = aUv;
++    fog = aFog;
++#else
++    p = aPos;
++    uv = aUv;
++    fog = aFog;
++#endif
++#if PACKED
++    vec4 color = decodedColor;
++#else
++    vec4 color = aColor;
++#endif
++    if (uFlags.y > 0.5) {
++        vec4 lit = clamp(color * uMul + uAdd, 0.0, 1.0);
++        color = floor(lit * 255.0) * (1.0 / 255.0);
++    }
++    // As the Vulkan GE: Y flipped (row 0 = top of the PSP frame, like the
++    // uploaded textures), depth in [0, w] mapped to GL's [-w, w].
++    p.y = -p.y;
++    p.z = 2.0 * p.z - p.w;
++    gl_Position = p;
++    vColor = color;
++    // The coordinate goes to texture2DProj untouched so Mali interpolates it
++    // at full precision (repeating textures reach large coordinates).
++    vTex = vec3(uv * aQ, aQ);
++    vFog = fog;
++}
++)";
++
++const char *kFragmentShader = R"(
++precision mediump float;
++varying lowp vec4 vColor;
++varying mediump vec3 vTex;
++varying lowp float vFog;
++uniform sampler2D uTex;
++uniform mediump vec4 uF[3];
++#define uEnv uF[0]
++#define uFogColor uF[1]
++#define uAlphaRef uF[2]
++void main() {
++    lowp vec4 c = clamp(vColor, 0.0, 1.0);
++#if TEXTURED
++    lowp vec4 t = texture2DProj(uTex, vTex);
++#if FUNC == 0
++    c.rgb *= t.rgb;
++#if USE_ALPHA
++    c.a *= t.a;
++#endif
++#elif FUNC == 1
++#if USE_ALPHA
++    c.rgb = mix(c.rgb, t.rgb, t.a);
++#else
++    c.rgb = t.rgb;
++#endif
++#elif FUNC == 2
++    c.rgb = mix(c.rgb, uEnv.rgb, t.rgb);
++#if USE_ALPHA
++    c.a *= t.a;
++#endif
++#elif FUNC == 3
++#if USE_ALPHA
++    c = t;
++#else
++    c.rgb = t.rgb;
++#endif
++#elif FUNC == 4
++    c.rgb = clamp(c.rgb + t.rgb, 0.0, 1.0);
++#if USE_ALPHA
++    c.a *= t.a;
++#endif
++#endif
++#if DOUBLE
++    c.rgb = clamp(c.rgb * 2.0, 0.0, 1.0);
++#endif
++#endif
++#if FOG
++    c.rgb = mix(uFogColor.rgb, c.rgb, clamp(vFog, 0.0, 1.0));
++#endif
++#if ALPHA_TEST
++    mediump float a = floor(c.a * 255.0 + 0.5);
++#if ALPHA_FUNC == 0
++    discard;
++#elif ALPHA_FUNC == 2
++    if (a != uAlphaRef.x) discard;
++#elif ALPHA_FUNC == 3
++    if (a == uAlphaRef.x) discard;
++#elif ALPHA_FUNC == 4
++    if (a >= uAlphaRef.x) discard;
++#elif ALPHA_FUNC == 5
++    if (a > uAlphaRef.x) discard;
++#elif ALPHA_FUNC == 6
++    if (a <= uAlphaRef.x) discard;
++#elif ALPHA_FUNC == 7
++    if (a < uAlphaRef.x) discard;
++#endif
++#endif
++#if OPAQUE
++    c.a = 1.0;
++#endif
++    gl_FragColor = c;
++}
++)";
++
++const char *kPresentVertex = R"(
++attribute vec4 aPos;
++attribute vec2 aUv;
++varying mediump vec2 vUv;
++void main() {
++    gl_Position = aPos;
++    vUv = aUv;
++}
++)";
++
++const char *kPresentFragment = R"(
++precision mediump float;
++varying mediump vec2 vUv;
++uniform sampler2D uTex;
++void main() {
++    gl_FragColor = vec4(texture2D(uTex, vUv).rgb, 1.0);
++}
++)";
++
++GLuint compile(GLenum type, const std::string &source, std::string &error) {
++    const GLuint shader = glCreateShader(type);
++    const char *text = source.c_str();
++    glShaderSource(shader, 1, &text, nullptr);
++    glCompileShader(shader);
++    GLint ok = GL_FALSE;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if (ok != GL_TRUE) {
++        char log[1024]{};
++        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
++        error = std::string("shader compile failed: ") + log;
++        glDeleteShader(shader);
++        return 0u;
++    }
++    return shader;
++}
++
++bool link_program(Program &program, const std::string &vertex, const std::string &fragment,
++                  std::string &error) {
++    const GLuint vs = compile(GL_VERTEX_SHADER, vertex, error);
++    if (vs == 0u) return false;
++    const GLuint fs = compile(GL_FRAGMENT_SHADER, fragment, error);
++    if (fs == 0u) {
++        glDeleteShader(vs);
++        return false;
++    }
++    program.id = glCreateProgram();
++    glAttachShader(program.id, vs);
++    glAttachShader(program.id, fs);
++    glBindAttribLocation(program.id, 0, "aPos");
++    glBindAttribLocation(program.id, 0, "aPacked");
++    glBindAttribLocation(program.id, 1, "aColor");
++    glBindAttribLocation(program.id, 2, "aUv");
++    glBindAttribLocation(program.id, 2, "aPackedUv");
++    glBindAttribLocation(program.id, 3, "aQ");
++    glBindAttribLocation(program.id, 4, "aFog");
++    glLinkProgram(program.id);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    GLint ok = GL_FALSE;
++    glGetProgramiv(program.id, GL_LINK_STATUS, &ok);
++    if (ok != GL_TRUE) {
++        char log[1024]{};
++        glGetProgramInfoLog(program.id, sizeof(log), nullptr, log);
++        error = std::string("program link failed: ") + log;
++        glDeleteProgram(program.id);
++        program.id = 0u;
++        return false;
++    }
++    program.vertex_location = glGetUniformLocation(program.id, "uV");
++    program.fragment_location = glGetUniformLocation(program.id, "uF");
++    glUseProgram(program.id);
++    if (const GLint sampler = glGetUniformLocation(program.id, "uTex"); sampler >= 0) glUniform1i(sampler, 0);
++    return true;
++}
++
++Program *program_for(RenderState &r, std::uint32_t key) {
++    if (const auto found = r.programs.find(key); found != r.programs.end())
++        return found->second.id != 0u ? &found->second : nullptr;
++    char defines[256];
++    std::snprintf(defines, sizeof(defines),
++                  "#define MODE %u\n#define TEXTURED %d\n#define FUNC %u\n#define USE_ALPHA %d\n"
++                  "#define DOUBLE %d\n#define FOG %d\n#define ALPHA_TEST %d\n#define ALPHA_FUNC %u\n"
++                  "#define OPAQUE %d\n#define PACKED %d\n",
++                  (key >> kModeShift) & 3u, (key & kTextured) != 0u, (key >> kFuncShift) & 7u,
++                  (key & kUseAlpha) != 0u, (key & kDouble) != 0u, (key & kFog) != 0u,
++                  (key & kAlphaTest) != 0u, (key >> kAlphaFuncShift) & 7u, (key & kOpaque) != 0u,
++                  (key & kPacked) != 0u);
++    Program &program = r.programs[key];
++    std::string error;
++    if (!link_program(program, std::string(defines) + kVertexShader,
++                      std::string(defines) + kFragmentShader, error)) {
++        runtime_log_error("gles2 ge program", error);
++        std::cerr << "[gles2] " << error << '\n';
++        return nullptr;
++    }
++    r.current_program = program.id;
++    return &program;
++}
++
++void upload_uniforms(Program &program, const UniformValues &values) {
++    const auto block = [&](GLint location, int first, int count, bool &valid) {
++        if (location < 0) return;
++        const std::size_t bytes = sizeof(values[0]) * static_cast<std::size_t>(count);
++        if (valid && std::memcmp(&program.sent[first], &values[first], bytes) == 0) return;
++        glUniform4fv(location, count, values[first].data());
++        std::memcpy(&program.sent[first], &values[first], bytes);
++        valid = true;
++    };
++    block(program.vertex_location, 0, UVertexCount, program.vertex_valid);
++    block(program.fragment_location, UEnv, UFragmentCount, program.fragment_valid);
++}
++
++// --------------------------------------------------------------- textures --
++
++std::uint64_t hash_mix(std::uint64_t hash, std::uint64_t value) noexcept {
++    hash ^= value + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
++    return hash;
++}
++
++// Same key as the Vulkan GE.
++std::uint64_t texture_key(const GeGpuDrawDescriptor &draw) noexcept {
++    if (draw.texture_cache_key_hint != 0u) return draw.texture_cache_key_hint;
++    std::uint64_t key = 0xCBF29CE484222325ull;
++    const std::uint32_t levels = draw.texture_level_addresses[0] != 0u && draw.texture_mipmap_enabled
++        ? std::min<std::uint32_t>(8u, draw.texture_max_level + 1u) : 1u;
++    key = hash_mix(key, levels);
++    for (std::uint32_t level = 0u; level < levels; ++level) {
++        key = hash_mix(key, draw.texture_level_addresses[level] != 0u
++            ? draw.texture_level_addresses[level] : draw.texture_address);
++        key = hash_mix(key, draw.texture_level_buffer_widths[level] != 0u
++            ? draw.texture_level_buffer_widths[level] : draw.texture_buffer_width);
++        key = hash_mix(key, draw.texture_level_widths[level] != 0u
++            ? draw.texture_level_widths[level] : draw.texture_width);
++        key = hash_mix(key, draw.texture_level_heights[level] != 0u
++            ? draw.texture_level_heights[level] : draw.texture_height);
++    }
++    key = hash_mix(key, draw.texture_format);
++    key = hash_mix(key, draw.clut_address);
++    key = hash_mix(key, draw.clut_format);
++    key = hash_mix(key, draw.clut_shift);
++    key = hash_mix(key, draw.clut_mask);
++    key = hash_mix(key, draw.clut_start);
++    key = hash_mix(key, draw.clut_checksum);
++    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_swizzled));
++    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_min_linear));
++    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mag_linear));
++    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mipmap_enabled));
++    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_mipmap_linear));
++    key = hash_mix(key, draw.texture_max_level);
++    key = hash_mix(key, draw.texture_level_mode);
++    key = hash_mix(key, static_cast<std::uint32_t>(draw.texture_level_offset16));
++    key = hash_mix(key, draw.texture_selected_level);
++    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_clamp_u));
++    key = hash_mix(key, static_cast<std::uint64_t>(draw.texture_clamp_v));
++    return key;
++}
++
++bool power_of_two(std::uint32_t value) noexcept { return value != 0u && (value & (value - 1u)) == 0u; }
++
++// 2x2 box filter, for the levels a PSP chain leaves out: GLES 2 samples an
++// incomplete mip chain as black.
++std::vector<std::byte> half_size(const std::byte *source, std::uint32_t width, std::uint32_t height) {
++    const std::uint32_t w = std::max(1u, width >> 1u);
++    const std::uint32_t h = std::max(1u, height >> 1u);
++    std::vector<std::byte> out(static_cast<std::size_t>(w) * h * 4u);
++    for (std::uint32_t y = 0u; y < h; ++y) {
++        const std::uint32_t y0 = std::min(y * 2u, height - 1u);
++        const std::uint32_t y1 = std::min(y * 2u + 1u, height - 1u);
++        for (std::uint32_t x = 0u; x < w; ++x) {
++            const std::uint32_t x0 = std::min(x * 2u, width - 1u);
++            const std::uint32_t x1 = std::min(x * 2u + 1u, width - 1u);
++            for (std::uint32_t c = 0u; c < 4u; ++c) {
++                const auto at = [&](std::uint32_t px, std::uint32_t py) {
++                    return static_cast<std::uint32_t>(source[(static_cast<std::size_t>(py) * width + px) * 4u + c]);
++                };
++                out[(static_cast<std::size_t>(y) * w + x) * 4u + c] =
++                    static_cast<std::byte>((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2u) / 4u);
++            }
++        }
++    }
++    return out;
++}
++
++void delete_texture(RenderState &r, std::uint64_t key) {
++    const auto found = r.textures.find(key);
++    if (found == r.textures.end()) return;
++    if (found->second.id != 0u) glDeleteTextures(1, &found->second.id);
++    r.textures.erase(found);
++}
++
++void upload_texture(RenderState &r, TextureUpload &upload) {
++    if (upload.width == 0u || upload.height == 0u || upload.rgba8.empty()) return;
++    GlTexture &texture = r.textures[upload.key];
++    texture.pot = power_of_two(upload.width) && power_of_two(upload.height);
++    const std::uint32_t levels = texture.pot ? upload.mip_levels : 1u;
++    if (texture.id == 0u) glGenTextures(1, &texture.id);
++    texture.wrap_s = texture.wrap_t = texture.min_filter = texture.mag_filter = 0;
++    glBindTexture(GL_TEXTURE_2D, texture.id);
++    r.bound_texture = texture.id;
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    std::uint32_t width = upload.width;
++    std::uint32_t height = upload.height;
++    std::size_t offset = 0u;
++    std::uint32_t uploaded = 0u;
++    const std::byte *last = nullptr;
++    std::uint32_t last_width = 0u;
++    std::uint32_t last_height = 0u;
++    while (uploaded < levels) {
++        const std::size_t level_bytes = static_cast<std::size_t>(width) * height * 4u;
++        if (offset + level_bytes > upload.rgba8.size()) break;
++        last = upload.rgba8.data() + offset;
++        glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(uploaded), GL_RGBA, static_cast<GLsizei>(width),
++                     static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, last);
++        offset += level_bytes;
++        last_width = width;
++        last_height = height;
++        ++uploaded;
++        if (width == 1u && height == 1u) break;
++        width = std::max(1u, width >> 1u);
++        height = std::max(1u, height >> 1u);
++    }
++    if (uploaded == 0u) {
++        delete_texture(r, upload.key);
++        return;
++    }
++    if (levels > 1u) {
++        // Complete the chain down to 1x1 from the last level the game gave.
++        std::vector<std::byte> generated;
++        while (!(last_width == 1u && last_height == 1u)) {
++            generated = half_size(last, last_width, last_height);
++            last_width = std::max(1u, last_width >> 1u);
++            last_height = std::max(1u, last_height >> 1u);
++            glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(uploaded), GL_RGBA, static_cast<GLsizei>(last_width),
++                         static_cast<GLsizei>(last_height), 0, GL_RGBA, GL_UNSIGNED_BYTE, generated.data());
++            last = generated.data();
++            ++uploaded;
++        }
++    }
++    texture.mip_levels = uploaded;
++}
++
++constexpr std::uint32_t kSamplerClampU = 1u;
++constexpr std::uint32_t kSamplerClampV = 2u;
++constexpr std::uint32_t kSamplerMagLinear = 4u;
++constexpr std::uint32_t kSamplerMinLinear = 8u;
++constexpr std::uint32_t kSamplerMip = 16u;
++constexpr std::uint32_t kSamplerMipLinear = 32u;
++
++std::uint32_t sampler_bits(const GeGpuDrawDescriptor &draw) {
++    return (draw.texture_clamp_u ? kSamplerClampU : 0u) | (draw.texture_clamp_v ? kSamplerClampV : 0u) |
++           (draw.texture_mag_linear ? kSamplerMagLinear : 0u) | (draw.texture_min_linear ? kSamplerMinLinear : 0u) |
++           (draw.texture_mipmap_enabled ? kSamplerMip : 0u) | (draw.texture_mipmap_linear ? kSamplerMipLinear : 0u);
++}
++
++void apply_sampler(GlTexture &texture, std::uint32_t bits) {
++    // NPOT textures in GLES 2: clamp only and no mipmaps, or they sample black.
++    const bool npot = !texture.pot;
++    const GLint wrap_s = (npot || (bits & kSamplerClampU)) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
++    const GLint wrap_t = (npot || (bits & kSamplerClampV)) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
++    const GLint mag = (bits & kSamplerMagLinear) ? GL_LINEAR : GL_NEAREST;
++    const bool min_linear = (bits & kSamplerMinLinear) != 0u;
++    GLint min = min_linear ? GL_LINEAR : GL_NEAREST;
++    if (texture.mip_levels > 1u && (bits & kSamplerMip)) {
++        const bool mip_linear = (bits & kSamplerMipLinear) != 0u;
++        if (min_linear) min = mip_linear ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_NEAREST;
++        else min = mip_linear ? GL_NEAREST_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST;
++    }
++    if (texture.wrap_s != wrap_s) {
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_s);
++        texture.wrap_s = wrap_s;
++    }
++    if (texture.wrap_t != wrap_t) {
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_t);
++        texture.wrap_t = wrap_t;
++    }
++    if (texture.min_filter != min) {
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min);
++        texture.min_filter = min;
++    }
++    if (texture.mag_filter != mag) {
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag);
++        texture.mag_filter = mag;
++    }
++}
++
++// ---------------------------------------------------------------- targets --
++
++Target *find_target(RenderState &r, std::uint32_t address) {
++    address &= 0x001FFFF0u;
++    const auto found = r.targets.find(address);
++    return found == r.targets.end() ? nullptr : &found->second;
++}
++
++GLuint make_target_texture(std::uint32_t width, std::uint32_t height) {
++    GLuint texture = 0u;
++    glGenTextures(1, &texture);
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0,
++                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    return texture;
++}
++
++void invalidate_state(RenderState &r) {
++    r.fixed_valid = false;
++    r.scissor_valid = false;
++    r.bound_texture = 0xFFFFFFFFu;
++}
++
++Target *ensure_target(RenderState &r, std::uint32_t address) {
++    address &= 0x001FFFF0u;
++    if (Target *found = find_target(r, address)) return found;
++    Target target{};
++    target.address = address;
++    target.color = make_target_texture(r.target_width, r.target_height);
++    glGenRenderbuffers(1, &target.depth);
++    glBindRenderbuffer(GL_RENDERBUFFER, target.depth);
++    glRenderbufferStorage(GL_RENDERBUFFER, r.depth24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16,
++                          static_cast<GLsizei>(r.target_width), static_cast<GLsizei>(r.target_height));
++    glGenFramebuffers(1, &target.fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
++    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target.depth);
++    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++    r.current_target = nullptr;
++    invalidate_state(r);
++    if (status != GL_FRAMEBUFFER_COMPLETE) {
++        std::cerr << "[gles2] framebuffer incomplete: 0x" << std::hex << status << std::dec << '\n';
++        glDeleteFramebuffers(1, &target.fbo);
++        glDeleteRenderbuffers(1, &target.depth);
++        glDeleteTextures(1, &target.color);
++        return nullptr;
++    }
++    // Black, alpha 1, depth 0 (PSP convention, as the Vulkan GE).
++    glDisable(GL_SCISSOR_TEST);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glDepthMask(GL_TRUE);
++    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++    glClearDepthf(0.0f);
++    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++    return &r.targets.emplace(address, target).first->second;
++}
++
++void begin_target(RenderState &r, Target &target) {
++    if (r.current_target == &target) return;
++    glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
++    glViewport(0, 0, static_cast<GLsizei>(r.target_width), static_cast<GLsizei>(r.target_height));
++    const bool first_this_frame = target.last_render_epoch != r.frame_epoch;
++    if (first_this_frame) {
++        // Changes state the draw loop caches.
++        r.fixed_valid = false;
++        r.scissor_valid = false;
++        glDisable(GL_SCISSOR_TEST);
++        glDepthMask(GL_TRUE);
++        glClearDepthf(0.0f);
++        GLbitfield bits = GL_DEPTH_BUFFER_BIT;
++        if (target.address == r.display_framebuffer) {
++            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++            bits |= GL_COLOR_BUFFER_BIT;
++        }
++        glClear(bits);
++    }
++    target.last_render_epoch = r.frame_epoch;
++    r.current_target = &target;
++}
++
++// The target's current pixels in its snapshot texture, for draws that sample
++// the framebuffer they render to.
++bool snapshot_target(RenderState &r, Target &target) {
++    if (target.snapshot == 0u) target.snapshot = make_target_texture(r.target_width, r.target_height);
++    begin_target(r, target);
++    glBindTexture(GL_TEXTURE_2D, target.snapshot);
++    r.bound_texture = target.snapshot;
++    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, static_cast<GLsizei>(r.target_width),
++                        static_cast<GLsizei>(r.target_height));
++    return true;
++}
++
++// ------------------------------------------------------------------ state --
++
++// Blend variants, as the Vulkan GE (PSP blend modes LCS uses).
++std::size_t blend_variant(const GeGpuDrawDescriptor &draw) noexcept {
++    if (!draw.blend_enabled || draw.clear_mode) return 0u;
++    const std::uint32_t eq = draw.blend_equation & 7u;
++    const std::uint32_t src = draw.blend_source_factor & 0xFu;
++    const std::uint32_t dst = draw.blend_dest_factor & 0xFu;
++    if (eq == 0u && src == 2u && dst == 3u) return 1u;
++    if (eq == 0u && src == 10u && dst == 10u) {
++        const std::uint32_t fs = draw.blend_fix_source & 0x00FFFFFFu;
++        const std::uint32_t fd = draw.blend_fix_dest & 0x00FFFFFFu;
++        if (fs == 0x00FFFFFFu && fd == 0u) return 2u;
++        if (fs == 0x00FFFFFFu && fd == 0x00FFFFFFu) return 3u;
++        bool complements = true;
++        for (std::uint32_t shift = 0u; shift < 24u; shift += 8u)
++            complements &= (((fs >> shift) & 0xFFu) + ((fd >> shift) & 0xFFu)) == 0xFFu;
++        if (complements) return 4u;
++    }
++    if (eq == 0u && src == 2u && dst == 10u &&
++        (draw.blend_fix_dest & 0x00FFFFFFu) == 0x00FFFFFFu) return 5u;
++    return 0u;
++}
++
++GLenum depth_compare(std::uint32_t function) noexcept {
++    switch (function & 7u) {
++    case 0u: return GL_NEVER;
++    case 1u: return GL_ALWAYS;
++    case 2u: return GL_EQUAL;
++    case 3u: return GL_NOTEQUAL;
++    case 4u: return GL_LESS;
++    case 5u: return GL_LEQUAL;
++    case 6u: return GL_GREATER;
++    case 7u: return GL_GEQUAL;
++    }
++    return GL_ALWAYS;
++}
++
++// Everything a draw's GL state depends on. Consecutive PSP draws with equal
++// state go out as one glDrawElements: on the Mali-400 each GL draw costs the
++// driver and kernel more than the vertices it carries.
++struct DrawState {
++    Target *target{};
++    std::array<GLint, 4> scissor{};
++    std::uint32_t program{};
++    Program *program_object{};
++    GLuint texture{};
++    GlTexture *sampled{};      // decoded texture whose sampler parameters apply
++    std::uint32_t sampler{};   // wrap/filter bits
++    std::uint32_t fixed{};     // depth/blend/colour-mask/cull bits
++    std::uint32_t blend_color{};
++    UniformValues uniforms{};
++};
++
++bool same_state(const DrawState &a, const DrawState &b) {
++    return a.target == b.target && a.scissor == b.scissor && a.program == b.program &&
++           a.texture == b.texture && a.sampler == b.sampler && a.fixed == b.fixed &&
++           a.blend_color == b.blend_color && a.uniforms == b.uniforms;
++}
++
++constexpr std::uint32_t kFixedDepthTest = 1u;
++constexpr std::uint32_t kFixedDepthFuncShift = 1u;  // 3 bits
++constexpr std::uint32_t kFixedDepthWrite = 1u << 4u;
++constexpr std::uint32_t kFixedBlendShift = 5u;      // 3 bits
++constexpr std::uint32_t kFixedMaskShift = 8u;       // 4 bits, set = channel written
++constexpr std::uint32_t kFixedCull = 1u << 12u;
++constexpr std::uint32_t kFixedCcw = 1u << 13u;
++
++std::uint32_t fixed_bits(const Batch &batch) {
++    const GeGpuDrawDescriptor &draw = batch.draw;
++    std::uint32_t bits = 0u;
++    if (draw.depth_test_enabled) {
++        bits |= kFixedDepthTest | ((draw.depth_function & 7u) << kFixedDepthFuncShift);
++        if (draw.depth_write_enabled) bits |= kFixedDepthWrite;
++    }
++    bits |= static_cast<std::uint32_t>(blend_variant(draw)) << kFixedBlendShift;
++    // PSP mask bits set = channel not written.
++    for (std::uint32_t c = 0u; c < 4u; ++c)
++        if (((draw.color_write_mask >> (c * 8u)) & 0xFFu) != 0xFFu) bits |= 1u << (kFixedMaskShift + c);
++    if (batch.hardware_transform && batch.transform.cull_enabled) {
++        bits |= kFixedCull;
++        if (batch.transform.accept_counter_clockwise) bits |= kFixedCcw;
++    }
++    return bits;
++}
++
++std::uint32_t blend_color_of(const GeGpuDrawDescriptor &draw) {
++    return blend_variant(draw) == 4u ? (draw.blend_fix_source & 0x00FFFFFFu) : 0u;
++}
++
++std::uint32_t program_key(const Batch &batch, bool textured) {
++    const GeGpuDrawDescriptor &draw = batch.draw;
++    std::uint32_t key = batch.pretransformed ? 0u : batch.hardware_transform ? 1u : 2u;
++    if (batch.packed) key |= kPacked;
++    if (textured) {
++        key |= kTextured;
++        key |= (std::min(draw.texture_function & 7u, 4u)) << kFuncShift;
++        if (draw.texture_use_alpha) key |= kUseAlpha;
++        if (draw.texture_double_color) key |= kDouble;
++    }
++    if (draw.fog_enabled) key |= kFog;
++    if (draw.alpha_test_enabled && (draw.alpha_function & 7u) != 1u) {
++        key |= kAlphaTest;
++        key |= (draw.alpha_function & 7u) << kAlphaFuncShift;
++    }
++    if ((draw.framebuffer_format & 3u) == 0u) key |= kOpaque;
++    return key;
++}
++
++// The hardware transform as four clip-space rows (the Vulkan GE's), the
++// viewport folded in.
++using ClipRows = std::array<std::array<float, 4>, 4>;
++ClipRows clip_rows(const GeGpuHardwareTransform &hw, std::uint32_t logical_width, std::uint32_t logical_height) {
++    const auto row = [&](std::size_t r) {
++        return std::array<float, 4>{hw.model_to_clip[r], hw.model_to_clip[4u + r],
++                                    hw.model_to_clip[8u + r], hw.model_to_clip[12u + r]};
++    };
++    const auto scaled = [](const std::array<float, 4> &a, float sa, const std::array<float, 4> &b, float sb) {
++        return std::array<float, 4>{a[0] * sa + b[0] * sb, a[1] * sa + b[1] * sb,
++                                    a[2] * sa + b[2] * sb, a[3] * sa + b[3] * sb};
++    };
++    const auto clip_w = row(3u);
++    const float x_a = hw.viewport_scale_x * (2.0f / static_cast<float>(logical_width));
++    const float x_b = (hw.viewport_center_x - hw.viewport_offset_x) *
++                      (2.0f / static_cast<float>(logical_width)) - 1.0f;
++    const float y_a = hw.viewport_scale_y * (2.0f / static_cast<float>(logical_height));
++    const float y_b = (hw.viewport_center_y - hw.viewport_offset_y) *
++                      (2.0f / static_cast<float>(logical_height)) - 1.0f;
++    constexpr float inv_depth = 1.0f / 65535.0f;
++    return {scaled(row(0u), x_a, clip_w, x_b), scaled(row(1u), -y_a, clip_w, -y_b),
++            scaled(row(2u), hw.viewport_scale_z * inv_depth, clip_w, hw.viewport_center_z * inv_depth), clip_w};
++}
++
++// Off by default: measured slower. LCS_GLES_CPU_TRANSFORM=1 turns it on.
++bool cpu_transform_enabled() {
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_GLES_CPU_TRANSFORM");
++        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
++    }();
++    return enabled;
++}
++
++// What the vertex shader's hardware-transform mode does, on the CPU, so draws
++// with different matrices share uniforms and merge into one GL draw.
++void pretransform(Frame &frame, Batch &batch, std::uint32_t logical_width, std::uint32_t logical_height) {
++    const GeGpuHardwareTransform &hw = batch.transform;
++    const ClipRows rows = clip_rows(hw, std::max<std::uint32_t>(1u, logical_width),
++                                    std::max<std::uint32_t>(1u, logical_height));
++    const auto dot = [](const std::array<float, 4> &r, const Vertex &v) {
++        return r[0] * v.x + r[1] * v.y + r[2] * v.z + r[3] * v.w;
++    };
++    const bool fog = batch.draw.fog_enabled;
++    const bool affine = hw.vertex_color_affine;
++    Vertex *vertex = frame.vertices.data() + batch.first_vertex;
++    for (std::uint32_t i = 0u; i < batch.vertex_count; ++i, ++vertex) {
++        Vertex &v = *vertex;
++        float w = dot(rows[3], v);
++        if (std::abs(w) < 1.0e-12f) w = 1.0f;
++        float z = dot(rows[2], v);
++        if (!hw.depth_clip_enabled) z = std::clamp(z, 0.0f, w);
++        const float x = dot(rows[0], v);
++        const float y = dot(rows[1], v);
++        if (fog) {
++            const float view_z = hw.model_to_view_z[0] * v.x + hw.model_to_view_z[1] * v.y +
++                                 hw.model_to_view_z[2] * v.z + hw.model_to_view_z[3] * v.w;
++            v.fog = std::clamp((view_z + hw.fog_end) * hw.fog_slope, 0.0f, 1.0f);
++        }
++        v.u = v.u * hw.uv_scale_u + hw.uv_offset_u;
++        v.v = v.v * hw.uv_scale_v + hw.uv_offset_v;
++        if (affine) {
++            std::uint32_t out = 0u;
++            for (std::uint32_t c = 0u; c < 4u; ++c) {
++                const float in = static_cast<float>((v.rgba >> (c * 8u)) & 0xFFu) * (1.0f / 255.0f);
++                const float lit = std::clamp(in * hw.vertex_color_mul[c] + hw.vertex_color_add[c], 0.0f, 1.0f);
++                out |= static_cast<std::uint32_t>(std::floor(lit * 255.0f)) << (c * 8u);
++            }
++            v.rgba = out;
++        }
++        v.x = x;
++        v.y = y;
++        v.z = z;
++        v.w = w;
++    }
++    batch.pretransformed = true;
++}
++
++// Uniform values for a draw; ones its shader variant doesn't use stay zero so
++// they don't keep otherwise equal draws apart.
++void fill_uniforms(UniformValues &u, const Batch &batch, std::uint32_t logical_width, std::uint32_t logical_height) {
++    logical_width = std::max<std::uint32_t>(1u, logical_width);
++    logical_height = std::max<std::uint32_t>(1u, logical_height);
++    const GeGpuDrawDescriptor &draw = batch.draw;
++    if (batch.pretransformed) {
++        // Clip space already; nothing per draw.
++    } else if (!batch.hardware_transform) {
++        u[UUv] = {2.0f / static_cast<float>(logical_width), 2.0f / static_cast<float>(logical_height),
++                  1.0f / 65535.0f, 0.0f};
++    } else {
++        const GeGpuHardwareTransform &hw = batch.transform;
++        const ClipRows rows = clip_rows(hw, logical_width, logical_height);
++        u[URow0] = rows[0];
++        u[URow1] = rows[1];
++        u[URow2] = rows[2];
++        u[URow3] = rows[3];
++        if (draw.fog_enabled) {
++            u[UViewZ] = hw.model_to_view_z;
++            u[UFog] = {hw.fog_end, hw.fog_slope, 0.0f, 0.0f};
++        }
++        u[UUv] = {hw.uv_scale_u, hw.uv_scale_v, hw.uv_offset_u, hw.uv_offset_v};
++        u[UFlags] = {hw.depth_clip_enabled ? 1.0f : 0.0f, hw.vertex_color_affine ? 1.0f : 0.0f, 0.0f, 0.0f};
++        if (hw.vertex_color_affine) {
++            u[UMul] = hw.vertex_color_mul;
++            u[UAdd] = hw.vertex_color_add;
++        }
++    }
++    const auto unpack = [](std::uint32_t rgb) {
++        return std::array<float, 4>{static_cast<float>(rgb & 0xFFu) / 255.0f,
++                                    static_cast<float>((rgb >> 8u) & 0xFFu) / 255.0f,
++                                    static_cast<float>((rgb >> 16u) & 0xFFu) / 255.0f, 1.0f};
++    };
++    if (draw.texture_enabled && (draw.texture_function & 7u) == 2u) u[UEnv] = unpack(draw.texture_env);
++    if (draw.fog_enabled) u[UFogColor] = unpack(draw.fog_color);
++    if (draw.alpha_test_enabled)
++        u[UAlphaRef] = {static_cast<float>(draw.alpha_reference & draw.alpha_mask & 0xFFu), 0.0f, 0.0f, 0.0f};
++}
++
++void apply_fixed(RenderState &r, std::uint32_t bits, std::uint32_t blend_color) {
++    if (r.fixed_valid && r.fixed_state == bits && r.blend_color == blend_color) return;
++    const std::uint32_t old = r.fixed_valid ? r.fixed_state : ~bits;
++    const auto changed = [&](std::uint32_t mask) { return ((old ^ bits) & mask) != 0u; };
++    if (changed(kFixedDepthTest | (7u << kFixedDepthFuncShift) | kFixedDepthWrite)) {
++        if (bits & kFixedDepthTest) {
++            glEnable(GL_DEPTH_TEST);
++            glDepthFunc(depth_compare((bits >> kFixedDepthFuncShift) & 7u));
++            glDepthMask((bits & kFixedDepthWrite) ? GL_TRUE : GL_FALSE);
++        } else {
++            glDisable(GL_DEPTH_TEST);
++        }
++    }
++    if (changed(15u << kFixedMaskShift)) {
++        const auto on = [&](std::uint32_t c) { return (bits >> (kFixedMaskShift + c)) & 1u ? GL_TRUE : GL_FALSE; };
++        glColorMask(on(0u), on(1u), on(2u), on(3u));
++    }
++    const std::uint32_t variant = (bits >> kFixedBlendShift) & 7u;
++    if (changed(7u << kFixedBlendShift) || (variant == 4u && r.blend_color != blend_color)) {
++        if (variant == 0u || variant == 2u) {
++            glDisable(GL_BLEND);
++        } else {
++            glEnable(GL_BLEND);
++            glBlendEquation(GL_FUNC_ADD);
++            if (variant == 1u) {
++                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            } else if (variant == 3u) {
++                glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
++            } else if (variant == 5u) {
++                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ONE, GL_ONE);
++            } else {
++                glBlendColor(static_cast<float>(blend_color & 0xFFu) / 255.0f,
++                             static_cast<float>((blend_color >> 8u) & 0xFFu) / 255.0f,
++                             static_cast<float>((blend_color >> 16u) & 0xFFu) / 255.0f, 1.0f);
++                glBlendFuncSeparate(GL_CONSTANT_COLOR, GL_ONE_MINUS_CONSTANT_COLOR, GL_ONE, GL_ZERO);
++            }
++        }
++    }
++    if (changed(kFixedCull | kFixedCcw)) {
++        if (bits & kFixedCull) {
++            glEnable(GL_CULL_FACE);
++            glCullFace(GL_BACK);
++            // GL's facing sign is the opposite of Vulkan's for the same window
++            // coordinates, so Vulkan's counter-clockwise front is GL's clockwise.
++            glFrontFace((bits & kFixedCcw) ? GL_CW : GL_CCW);
++        } else {
++            glDisable(GL_CULL_FACE);
++        }
++    }
++    r.fixed_state = bits;
++    r.blend_color = blend_color;
++    r.fixed_valid = true;
++}
++
++// base: a pointer into client memory, or an offset into the bound buffer.
++void bind_packed_vertices(const std::uint8_t *base) {
++    // Stride 10: u8 u, u8 v, u16 colour, s16 x, y, z. q and fog are constant.
++    glVertexAttribPointer(0, 3, GL_SHORT, GL_FALSE, 10, base + 4);
++    glVertexAttribPointer(1, 1, GL_UNSIGNED_SHORT, GL_FALSE, 10, base + 2);
++    glVertexAttribPointer(2, 2, GL_UNSIGNED_BYTE, GL_FALSE, 10, base);
++    glDisableVertexAttribArray(3);
++    glDisableVertexAttribArray(4);
++    glVertexAttrib1f(3, 1.0f);
++    glVertexAttrib1f(4, 1.0f);
++}
++
++void bind_vertices(const Vertex *base) {
++    glEnableVertexAttribArray(3);
++    glEnableVertexAttribArray(4);
++    const auto *bytes = reinterpret_cast<const std::byte *>(base);
++    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), bytes + offsetof(Vertex, x));
++    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), bytes + offsetof(Vertex, rgba));
++    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), bytes + offsetof(Vertex, u));
++    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vertex), bytes + offsetof(Vertex, q));
++    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(Vertex), bytes + offsetof(Vertex, fog));
++}
++
++void apply_state(RenderState &r, const DrawState &state) {
++    begin_target(r, *state.target);
++    if (!r.scissor_valid || r.scissor != state.scissor) {
++        // Row 0 is the top of the PSP frame (Y is flipped in the shader), so
++        // the PSP's scissor rows are GL's rows as they are.
++        if (!r.scissor_valid) glEnable(GL_SCISSOR_TEST);
++        glScissor(state.scissor[0], state.scissor[1], state.scissor[2], state.scissor[3]);
++        r.scissor = state.scissor;
++        r.scissor_valid = true;
++    }
++    if (state.texture != 0u && state.texture != r.bound_texture) {
++        glBindTexture(GL_TEXTURE_2D, state.texture);
++        r.bound_texture = state.texture;
++    }
++    if (state.sampled != nullptr) apply_sampler(*state.sampled, state.sampler);
++    Program &program = *state.program_object;
++    if (r.current_program != program.id) {
++        glUseProgram(program.id);
++        r.current_program = program.id;
++    }
++    upload_uniforms(program, state.uniforms);
++    apply_fixed(r, state.fixed, state.blend_color);
++}
++
++// A PSP draw as triangle-list indices (strips unrolled with the odd
++// triangles' winding swapped, as GL does), offset into the merged draw.
++void append_triangles(std::vector<std::uint16_t> &out, const Frame &frame, const Batch &batch,
++                      std::uint32_t offset) {
++    const bool strip = batch.hardware_transform && batch.transform.primitive == 4u;
++    const std::uint32_t count = batch.indexed ? batch.index_count : batch.vertex_count;
++    const std::uint32_t *indices = frame.indices.data() + batch.first_index;
++    const auto index = [&](std::uint32_t i) {
++        return static_cast<std::uint16_t>(offset + (batch.indexed ? indices[i] : i));
++    };
++    if (!strip) {
++        const std::size_t at = out.size();
++        out.resize(at + count);
++        std::uint16_t *dst = out.data() + at;
++        for (std::uint32_t i = 0u; i < count; ++i) dst[i] = index(i);
++        return;
++    }
++    for (std::uint32_t i = 0u; i + 2u < count; ++i) {
++        std::uint16_t a = index(i);
++        std::uint16_t b = index(i + 1u);
++        if (i & 1u) std::swap(a, b);
++        out.push_back(a);
++        out.push_back(b);
++        out.push_back(index(i + 2u));
++    }
++}
++
++// ---------------------------------------------------------------- present --
++
++// Draw a texture (row 0 = top) onto the screen, fitted with its aspect ratio.
++void draw_to_screen(RenderState &r, GLuint texture, float aspect) {
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    r.current_target = nullptr;
++    glViewport(0, 0, static_cast<GLsizei>(r.screen_width), static_cast<GLsizei>(r.screen_height));
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_DEPTH_TEST);
++    glDisable(GL_BLEND);
++    glDisable(GL_CULL_FACE);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++    const float screen_aspect = static_cast<float>(r.screen_width) / static_cast<float>(r.screen_height);
++    float sx = 1.0f;
++    float sy = 1.0f;
++    if (aspect > screen_aspect) sy = screen_aspect / aspect;
++    else sx = aspect / screen_aspect;
++    const float quad[] = {
++        -sx, sy, 0.0f, 0.0f,    sx, sy, 1.0f, 0.0f,
++        -sx, -sy, 0.0f, 1.0f,   sx, -sy, 1.0f, 1.0f,
++    };
++    glUseProgram(r.present_program.id);
++    r.current_program = r.present_program.id;
++    glEnableVertexAttribArray(0);
++    glEnableVertexAttribArray(2);
++    glDisableVertexAttribArray(1);
++    glDisableVertexAttribArray(3);
++    glDisableVertexAttribArray(4);
++    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
++    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad + 2);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++    invalidate_state(r);
++}
++
++// "FPS nn" in the top-left corner, drawn with scissored clears (one per lit
++// pixel of the 5x7 font), so it needs no texture or shader.
++void draw_fps(RenderState &r) {
++    if (!r.show_fps) return;
++    char text[16];
++    std::snprintf(text, sizeof(text), "FPS %.0f", std::min(r.fps, 999.0));
++    const int scale = std::max(2, static_cast<int>(r.screen_height) / 240);
++    const int margin = 4 * scale;
++    const int length = static_cast<int>(std::strlen(text));
++    const int top = static_cast<int>(r.screen_height) - margin;  // GL rows count from the bottom
++    glEnable(GL_SCISSOR_TEST);
++    glScissor(margin, top - 9 * scale, (length * 6 + 3) * scale, 9 * scale);
++    glClearColor(0.03f, 0.05f, 0.11f, 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++    glClearColor(0.91f, 0.97f, 1.0f, 1.0f);
++    for (int c = 0; c < length; ++c) {
++        const char ch = text[c];
++        int glyph = 0;  // space
++        if (ch >= '0' && ch <= '9') glyph = 1 + (ch - '0');
++        else if (ch >= 'A' && ch <= 'Z') glyph = 11 + (ch - 'A');
++        for (int row = 0; row < 7; ++row) {
++            const std::uint8_t bits = kGlyph5x7[static_cast<std::size_t>(glyph)][static_cast<std::size_t>(row)];
++            for (int column = 0; column < 5; ++column) {
++                if ((bits & (0x10u >> column)) == 0u) continue;
++                glScissor(margin + (2 + c * 6 + column) * scale, top - (2 + row + 1) * scale, scale, scale);
++                glClear(GL_COLOR_BUFFER_BIT);
++            }
++        }
++    }
++    glDisable(GL_SCISSOR_TEST);
++}
++
++void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
++    draw_fps(r);
++    eglSwapBuffers(r.display, r.surface);
++    const auto now = std::chrono::steady_clock::now();
++    if (r.fps_frames == 0u && r.fps_start.time_since_epoch().count() == 0) r.fps_start = now;
++    ++r.fps_frames;
++    r.fps_psp_draws += psp_draws;
++    r.fps_gl_draws += gl_draws;
++    const double seconds = std::chrono::duration<double>(now - r.fps_start).count();
++    if (seconds < 0.5) return;
++    const double frames = static_cast<double>(r.fps_frames);
++    r.fps = frames / seconds;
++    if (r.log_fps)
++        std::fprintf(stderr, "glos: FPS %.1f draws %.0f gl %.0f\n", r.fps,
++                     static_cast<double>(r.fps_psp_draws) / frames, static_cast<double>(r.fps_gl_draws) / frames);
++    r.fps_frames = 0u;
++    r.fps_psp_draws = 0u;
++    r.fps_gl_draws = 0u;
++    r.fps_start = now;
++}
++
++// ------------------------------------------------------------ render thread --
++
++// One step of a frame: a merged draw, or a snapshot of a target that a later
++// draw samples while rendering to it.
++struct Command {
++    DrawState state{};
++    Target *snapshot{};       // set: copy this target to its snapshot texture
++    std::uint32_t base{};     // first vertex (in the packed or float array)
++    std::uint32_t first_index{};
++    std::uint32_t index_count{};
++};
++
++void render_frame(RenderState &r, Frame &frame) {
++    r.display_framebuffer = frame.display_framebuffer;
++    for (std::uint64_t key : frame.deletes) delete_texture(r, key);
++    for (TextureUpload &upload : frame.uploads) upload_texture(r, upload);
++    for (const TargetSize &size : frame.targets) {
++        Target *target = ensure_target(r, size.address);
++        if (target == nullptr) continue;
++        target->logical_width = size.logical_width;
++        target->logical_height = size.logical_height;
++    }
++    if (frame.batches.empty()) {
++        ++r.frame_epoch;
++        return;
++    }
++    // Pass 1: merge draws into commands; all indices into one array.
++    static thread_local std::vector<Command> commands;
++    commands.clear();
++    r.index16.clear();
++    bool touched_display = false;
++    Command group{};
++    bool group_open = false;
++    const auto flush = [&]() {
++        if (!group_open) return;
++        group_open = false;
++        group.index_count = static_cast<std::uint32_t>(r.index16.size()) - group.first_index;
++        if (group.index_count != 0u) commands.push_back(group);
++    };
++    for (Batch &batch : frame.batches) {
++        Target *target = find_target(r, batch.draw.framebuffer_address);
++        if (target == nullptr) target = ensure_target(r, batch.draw.framebuffer_address);
++        if (target == nullptr || batch.vertex_count > 65536u) continue;
++        const auto scale = [](std::int32_t value, std::uint32_t logical, std::uint32_t size) {
++            return static_cast<GLint>(std::clamp<std::int64_t>(
++                static_cast<std::int64_t>(value) * size / std::max<std::uint32_t>(1u, logical), 0, size));
++        };
++        const GLint x0 = scale(batch.draw.scissor_x0, target->logical_width, r.target_width);
++        const GLint y0 = scale(batch.draw.scissor_y0, target->logical_height, r.target_height);
++        const GLint x1 = scale(batch.draw.scissor_x1 + 1, target->logical_width, r.target_width);
++        const GLint y1 = scale(batch.draw.scissor_y1 + 1, target->logical_height, r.target_height);
++        if (x1 <= x0 || y1 <= y0) continue;
++        if (target->address == r.display_framebuffer) touched_display = true;
++
++        DrawState state{};
++        state.target = target;
++        state.scissor = {x0, y0, x1 - x0, y1 - y0};
++        bool textured = false;
++        bool self_feedback = false;
++        if (batch.draw.texture_enabled) {
++            if (batch.framebuffer_feedback && batch.feedback_address == target->address) {
++                // Reads what was drawn so far: everything before it goes first.
++                flush();
++                if (target->snapshot == 0u) {
++                    target->snapshot = make_target_texture(r.target_width, r.target_height);
++                    r.current_target = nullptr;
++                    invalidate_state(r);
++                }
++                Command snapshot{};
++                snapshot.snapshot = target;
++                commands.push_back(snapshot);
++                state.texture = target->snapshot;
++                textured = true;
++                self_feedback = true;
++            } else if (batch.framebuffer_feedback) {
++                Target *feedback = find_target(r, batch.feedback_address);
++                if (feedback == nullptr) feedback = ensure_target(r, batch.feedback_address);
++                if (feedback != nullptr && feedback->color != 0u) {
++                    state.texture = feedback->color;
++                    textured = true;
++                }
++            } else if (const auto found = r.textures.find(batch.texture_key);
++                       found != r.textures.end() && found->second.id != 0u) {
++                state.texture = found->second.id;
++                state.sampled = &found->second;
++                state.sampler = sampler_bits(batch.draw);
++                textured = true;
++            }
++        }
++        if (batch.hardware_transform && !batch.packed && !batch.pretransformed && cpu_transform_enabled())
++            pretransform(frame, batch, target->logical_width, target->logical_height);
++        state.program = program_key(batch, textured);
++        state.program_object = program_for(r, state.program);
++        if (state.program_object == nullptr) continue;
++        state.fixed = fixed_bits(batch);
++        state.blend_color = blend_color_of(batch.draw);
++        fill_uniforms(state.uniforms, batch, target->logical_width, target->logical_height);
++
++        // Indices are 16-bit offsets from the group's first vertex (decoded
++        // packed vertices sit after the others, so order isn't guaranteed).
++        const bool fits = batch.first_vertex >= group.base &&
++                          batch.first_vertex + batch.vertex_count - group.base <= 65536u;
++        if (!(group_open && fits && same_state(state, group.state))) {
++            flush();
++            group = {};
++            group.state = state;
++            group.base = batch.first_vertex;
++            group.first_index = static_cast<std::uint32_t>(r.index16.size());
++            group_open = true;
++        }
++        append_triangles(r.index16, frame, batch, batch.first_vertex - group.base);
++        if (self_feedback) flush();
++    }
++    flush();
++
++    // Pass 2: upload the frame's geometry once, then replay the commands.
++    const std::uint8_t *vertex_base = reinterpret_cast<const std::uint8_t *>(frame.vertices.data());
++    const std::uint8_t *packed_base = frame.packed.data();
++    const std::uint8_t *index_base = reinterpret_cast<const std::uint8_t *>(r.index16.data());
++    if (r.use_vbo) {
++        std::array<GLuint, 3> &set = r.buffers[r.ring];
++        r.ring = (r.ring + 1u) % static_cast<std::uint32_t>(r.buffers.size());
++        if (set[0] == 0u) glGenBuffers(3, set.data());
++        glBindBuffer(GL_ARRAY_BUFFER, set[0]);
++        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(frame.vertices.size() * sizeof(Vertex)),
++                     frame.vertices.data(), GL_STREAM_DRAW);
++        if (!frame.packed.empty()) {
++            glBindBuffer(GL_ARRAY_BUFFER, set[1]);
++            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(frame.packed.size()), frame.packed.data(),
++                         GL_STREAM_DRAW);
++        }
++        if (r.index_vbo) {
++            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, set[2]);
++            glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(r.index16.size() * sizeof(std::uint16_t)),
++                         r.index16.data(), GL_STREAM_DRAW);
++            index_base = nullptr;
++        }
++        vertex_base = packed_base = nullptr;  // offsets from here on
++        r.vertex_buffer = set[0];
++        r.packed_buffer = set[1];
++    }
++    glEnableVertexAttribArray(0);
++    glEnableVertexAttribArray(1);
++    glEnableVertexAttribArray(2);
++    glEnableVertexAttribArray(3);
++    glEnableVertexAttribArray(4);
++    glActiveTexture(GL_TEXTURE0);
++    invalidate_state(r);
++    r.current_target = nullptr;
++    std::uint64_t gl_draws = 0u;
++    GLuint bound_array = 0xFFFFFFFFu;
++    for (const Command &command : commands) {
++        if (command.snapshot != nullptr) {
++            snapshot_target(r, *command.snapshot);
++            continue;
++        }
++        apply_state(r, command.state);
++        if (command.state.program & kPacked) {
++            if (r.use_vbo && bound_array != r.packed_buffer) {
++                glBindBuffer(GL_ARRAY_BUFFER, r.packed_buffer);
++                bound_array = r.packed_buffer;
++            }
++            bind_packed_vertices(packed_base + static_cast<std::size_t>(command.base) * 10u);
++        } else {
++            if (r.use_vbo && bound_array != r.vertex_buffer) {
++                glBindBuffer(GL_ARRAY_BUFFER, r.vertex_buffer);
++                bound_array = r.vertex_buffer;
++            }
++            bind_vertices(reinterpret_cast<const Vertex *>(vertex_base + static_cast<std::size_t>(command.base) * sizeof(Vertex)));
++        }
++        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(command.index_count), GL_UNSIGNED_SHORT,
++                       index_base + static_cast<std::size_t>(command.first_index) * sizeof(std::uint16_t));
++        ++gl_draws;
++    }
++    if (r.use_vbo) {
++        glBindBuffer(GL_ARRAY_BUFFER, 0);
++        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
++    }
++    glDisable(GL_SCISSOR_TEST);
++    invalidate_state(r);
++
++    Target *display = find_target(r, r.display_framebuffer);
++    if (frame.publish && touched_display && display != nullptr && display->color != 0u) {
++        // The target texture holds the logical frame stretched to its size. With
++        // Widescreen.AspectRatio set the game drew for that aspect instead
++        // (e.g. 4:3 to fill a 4:3 screen without bars).
++        const float aspect = frame.display_aspect > 0.0f
++            ? frame.display_aspect
++            : static_cast<float>(frame.display_logical_width) /
++                  static_cast<float>(std::max<std::uint32_t>(1u, frame.display_logical_height));
++        draw_to_screen(r, display->color, aspect);
++        swap(r, frame.psp_draws, gl_draws);
++    }
++    ++r.frame_epoch;
++}
++
++// Frames the game writes to PSP memory itself (movies, loading screens).
++void render_guest(RenderState &r, Frame &frame) {
++    if (r.guest_texture == 0u) {
++        glGenTextures(1, &r.guest_texture);
++        glBindTexture(GL_TEXTURE_2D, r.guest_texture);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    }
++    glBindTexture(GL_TEXTURE_2D, r.guest_texture);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    const auto width = static_cast<GLsizei>(frame.guest_width);
++    const auto height = static_cast<GLsizei>(frame.guest_height);
++    if (r.guest_width != frame.guest_width || r.guest_height != frame.guest_height) {
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, frame.guest_rgba.data());
++        r.guest_width = frame.guest_width;
++        r.guest_height = frame.guest_height;
++    } else {
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, frame.guest_rgba.data());
++    }
++    draw_to_screen(r, r.guest_texture, static_cast<float>(frame.guest_width) / static_cast<float>(frame.guest_height));
++    swap(r, 0u, 0u);
++}
++
++void destroy_gl_objects(RenderState &r) {
++    for (auto &entry : r.textures)
++        if (entry.second.id != 0u) glDeleteTextures(1, &entry.second.id);
++    for (auto &entry : r.targets) {
++        Target &t = entry.second;
++        glDeleteFramebuffers(1, &t.fbo);
++        glDeleteRenderbuffers(1, &t.depth);
++        glDeleteTextures(1, &t.color);
++        if (t.snapshot != 0u) glDeleteTextures(1, &t.snapshot);
++    }
++    for (auto &entry : r.programs)
++        if (entry.second.id != 0u) glDeleteProgram(entry.second.id);
++    if (r.present_program.id != 0u) glDeleteProgram(r.present_program.id);
++    if (r.guest_texture != 0u) glDeleteTextures(1, &r.guest_texture);
++    for (auto &set : r.buffers)
++        if (set[0] != 0u) glDeleteBuffers(3, set.data());
++    r.buffers = {};
++    r.textures.clear();
++    r.targets.clear();
++    r.programs.clear();
++    r.present_program = {};
++    r.guest_texture = 0u;
++}
++
++void render_thread_main(Gles2State *s) {
++    RenderState &r = s->render;
++    if (eglMakeCurrent(r.display, r.surface, r.surface, r.context) != EGL_TRUE)
++        std::cerr << "[gles2] render thread: eglMakeCurrent failed 0x" << std::hex << eglGetError() << std::dec << '\n';
++    for (;;) {
++        std::unique_ptr<Frame> frame;
++        {
++            std::unique_lock<std::mutex> lock(s->queue_mutex);
++            s->queue_cv.wait(lock, [&] { return s->stop || s->queued != nullptr; });
++            if (s->queued == nullptr) break;  // stopping, nothing left
++            frame = std::move(s->queued);
++        }
++        s->queue_cv.notify_all();  // the GE thread may queue the next frame
++        if (frame->guest) render_guest(r, *frame);
++        else render_frame(r, *frame);
++        frame->clear();
++        std::lock_guard<std::mutex> lock(s->queue_mutex);
++        s->spare.push_back(std::move(frame));
++    }
++    destroy_gl_objects(r);
++    eglMakeCurrent(r.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++}
++
++void Gles2State::stop_render_thread() {
++    if (!render_thread.joinable() && !transform_thread.joinable()) return;
++    {
++        std::lock_guard<std::mutex> lock(queue_mutex);
++        stop = true;
++    }
++    queue_cv.notify_all();
++    if (transform_thread.joinable()) transform_thread.join();
++    if (render_thread.joinable()) render_thread.join();
++    stop = false;
++}
++
++// A frame to fill: a spare one (keeps its buffers' capacity) or a new one.
++std::unique_ptr<Frame> take_frame(Gles2State &s) {
++    std::lock_guard<std::mutex> lock(s.queue_mutex);
++    if (s.spare.empty()) return std::make_unique<Frame>();
++    std::unique_ptr<Frame> frame = std::move(s.spare.back());
++    s.spare.pop_back();
++    return frame;
++}
++
++// Hands a frame to the render thread; waits while one is still waiting there
++// (at most one queued and one being drawn).
++void submit_to_render(Gles2State &s, std::unique_ptr<Frame> frame) {
++    std::unique_lock<std::mutex> lock(s.queue_mutex);
++    s.queue_cv.wait(lock, [&] { return s.queued == nullptr || s.stop; });
++    if (s.stop) return;
++    s.queued = std::move(frame);
++    lock.unlock();
++    s.queue_cv.notify_all();
++}
++
++// A frame from the GE thread (or a guest frame): to the transform worker when
++// it runs, otherwise straight to the render thread.
++void submit_frame(Gles2State &s, std::unique_ptr<Frame> frame) {
++    if (!s.use_transform_thread) {
++        submit_to_render(s, std::move(frame));
++        return;
++    }
++    std::unique_lock<std::mutex> lock(s.queue_mutex);
++    s.queue_cv.wait(lock, [&] { return s.to_transform == nullptr || s.stop; });
++    if (s.stop) return;
++    s.to_transform = std::move(frame);
++    lock.unlock();
++    s.queue_cv.notify_all();
++}
++
++// Every hardware-transform draw of a frame to clip space (packed 0115
++// vertices decoded first), on the transform worker. Each such draw otherwise
++// needs its own matrix uniforms, and ARM's driver turns every uniform upload
++// into a kernel call (MEM_WRITE_SAFE, ~3 us): ~40,000 a second in LCS. Done
++// here, the draws share uniforms and merge into far fewer GL draws.
++void pretransform_frame(Frame &frame) {
++    std::size_t packed_vertices = 0u;
++    for (const Batch &batch : frame.batches)
++        if (batch.hardware_transform && batch.packed && batch.vertex_count <= 4096u) packed_vertices += batch.vertex_count;
++    frame.vertices.reserve(frame.vertices.size() + packed_vertices);
++    const auto expand5 = [](std::uint32_t value) {
++        value &= 31u;
++        return (value << 3u) | (value >> 2u);
++    };
++    // Only small draws: their per-draw driver cost dwarfs their vertex work;
++    // big meshes are cheaper in the vertex shader (LCS_GLES_PRETRANSFORM_MAX).
++    static const std::uint32_t max_vertices = [] {
++        const char *text = std::getenv("LCS_GLES_PRETRANSFORM_MAX");
++        return text != nullptr && *text != '\0' ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 24u;
++    }();
++    for (Batch &batch : frame.batches) {
++        if (!batch.hardware_transform || batch.pretransformed || batch.vertex_count > max_vertices) continue;
++        if (batch.packed) {
++            // Same decode as the vertex shader's PACKED variant.
++            const std::uint32_t first = static_cast<std::uint32_t>(frame.vertices.size());
++            const std::uint8_t *source = frame.packed.data() + static_cast<std::size_t>(batch.first_vertex) * 10u;
++            for (std::uint32_t i = 0u; i < batch.vertex_count; ++i, source += 10u) {
++                Packed0115 packed;
++                std::memcpy(&packed, source, sizeof(packed));
++                Vertex &v = frame.vertices.emplace_back();
++                v.x = static_cast<float>(packed.x) * (1.0f / 32768.0f);
++                v.y = static_cast<float>(packed.y) * (1.0f / 32768.0f);
++                v.z = static_cast<float>(packed.z) * (1.0f / 32768.0f);
++                v.w = 1.0f;
++                v.rgba = expand5(packed.color) | (expand5(packed.color >> 5u) << 8u) |
++                         (expand5(packed.color >> 10u) << 16u) | ((packed.color & 0x8000u) != 0u ? 0xFF000000u : 0u);
++                v.u = static_cast<float>(packed.u) * (1.0f / 128.0f);
++                v.v = static_cast<float>(packed.v) * (1.0f / 128.0f);
++                v.q = 1.0f;
++                v.fog = 1.0f;
++            }
++            batch.first_vertex = first;
++            batch.packed = false;
++        }
++        std::uint32_t width = kReferenceWidth;
++        std::uint32_t height = kReferenceHeight;
++        const std::uint32_t address = batch.draw.framebuffer_address & 0x001FFFF0u;
++        for (const TargetSize &target : frame.targets)
++            if (target.address == address) {
++                width = target.logical_width;
++                height = target.logical_height;
++                break;
++            }
++        pretransform(frame, batch, width, height);
++    }
++}
++
++void transform_thread_main(Gles2State *s) {
++    for (;;) {
++        std::unique_ptr<Frame> frame;
++        {
++            std::unique_lock<std::mutex> lock(s->queue_mutex);
++            s->queue_cv.wait(lock, [&] { return s->stop || s->to_transform != nullptr; });
++            if (s->to_transform == nullptr) break;  // stopping, nothing left
++            frame = std::move(s->to_transform);
++        }
++        s->queue_cv.notify_all();  // the GE thread may hand over the next frame
++        if (!frame->guest) pretransform_frame(*frame);
++        submit_to_render(*s, std::move(frame));
++    }
++}
++
++// ------------------------------------------------------------------ setup --
++
++void destroy_backend(Gles2State &s) noexcept {
++    s.stop_render_thread();
++    RenderState &r = s.render;
++    if (r.display != EGL_NO_DISPLAY) {
++        if (r.context != EGL_NO_CONTEXT) eglDestroyContext(r.display, r.context);
++        if (r.surface != EGL_NO_SURFACE) eglDestroySurface(r.display, r.surface);
++        eglTerminate(r.display);
++    }
++    r.display = EGL_NO_DISPLAY;
++    r.surface = EGL_NO_SURFACE;
++    r.context = EGL_NO_CONTEXT;
++    s.textures.clear();
++    s.targets.clear();
++    s.uploads.clear();
++    s.deletes.clear();
++    s.texture_bytes = 0u;
++    s.enabled = false;
++}
++
++bool create_backend(Gles2State &s, std::string &error) {
++    RenderState &r = s.render;
++    if (access("/dev/mali", F_OK) != 0) {
++        error = "ARM's Mali driver isn't loaded (no /dev/mali); start through glos-gpu run mali";
++        return false;
++    }
++    if (!fbdev_size(r.screen_width, r.screen_height)) {
++        error = "can't read /dev/fb0";
++        return false;
++    }
++    const InternalResolutionDimensions dims = resolve_internal_resolution(lcs_render_configuration().rendering);
++    // LCS_GLES_SCALE=<25-100>: render the PSP frame at that percentage of the
++    // internal resolution (fewer pixels for the fill-limited Mali-400).
++    std::uint32_t scale = 100u;
++    if (const char *text = std::getenv("LCS_GLES_SCALE"); text != nullptr && *text != '\0')
++        scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)), 25u, 100u);
++    r.target_width = std::max<std::uint32_t>(1u, dims.width * scale / 100u);
++    r.target_height = std::max<std::uint32_t>(1u, dims.height * scale / 100u);
++    r.vsync = lcs_render_configuration().display.vsync;
++    r.display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++    EGLint major = 0;
++    EGLint minor = 0;
++    if (r.display == EGL_NO_DISPLAY || eglInitialize(r.display, &major, &minor) != EGL_TRUE) {
++        error = "eglInitialize failed";
++        return false;
++    }
++    const EGLint attributes[] = {
++        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
++        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
++        EGL_NONE
++    };
++    EGLConfig config{};
++    EGLint count = 0;
++    if (eglChooseConfig(r.display, attributes, &config, 1, &count) != EGL_TRUE || count < 1) {
++        error = "no EGL config";
++        return false;
++    }
++    r.window.width = static_cast<unsigned short>(r.screen_width);
++    r.window.height = static_cast<unsigned short>(r.screen_height);
++    r.surface = eglCreateWindowSurface(r.display, config, reinterpret_cast<EGLNativeWindowType>(&r.window), nullptr);
++    const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
++    r.context = eglCreateContext(r.display, config, EGL_NO_CONTEXT, context_attributes);
++    if (r.surface == EGL_NO_SURFACE || r.context == EGL_NO_CONTEXT ||
++        eglMakeCurrent(r.display, r.surface, r.surface, r.context) != EGL_TRUE) {
++        error = "EGL surface/context failed: 0x" + std::to_string(eglGetError());
++        return false;
++    }
++    eglSwapInterval(r.display, r.vsync ? 1 : 0);
++    r.depth24 = has_extension("GL_OES_depth24");
++    if (!link_program(r.present_program, kPresentVertex, kPresentFragment, error)) {
++        eglMakeCurrent(r.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        return false;
++    }
++    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++    eglSwapBuffers(r.display, r.surface);
++    std::cout << "[gles2] EGL " << major << '.' << minor << " on fbdev " << r.screen_width << 'x'
++              << r.screen_height << ", " << reinterpret_cast<const char *>(glGetString(GL_RENDERER))
++              << ", targets " << r.target_width << 'x' << r.target_height
++              << (r.depth24 ? ", depth24" : ", depth16") << ", render thread\n" << std::flush;
++    // The render thread owns the context from here on.
++    eglMakeCurrent(r.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    const char *log = std::getenv("LCS_FPS_LOG");
++    r.log_fps = log != nullptr && *log != '\0' && *log != '0';
++    r.show_fps = lcs_render_configuration().display.show_fps;
++    const char *vbo = std::getenv("LCS_GLES_VBO");
++    r.use_vbo = vbo == nullptr || *vbo == '\0' || std::strcmp(vbo, "0") != 0;
++    r.index_vbo = vbo != nullptr && std::strcmp(vbo, "2") == 0;
++    s.stop = false;
++    // LCS_GLES_TRANSFORM_THREAD=0: hardware transform in the vertex shader,
++    // no transform worker.
++    const char *worker = std::getenv("LCS_GLES_TRANSFORM_THREAD");
++    s.use_transform_thread = worker == nullptr || *worker == '\0' || std::strcmp(worker, "0") != 0;
++    s.render_thread = std::thread(render_thread_main, &s);
++    if (s.use_transform_thread) s.transform_thread = std::thread(transform_thread_main, &s);
++    return true;
++}
++
++}  // namespace
++
++// ------------------------------------------------------------- public API --
++// Everything below runs on the GE thread (or the window thread, for guest
++// frames) and never touches GL.
++
++namespace {
++
++bool is_target(Gles2State &s, std::uint32_t address) {
++    return s.targets.find(address & 0x001FFFF0u) != s.targets.end();
++}
++
++void note_target(Gles2State &s, std::uint32_t address, std::uint32_t width, std::uint32_t height) {
++    TargetSize &target = s.targets[address & 0x001FFFF0u];
++    target.address = address & 0x001FFFF0u;
++    if (width != 0u) target.logical_width = width;
++    if (height != 0u) target.logical_height = height;
++}
++
++bool prepare_texture(Gles2State &s, const GeGpuDrawDescriptor &draw, std::uint32_t width,
++                     std::uint32_t height, std::uint32_t mips, std::vector<std::byte> rgba) {
++    if (width == 0u) width = draw.texture_width;
++    if (height == 0u) height = draw.texture_height;
++    if (width == 0u || height == 0u || rgba.empty() || mips == 0u) return false;
++    const std::uint64_t key = texture_key(draw);
++    TextureInfo &texture = s.textures[key];
++    s.texture_bytes -= std::min(s.texture_bytes, texture.bytes);
++    texture.descriptor = draw;
++    texture.bytes = rgba.size();
++    texture.signature_epoch = s.frame_epoch;
++    texture.last_used_epoch = s.frame_epoch;
++    s.texture_bytes += texture.bytes;
++    s.last_texture_rgba.assign(rgba.begin(),
++                               rgba.begin() + std::min(rgba.size(), static_cast<std::size_t>(width) * height * 4u));
++    s.uploads.push_back({key, width, height, mips, std::move(rgba)});
++    ++s.report.decoded_texture_uploads;
++    s.report.unique_texture_keys = s.textures.size();
++    return true;
++}
++
++// Least-recently-used textures not drawn this frame go when the budget is
++// exceeded; the render thread deletes them with the frame.
++void evict_textures(Gles2State &s) {
++    if (s.texture_bytes <= kTextureBudgetBytes) return;
++    std::vector<std::pair<std::uint64_t, std::uint64_t>> stale;
++    for (const auto &entry : s.textures)
++        if (entry.second.last_used_epoch < s.frame_epoch) stale.emplace_back(entry.second.last_used_epoch, entry.first);
++    std::sort(stale.begin(), stale.end());
++    for (const auto &item : stale) {
++        if (s.texture_bytes <= kTextureBudgetBytes) break;
++        const auto found = s.textures.find(item.second);
++        if (found == s.textures.end()) continue;
++        s.texture_bytes -= std::min(s.texture_bytes, found->second.bytes);
++        s.textures.erase(found);
++        s.deletes.push_back(item.second);
++        ++s.report.evicted_textures;
++    }
++}
++
++}  // namespace
++
++bool initialize_ge_gpu_backend(std::string &error) {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    destroy_backend(s);
++    s.report = {};
++    s.display_framebuffer = 0u;
++    const RenderingConfiguration &rendering = lcs_render_configuration().rendering;
++    const bool requested_gpu = rendering.backend == RenderingBackend::DirectX12 ||
++                               rendering.backend == RenderingBackend::Vulkan;
++    s.report.requested = requested_gpu ? GeGpuBackendKind::Vulkan : GeGpuBackendKind::Software;
++    s.report.active = GeGpuBackendKind::Software;
++    if (!requested_gpu || !rendering.dx12_ge_color) {
++        s.report.message = "Software GE backend active";
++        error.clear();
++        return true;
++    }
++    if (!create_backend(s, error)) {
++        s.report.message = "GLES2 GE unavailable; using the software GE: " + error;
++        std::cerr << "[gles2] " << error << "; software GE\n";
++        destroy_backend(s);
++        error.clear();
++        return true;
++    }
++    s.enabled = true;
++    s.report.active = GeGpuBackendKind::Vulkan;  // "a GPU backend"; the enum has no GLES2
++    s.report.message = "GLES2 GE backend active (ARM Mali fbdev)";
++    s.report.offscreen_width = s.render.target_width;
++    s.report.offscreen_height = s.render.target_height;
++    s.report.swapchain_active = true;
++    error.clear();
++    return true;
++}
++
++void shutdown_ge_gpu_backend() noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    destroy_backend(s);
++    s.report = {};
++    s.vertices.clear();
++    s.indices.clear();
++    s.batches.clear();
++}
++
++bool ge_gpu_backend_active() noexcept { return state().enabled; }
++bool ge_gpu_backend_transfer_ready() noexcept { return state().enabled; }
++bool ge_gpu_backend_graphics_ready() noexcept { return state().enabled; }
++
++void ge_gpu_backend_record_draw(const GeGpuDrawDescriptor &draw) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled) return;
++    ++s.report.draw_calls;
++    s.report.vertices += draw.vertex_count;
++    const std::uint32_t target = draw.framebuffer_address & 0x001FFFF0u;
++    if (draw.framebuffer_stride != 0u || target == s.display_framebuffer) {
++        const std::uint32_t logical_width = target == s.display_framebuffer
++            ? s.display_logical_width
++            : std::max<std::uint32_t>(1u, draw.framebuffer_stride != 0u
++                  ? draw.framebuffer_stride
++                  : static_cast<std::uint32_t>(std::max(1, draw.scissor_x1 + 1)));
++        const std::uint32_t logical_height = target == s.display_framebuffer
++            ? s.display_logical_height
++            : static_cast<std::uint32_t>(std::max(1, draw.scissor_y1 + 1));
++        note_target(s, target, logical_width, logical_height);
++    }
++}
++
++void ge_gpu_backend_observe_camera(const std::array<float, 12> &, const std::array<float, 16> &,
++                                   const std::array<float, 6> &, const std::array<float, 3> &,
++                                   const GeGpuDrawDescriptor &, std::uint32_t) noexcept {}
++
++bool ge_gpu_backend_stage_vertices(const GeGpuDrawDescriptor &, std::span<const GeGpuVertex> vertices) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled) return false;
++    ++s.report.staged_draw_calls;
++    s.report.staged_vertices += vertices.size();
++    return true;
++}
++
++bool ge_gpu_backend_texture_needed(const GeGpuDrawDescriptor &draw) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled || !draw.texture_enabled || draw.texture_format > 10u ||
++        draw.texture_width == 0u || draw.texture_height == 0u) return false;
++    if (is_target(s, draw.texture_address)) {
++        ++s.report.texture_cache_hits;
++        return false;
++    }
++    ++s.report.texture_decode_requests;
++    const auto found = s.textures.find(texture_key(draw));
++    if (found == s.textures.end()) return true;
++    found->second.signature_epoch = s.frame_epoch;
++    found->second.last_used_epoch = s.frame_epoch;
++    if (draw.texture_content_signature != 0u &&
++        found->second.descriptor.texture_content_signature != draw.texture_content_signature)
++        return true;
++    ++s.report.texture_cache_hits;
++    return false;
++}
++
++void ge_gpu_backend_prepare_texture_keys(GeGpuDrawDescriptor &draw) noexcept {
++    if (!draw.texture_enabled) {
++        draw.texture_cache_key_hint = 0u;
++        draw.texture_image_key_hint = 0u;
++        return;
++    }
++    const std::uint64_t key = texture_key(draw);
++    draw.texture_cache_key_hint = key;
++    draw.texture_image_key_hint = key;
++}
++
++bool ge_gpu_backend_texture_signature_needed(const GeGpuDrawDescriptor &draw) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled || !draw.texture_enabled || draw.texture_width == 0u || draw.texture_height == 0u)
++        return false;
++    if (is_target(s, draw.texture_address)) return false;
++    const auto found = s.textures.find(texture_key(draw));
++    return found == s.textures.end() || found->second.signature_epoch != s.frame_epoch;
++}
++
++bool ge_gpu_backend_is_framebuffer_feedback_texture(const GeGpuDrawDescriptor &draw) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    return s.enabled && draw.texture_enabled && is_target(s, draw.texture_address);
++}
++
++GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(const GeGpuDrawDescriptor &draw) noexcept {
++    GeGpuWidescreenHud hud{};
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled) return hud;
++    const LcsConfiguration &config = lcs_render_configuration();
++    if (!config.initialized || !config.widescreen.enabled) return hud;
++    const float shrink = widescreen_render_stretch();
++    if (!std::isfinite(shrink) || shrink <= 0.0f || std::abs(shrink - 1.0f) < 1.0e-5f) return hud;
++    std::uint32_t logical_width = kReferenceWidth;
++    if (const auto found = s.targets.find(draw.framebuffer_address & 0x001FFFF0u); found != s.targets.end())
++        logical_width = std::max<std::uint32_t>(1u, found->second.logical_width);
++    hud.shrink = shrink;
++    hud.display_scale_x = static_cast<float>(kReferenceWidth) / static_cast<float>(logical_width);
++    hud.source_center = static_cast<float>(logical_width) * 0.5f;
++    return hud;
++}
++
++void ge_gpu_backend_note_through_extent(const GeGpuDrawDescriptor &, float, float) noexcept {}
++bool ge_gpu_backend_adopt_shared_texture(const GeGpuDrawDescriptor &) noexcept { return false; }
++
++bool ge_gpu_backend_texture_available(const GeGpuDrawDescriptor &draw) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled || !draw.texture_enabled) return false;
++    if (is_target(s, draw.texture_address)) return true;
++    const auto found = s.textures.find(texture_key(draw));
++    if (found == s.textures.end()) return false;
++    // Uploaded, or uploaded before this frame's draws on the render thread.
++    found->second.last_used_epoch = s.frame_epoch;
++    return true;
++}
++
++bool ge_gpu_backend_upload_decoded_texture(const GeGpuDrawDescriptor &draw, std::uint32_t width,
++                                           std::uint32_t height, std::span<const std::byte> rgba) noexcept {
++    if (rgba.empty()) return false;
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    return prepare_texture(s, draw, width, height, 1u, std::vector<std::byte>(rgba.begin(), rgba.end()));
++}
++
++bool ge_gpu_backend_upload_decoded_texture_chain(const GeGpuDrawDescriptor &draw,
++                                                 std::span<const GeGpuDecodedMipLevel> levels) noexcept {
++    if (levels.empty() || levels.size() > 8u || levels.front().width == 0u || levels.front().height == 0u)
++        return false;
++    std::vector<std::byte> packed;
++    for (const GeGpuDecodedMipLevel &level : levels) {
++        const std::size_t bytes = static_cast<std::size_t>(level.width) * level.height * 4u;
++        if (level.rgba8.size() != bytes) return false;
++        packed.insert(packed.end(), level.rgba8.begin(), level.rgba8.end());
++    }
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    return prepare_texture(s, draw, levels.front().width, levels.front().height,
++                           static_cast<std::uint32_t>(levels.size()), std::move(packed));
++}
++
++bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescriptor &draw,
++                                                        std::uint32_t width, std::uint32_t height,
++                                                        std::uint32_t mip_levels,
++                                                        std::vector<std::byte> packed) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    return prepare_texture(s, draw, width, height, mip_levels, std::move(packed));
++}
++
++bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte> destination) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (s.last_texture_rgba.empty() || destination.size() < s.last_texture_rgba.size()) return false;
++    std::memcpy(destination.data(), s.last_texture_rgba.data(), s.last_texture_rgba.size());
++    return true;
++}
++
++void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
++                                               std::span<const GeGpuVertex> triangle_vertices) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled || triangle_vertices.empty() || triangle_vertices.size() % 3u != 0u) return;
++    if (s.vertices.size() + triangle_vertices.size() > kMaxFrameVertices) {
++        ++s.report.game_vertex_overflows;
++        return;
++    }
++    const bool sampled = draw.texture_enabled && ge_gpu_backend_texture_available(draw) &&
++                         draw.texture_width != 0u && draw.texture_height != 0u;
++    const float su = sampled ? 1.0f / static_cast<float>(draw.texture_width) : 1.0f;
++    const float sv = sampled ? 1.0f / static_cast<float>(draw.texture_height) : 1.0f;
++    const std::uint32_t first = static_cast<std::uint32_t>(s.vertices.size());
++    s.vertices.resize(first + triangle_vertices.size());
++    Vertex *out = s.vertices.data() + first;
++    for (const GeGpuVertex &v : triangle_vertices)
++        *out++ = {v.x, v.y, v.z, v.w, v.rgba, v.u * su, v.v * sv, v.q, v.fog_factor};
++    Batch &batch = s.batches.emplace_back();
++    batch.draw = draw;
++    batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
++    batch.first_vertex = first;
++    batch.vertex_count = static_cast<std::uint32_t>(triangle_vertices.size());
++    batch.feedback_address = draw.texture_address & 0x001FFFF0u;
++    batch.framebuffer_feedback = draw.texture_enabled && is_target(s, batch.feedback_address);
++    ++s.report.game_draw_calls;
++    s.report.game_vertices += triangle_vertices.size();
++}
++
++namespace {
++
++// Appends a hardware-transform draw: fill(out) writes vertex_count vertices
++// straight into the frame's vertex array (no temporary per draw).
++template <typename Fill>
++void append_hardware_batch(Gles2State &s, const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
++                           std::size_t vertex_count, std::span<const std::uint32_t> triangle_indices, Fill fill) {
++    const bool indexed = !triangle_indices.empty();
++    const std::size_t emitted = indexed ? triangle_indices.size() : vertex_count;
++    if (emitted == 0u || (transform.primitive == 4u ? emitted < 3u : (emitted % 3u) != 0u)) return;
++    if (s.vertices.size() + vertex_count > kMaxFrameVertices) {
++        ++s.report.game_vertex_overflows;
++        return;
++    }
++    if (indexed) {
++        std::uint32_t highest = 0u;
++        for (std::uint32_t index : triangle_indices) highest = std::max(highest, index);
++        if (highest >= vertex_count) {
++            ++s.report.game_vertex_overflows;
++            return;
++        }
++    }
++    const std::uint32_t first_vertex = static_cast<std::uint32_t>(s.vertices.size());
++    const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
++    s.vertices.resize(first_vertex + vertex_count);
++    fill(s.vertices.data() + first_vertex);
++    if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
++    Batch &batch = s.batches.emplace_back();
++    batch.draw = draw;
++    batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
++    batch.first_vertex = first_vertex;
++    batch.vertex_count = static_cast<std::uint32_t>(vertex_count);
++    batch.first_index = first_index;
++    batch.index_count = indexed ? static_cast<std::uint32_t>(triangle_indices.size()) : 0u;
++    batch.indexed = indexed;
++    batch.logical_draw_count = std::max<std::uint32_t>(1u, transform.logical_prim_batches);
++    batch.hardware_transform = true;
++    batch.transform = transform;
++    batch.feedback_address = draw.texture_address & 0x001FFFF0u;
++    batch.framebuffer_feedback = draw.texture_enabled && is_target(s, batch.feedback_address);
++    s.report.game_draw_calls += batch.logical_draw_count;
++    s.report.hw_transform_draw_calls += batch.logical_draw_count;
++    s.report.game_vertices += emitted;
++}
++
++}  // namespace
++
++void ge_gpu_backend_accumulate_hardware_triangles(
++    const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
++    std::span<const GeGpuVertex> vertices, std::span<const std::uint32_t> triangle_indices) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled || vertices.empty()) return;
++    append_hardware_batch(s, draw, transform, vertices.size(), triangle_indices, [&](Vertex *out) {
++        for (const GeGpuVertex &v : vertices)
++            *out++ = {v.x, v.y, v.z, v.w, v.rgba, v.u, v.v, v.q, v.fog_factor};
++    });
++}
++
++bool ge_gpu_backend_accumulate_hardware_packed_0115(
++    const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
++    std::span<const std::byte> packed_vertices, std::uint32_t vertex_count,
++    std::span<const std::uint32_t> triangle_indices) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    if (!s.enabled || vertex_count == 0u ||
++        packed_vertices.size() != static_cast<std::size_t>(vertex_count) * sizeof(Packed0115))
++        return false;
++    // Kept as the PSP stores them; the vertex shader decodes them.
++    const bool indexed = !triangle_indices.empty();
++    const std::size_t emitted = indexed ? triangle_indices.size() : vertex_count;
++    if (emitted == 0u || (transform.primitive == 4u ? emitted < 3u : (emitted % 3u) != 0u)) return true;
++    if (s.packed.size() / sizeof(Packed0115) + vertex_count > kMaxFrameVertices) {
++        ++s.report.game_vertex_overflows;
++        return true;
++    }
++    if (indexed) {
++        std::uint32_t highest = 0u;
++        for (std::uint32_t index : triangle_indices) highest = std::max(highest, index);
++        if (highest >= vertex_count) {
++            ++s.report.game_vertex_overflows;
++            return true;
++        }
++    }
++    const std::uint32_t first_vertex = static_cast<std::uint32_t>(s.packed.size() / sizeof(Packed0115));
++    const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
++    const auto *bytes = reinterpret_cast<const std::uint8_t *>(packed_vertices.data());
++    s.packed.insert(s.packed.end(), bytes, bytes + packed_vertices.size());
++    if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
++    Batch &batch = s.batches.emplace_back();
++    batch.draw = draw;
++    batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
++    batch.first_vertex = first_vertex;
++    batch.vertex_count = vertex_count;
++    batch.first_index = first_index;
++    batch.index_count = indexed ? static_cast<std::uint32_t>(triangle_indices.size()) : 0u;
++    batch.indexed = indexed;
++    batch.logical_draw_count = std::max<std::uint32_t>(1u, transform.logical_prim_batches);
++    batch.hardware_transform = true;
++    batch.packed = true;
++    batch.transform = transform;
++    batch.feedback_address = draw.texture_address & 0x001FFFF0u;
++    batch.framebuffer_feedback = draw.texture_enabled && is_target(s, batch.feedback_address);
++    s.report.game_draw_calls += batch.logical_draw_count;
++    s.report.hw_transform_draw_calls += batch.logical_draw_count;
++    s.report.game_vertices += emitted;
++    return true;
++}
++
++void ge_gpu_backend_set_native_window(void *) noexcept {}
++
++void ge_gpu_backend_set_display_framebuffer(std::uint32_t address, std::uint32_t logical_width,
++                                            std::uint32_t logical_height) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    s.display_framebuffer = address & 0x001FFFF0u;
++    s.display_logical_width = logical_width != 0u ? logical_width : kReferenceWidth;
++    s.display_logical_height = logical_height != 0u ? logical_height : kReferenceHeight;
++    if (!s.enabled) return;
++    note_target(s, s.display_framebuffer, s.display_logical_width, s.display_logical_height);
++}
++
++void ge_gpu_backend_display_logical_size(std::uint32_t &width, std::uint32_t &height) noexcept {
++    const Gles2State &s = state();
++    width = s.display_logical_width;
++    height = s.display_logical_height;
++}
++
++bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    const bool publish = ge_finish_shows_this_frame();
++    if (!s.enabled || (s.batches.empty() && s.uploads.empty() && s.deletes.empty())) {
++        s.vertices.clear();
++        s.packed.clear();
++        s.indices.clear();
++        s.batches.clear();
++        ++s.frame_epoch;
++        return false;
++    }
++    evict_textures(s);
++    bool touched_display = false;
++    std::uint64_t psp_draws = 0u;
++    for (const Batch &batch : s.batches) {
++        psp_draws += batch.logical_draw_count;
++        touched_display |= (batch.draw.framebuffer_address & 0x001FFFF0u) == s.display_framebuffer;
++    }
++    std::unique_ptr<Frame> frame = take_frame(s);
++    frame->guest = false;
++    frame->vertices.swap(s.vertices);
++    frame->packed.swap(s.packed);
++    frame->indices.swap(s.indices);
++    frame->batches.swap(s.batches);
++    frame->uploads.swap(s.uploads);
++    frame->deletes.swap(s.deletes);
++    frame->targets.clear();
++    for (const auto &entry : s.targets) frame->targets.push_back(entry.second);
++    frame->display_framebuffer = s.display_framebuffer;
++    frame->display_logical_width = s.display_logical_width;
++    frame->display_logical_height = s.display_logical_height;
++    frame->publish = publish;
++    frame->display_aspect = resolve_widescreen_aspect_ratio(lcs_render_configuration(), 0u, 0u);
++    frame->psp_draws = psp_draws;
++    // The swaps left the spare frame's (empty) buffers here, capacity and all.
++    s.vertices.clear();
++    s.packed.clear();
++    s.indices.clear();
++    s.batches.clear();
++    s.uploads.clear();
++    s.deletes.clear();
++    submit_frame(s, std::move(frame));
++    ++s.report.game_frames;
++    s.report.game_frame_vblank = vblank;
++    s.report.presented_framebuffer_target = touched_display ? s.display_framebuffer : 0u;
++    if (!touched_display) ++s.report.frames_without_displayed_target;
++    ++s.frame_epoch;
++    return publish && touched_display;
++}
++
++bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte>) noexcept { return false; }
++
++bool ge_gpu_backend_presents_directly() noexcept { return state().enabled; }
++
++static bool gles2_guest_present_available() noexcept { return state().enabled; }
++
++// Frames the game writes to PSP memory itself (movies, loading screens); the
++// window thread calls this. Drawn by the render thread, in order with frames.
++static bool gles2_present_guest_rgba(std::span<const std::byte> rgba, std::uint32_t width,
++                                     std::uint32_t height) noexcept {
++    Gles2State &s = state();
++    if (!s.enabled || width == 0u || height == 0u ||
++        rgba.size() < static_cast<std::size_t>(width) * height * 4u)
++        return false;
++    std::unique_ptr<Frame> frame = take_frame(s);
++    frame->guest = true;
++    frame->guest_rgba.assign(rgba.begin(), rgba.begin() + static_cast<std::ptrdiff_t>(width) * height * 4);
++    frame->guest_width = width;
++    frame->guest_height = height;
++    submit_frame(s, std::move(frame));
++    return true;
++}
++
++namespace {
++struct RegisterGles2GuestPresent {
++    RegisterGles2GuestPresent() noexcept {
++        ge_guest_present().available = gles2_guest_present_available;
++        ge_guest_present().present = gles2_present_guest_rgba;
++    }
++};
++const RegisterGles2GuestPresent register_gles2_guest_present{};
++}  // namespace
++
++std::uint32_t ge_gpu_backend_owned_framebuffer() noexcept {
++    const Gles2State &s = state();
++    return s.enabled ? s.display_framebuffer : 0u;
++}
++std::uint32_t ge_gpu_backend_display_framebuffer() noexcept { return state().display_framebuffer; }
++std::span<const std::byte> ge_gpu_backend_game_frame_rgba() noexcept { return {}; }
++bool ge_gpu_backend_copy_offscreen_rgba(std::span<std::byte>) noexcept { return false; }
++void ge_gpu_backend_mark_window_presented() noexcept { state().report.gpu_frame_presented_to_window = true; }
++GeGpuBackendReport ge_gpu_backend_report() {
++    Gles2State &s = state();
++    std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    return s.report;
++}
++
++}  // namespace lcs
++
++#endif
+diff --git a/lcs/host/lcs_render_config.cpp b/lcs/host/lcs_render_config.cpp
+index 8b5e927..557f21b 100644
+--- a/lcs/host/lcs_render_config.cpp
++++ b/lcs/host/lcs_render_config.cpp
+@@ -204,8 +204,13 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
+             config.rendering.backend = RenderingBackend::DirectX12;
+         else if (backend == "vulkan" || backend == "vk")
+             config.rendering.backend = RenderingBackend::Vulkan;
++        // GLES2 is the GPU backend of builds without Vulkan (DirectX12 here means "a GPU").
++        else if (backend == "gles2" || backend == "gles")
++            config.rendering.backend = RenderingBackend::DirectX12;
++        else if (backend == "software" || backend == "cpu")
++            config.rendering.backend = RenderingBackend::Software;
+         else
+-            warning(config, line, "Rendering.Backend supports DirectX12 and Vulkan");
++            warning(config, line, "Rendering.Backend supports DirectX12, Vulkan, GLES2 and Software");
+         return;
+     }
+     if (key == "internalresolutionmode" || key == "internalmode") {

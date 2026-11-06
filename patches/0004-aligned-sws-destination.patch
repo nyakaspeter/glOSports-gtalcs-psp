@@ -1,0 +1,60 @@
+diff --git a/lcs/host/lcs_media_decoder.cpp b/lcs/host/lcs_media_decoder.cpp
+index 5cd3736..819cddd 100644
+--- a/lcs/host/lcs_media_decoder.cpp
++++ b/lcs/host/lcs_media_decoder.cpp
+@@ -2,12 +2,14 @@
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <cstring>
+ #include <vector>
+ 
+ extern "C" {
+ #include <libavcodec/avcodec.h>
+ #include <libavformat/avformat.h>
+ #include <libavutil/imgutils.h>
++#include <libavutil/mem.h>
+ #include <libavutil/opt.h>
+ #include <libswresample/swresample.h>
+ #include <libswscale/swscale.h>
+@@ -357,9 +359,14 @@ struct VideoStreamDecoder::State {
+     SwsContext *scaler{};
+     int width{};
+     int height{};
++    // sws_scale's SIMD stores need an aligned destination (NEON on 32-bit ARM
++    // faults on one that is only malloc-aligned), so it scales into this.
++    std::uint8_t *aligned{};
++    int aligned_stride{};
+ 
+     ~State() {
+         if (scaler != nullptr) sws_freeContext(scaler);
++        av_free(aligned);
+     }
+ };
+ 
+@@ -397,14 +404,19 @@ std::size_t VideoStreamDecoder::read(std::span<std::uint8_t> output) {
+                     frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
+                     frame->width, frame->height, AV_PIX_FMT_RGBA,
+                     SWS_BILINEAR, nullptr, nullptr, nullptr);
++                av_free(state.aligned);
++                state.aligned_stride = (frame->width * 4 + 31) & ~31;
++                state.aligned = static_cast<std::uint8_t *>(
++                    av_malloc(static_cast<std::size_t>(state.aligned_stride) * frame->height));
+             }
+-            if (state.scaler == nullptr) return;
+-            const std::size_t bytes = static_cast<std::size_t>(frame->width) * frame->height * 4u;
+-            state.common.pending.resize(bytes);
+-            std::uint8_t *destination = state.common.pending.data();
+-            const int stride = frame->width * 4;
++            if (state.scaler == nullptr || state.aligned == nullptr) return;
++            const std::size_t row = static_cast<std::size_t>(frame->width) * 4u;
++            state.common.pending.resize(row * frame->height);
+             sws_scale(state.scaler, frame->data, frame->linesize, 0, frame->height,
+-                      &destination, &stride);
++                      &state.aligned, &state.aligned_stride);
++            for (int y = 0; y < frame->height; ++y)
++                std::memcpy(state.common.pending.data() + row * y,
++                            state.aligned + static_cast<std::size_t>(state.aligned_stride) * y, row);
+         });
+     });
+ }

@@ -1,0 +1,133 @@
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -228,6 +228,10 @@ struct RenderState {
+     // driver: it reads each draw's indices back from uncached memory); 0
+     // client-side arrays per draw.
+     bool use_vbo{true};
++    // LCS_GLES_STRIPS=0: unroll the PSP's triangle strips into lists. By
++    // default strips stay strips (about a third of the indices; ARM's driver
++    // copies and scans every index on the CPU).
++    bool strips{true};
+     bool index_vbo{};
+     std::array<std::array<GLuint, 3>, 3> buffers{};  // [ring][vertices, packed, indices]
+     std::uint32_t ring{};
+@@ -253,6 +257,8 @@ struct RenderState {
+     std::uint32_t fps_frames{};
+     std::uint64_t fps_psp_draws{};
+     std::uint64_t fps_gl_draws{};
++    // LCS_FPS_LOG: bytes per frame sent to the GPU (vertices, packed, indices, textures).
++    std::array<std::uint64_t, 4> fps_bytes{};
+ };
+ 
+ // -------------------------------------------------------------- GE side --
+@@ -1233,6 +1239,30 @@ void append_triangles(std::vector<std::uint16_t> &out, const Frame &frame, const
+     }
+ }
+ 
++// A PSP strip appended to the group's strip (which starts at first_index):
++// joined by repeating the last and first index (degenerate triangles), plus
++// one more when the group's length is odd so every triangle keeps its winding.
++void append_strip(std::vector<std::uint16_t> &out, const Frame &frame, const Batch &batch, std::uint32_t offset,
++                  std::uint32_t first_index) {
++    const std::uint32_t count = batch.indexed ? batch.index_count : batch.vertex_count;
++    if (count < 3u) return;
++    const std::uint32_t *indices = frame.indices.data() + batch.first_index;
++    const auto index = [&](std::uint32_t i) {
++        return static_cast<std::uint16_t>(offset + (batch.indexed ? indices[i] : i));
++    };
++    const std::size_t length = out.size() - first_index;
++    const std::size_t join = length == 0u ? 0u : (length & 1u) ? 3u : 2u;
++    const std::size_t at = out.size();
++    out.resize(at + join + count);
++    std::uint16_t *dst = out.data() + at;
++    if (join != 0u) {
++        *dst++ = out[at - 1u];
++        *dst++ = index(0u);
++        if (join == 3u) *dst++ = index(0u);
++    }
++    for (std::uint32_t i = 0u; i < count; ++i) dst[i] = index(i);
++}
++
+ // ---------------------------------------------------------------- present --
+ 
+ // Draw a texture (row 0 = top) onto the screen, fitted with its aspect ratio.
+@@ -1316,8 +1346,11 @@ void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
+     const double frames = static_cast<double>(r.fps_frames);
+     r.fps = frames / seconds;
+     if (r.log_fps)
+-        std::fprintf(stderr, "glos: FPS %.1f draws %.0f gl %.0f\n", r.fps,
+-                     static_cast<double>(r.fps_psp_draws) / frames, static_cast<double>(r.fps_gl_draws) / frames);
++        std::fprintf(stderr, "glos: FPS %.1f draws %.0f gl %.0f  KB/frame vertices %.0f packed %.0f indices %.0f textures %.0f\n",
++                     r.fps, static_cast<double>(r.fps_psp_draws) / frames, static_cast<double>(r.fps_gl_draws) / frames,
++                     r.fps_bytes[0] / frames / 1024.0, r.fps_bytes[1] / frames / 1024.0,
++                     r.fps_bytes[2] / frames / 1024.0, r.fps_bytes[3] / frames / 1024.0);
++    r.fps_bytes = {};
+     r.fps_frames = 0u;
+     r.fps_psp_draws = 0u;
+     r.fps_gl_draws = 0u;
+@@ -1334,12 +1367,16 @@ struct Command {
+     std::uint32_t base{};     // first vertex (in the packed or float array)
+     std::uint32_t first_index{};
+     std::uint32_t index_count{};
++    bool strip{};             // one triangle strip (draws joined by degenerate triangles)
+ };
+ 
+ void render_frame(RenderState &r, Frame &frame) {
+     r.display_framebuffer = frame.display_framebuffer;
+     for (std::uint64_t key : frame.deletes) delete_texture(r, key);
+-    for (TextureUpload &upload : frame.uploads) upload_texture(r, upload);
++    for (TextureUpload &upload : frame.uploads) {
++        r.fps_bytes[3] += upload.rgba8.size();
++        upload_texture(r, upload);
++    }
+     for (const TargetSize &size : frame.targets) {
+         Target *target = ensure_target(r, size.address);
+         if (target == nullptr) continue;
+@@ -1426,19 +1463,25 @@ void render_frame(RenderState &r, Frame &frame) {
+         // packed vertices sit after the others, so order isn't guaranteed).
+         const bool fits = batch.first_vertex >= group.base &&
+                           batch.first_vertex + batch.vertex_count - group.base <= 65536u;
+-        if (!(group_open && fits && same_state(state, group.state))) {
++        const bool strip = r.strips && batch.hardware_transform && batch.transform.primitive == 4u;
++        if (!(group_open && fits && group.strip == strip && same_state(state, group.state))) {
+             flush();
+             group = {};
+             group.state = state;
+             group.base = batch.first_vertex;
+             group.first_index = static_cast<std::uint32_t>(r.index16.size());
++            group.strip = strip;
+             group_open = true;
+         }
+-        append_triangles(r.index16, frame, batch, batch.first_vertex - group.base);
++        if (strip) append_strip(r.index16, frame, batch, batch.first_vertex - group.base, group.first_index);
++        else append_triangles(r.index16, frame, batch, batch.first_vertex - group.base);
+         if (self_feedback) flush();
+     }
+     flush();
+ 
++    r.fps_bytes[0] += frame.vertices.size() * sizeof(Vertex);
++    r.fps_bytes[1] += frame.packed.size();
++    r.fps_bytes[2] += r.index16.size() * sizeof(std::uint16_t);
+     // Pass 2: upload the frame's geometry once, then replay the commands.
+     const std::uint8_t *vertex_base = reinterpret_cast<const std::uint8_t *>(frame.vertices.data());
+     const std::uint8_t *packed_base = frame.packed.data();
+@@ -1494,7 +1537,8 @@ void render_frame(RenderState &r, Frame &frame) {
+             }
+             bind_vertices(reinterpret_cast<const Vertex *>(vertex_base + static_cast<std::size_t>(command.base) * sizeof(Vertex)));
+         }
+-        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(command.index_count), GL_UNSIGNED_SHORT,
++        glDrawElements(command.strip ? GL_TRIANGLE_STRIP : GL_TRIANGLES, static_cast<GLsizei>(command.index_count),
++                       GL_UNSIGNED_SHORT,
+                        index_base + static_cast<std::size_t>(command.first_index) * sizeof(std::uint16_t));
+         ++gl_draws;
+     }
+@@ -1799,6 +1843,8 @@ bool create_backend(Gles2State &s, std::string &error) {
+     r.show_fps = lcs_render_configuration().display.show_fps;
+     const char *vbo = std::getenv("LCS_GLES_VBO");
+     r.use_vbo = vbo == nullptr || *vbo == '\0' || std::strcmp(vbo, "0") != 0;
++    const char *strips = std::getenv("LCS_GLES_STRIPS");
++    r.strips = strips == nullptr || *strips == '\0' || std::strcmp(strips, "0") != 0;
+     r.index_vbo = vbo != nullptr && std::strcmp(vbo, "2") == 0;
+     s.stop = false;
+     // LCS_GLES_TRANSFORM_THREAD=0: hardware transform in the vertex shader,

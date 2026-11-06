@@ -1,0 +1,62 @@
+diff --git a/lcs/host/display_window_sdl.cpp b/lcs/host/display_window_sdl.cpp
+index 647b80b..fef2681 100644
+--- a/lcs/host/display_window_sdl.cpp
++++ b/lcs/host/display_window_sdl.cpp
+@@ -34,6 +34,9 @@ SDL_GameController *g_pad{};
+ std::thread::id g_window_thread{};
+ bool g_closed{};
+ bool g_focused{true};
++// No SDL video (e.g. ARM's Mali driver, where the GLES2 GE draws to /dev/fb0
++// itself): only controller input, and presents go to the GPU backend.
++bool g_headless{};
+ std::uint32_t g_texture_width{};
+ std::uint32_t g_texture_height{};
+ std::vector<std::uint8_t> g_pending_frame{};
+@@ -255,6 +258,9 @@ void note_host_frame() noexcept {
+     g_host_fps = static_cast<double>(g_fps_window_frames) / seconds;
+     g_fps_window_frames = 0u;
+     g_fps_window_start = now;
++    // LCS_FPS_LOG=1: also log it, for measuring without looking at the screen.
++    static const bool log_fps = std::getenv("LCS_FPS_LOG") != nullptr;
++    if (log_fps) std::fprintf(stderr, "glos: FPS %.1f\n", g_host_fps);
+ }
+ 
+ void paint_fps(SDL_Renderer *renderer) noexcept {
+@@ -413,6 +419,10 @@ void display_window_init() {
+     g_window_thread = std::this_thread::get_id();
+     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+         std::cerr << "[window] SDL_Init failed: " << SDL_GetError() << "\n";
++        if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) return;
++        g_headless = true;
++        for (int index = 0; index < SDL_NumJoysticks() && g_pad == nullptr; ++index) open_pad(index);
++        std::cerr << "[window] no SDL video: controller input only" << (g_pad ? " (pad open)" : "") << "\n";
+         return;
+     }
+     const bool nearest = lcs_render_configuration().display.upscale_filter == DisplayUpscaleFilter::Nearest;
+@@ -490,7 +500,7 @@ void display_window_present(psprecomp::Runtime &runtime, std::uint32_t frame_buf
+                             std::uint32_t buffer_width, std::uint32_t pixel_format,
+                             std::uint32_t width, std::uint32_t height) {
+     std::lock_guard<std::mutex> guard(g_sdl_mutex);
+-    if (g_closed || g_window == nullptr) return;
++    if (g_closed || (g_window == nullptr && !g_headless)) return;
+     static auto last_present = std::chrono::steady_clock::time_point{};
+     const auto now = std::chrono::steady_clock::now();
+     if (now - last_present < std::chrono::milliseconds(33)) return;
+@@ -514,7 +524,7 @@ void display_window_present(psprecomp::Runtime &runtime, std::uint32_t frame_buf
+ void display_window_present_rgba(std::span<const std::byte> rgba, std::uint32_t width,
+                                  std::uint32_t height) {
+     std::lock_guard<std::mutex> guard(g_sdl_mutex);
+-    if (g_window == nullptr || width == 0u || height == 0u) return;
++    if ((g_window == nullptr && !g_headless) || width == 0u || height == 0u) return;
+     const std::size_t pixel_count = static_cast<std::size_t>(width) * height;
+     if (rgba.size() < pixel_count * 4u) return;
+     present_rgba_bytes(reinterpret_cast<const std::uint8_t *>(rgba.data()), width, height);
+@@ -567,7 +577,7 @@ HostInputState display_window_input() {
+     const int wheel = g_wheel.exchange(0, std::memory_order_relaxed);
+     const std::int32_t mouse_dx = g_mouse_dx.exchange(0, std::memory_order_relaxed);
+     const std::int32_t mouse_dy = g_mouse_dy.exchange(0, std::memory_order_relaxed);
+-    const bool focused = g_window != nullptr && g_focused;
++    const bool focused = (g_window != nullptr || g_headless) && g_focused;
+     const bool menu = lcs_menu_active();
+     const bool in_game = lcs_camera_in_use() && !menu;
+     const bool minimized = g_window != nullptr &&

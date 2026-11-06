@@ -1,0 +1,44 @@
+--- a/lcs/host/lcs_profile.cpp
++++ b/lcs/host/lcs_profile.cpp
+@@ -1037,7 +1037,12 @@
+ std::uint32_t audio_remaining_samples(const AudioChannelState &channel) {
+     if (!channel.reserved || channel.busy_until_us <= virtual_time_us) return 0u;
+     const std::uint64_t remaining_us = channel.busy_until_us - virtual_time_us;
+-    const std::uint64_t samples = (remaining_us * 44100u + 999999u) / 1000000u;
++    // ceil(us * 44100 / 1000000) == ceil(us * 441 / 10000); the 32-bit form
++    // covers up to 9.7 s and avoids a 64-bit division (a libgcc call on
++    // 32-bit ARM) on a path the game polls ~1700 times a frame.
++    const std::uint64_t samples = remaining_us < 9700000u
++        ? (static_cast<std::uint32_t>(remaining_us) * 441u + 9999u) / 10000u
++        : (remaining_us * 44100u + 999999u) / 1000000u;
+     return static_cast<std::uint32_t>(std::min<std::uint64_t>(samples, channel.sample_count));
+ }
+ 
+@@ -4443,11 +4448,25 @@
+         });
+     runtime.register_hle("UtilsForUser", 0x71EC4271u,
+         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
++            // sceKernelLibcGettimeofday: the game calls it ~3000 times a frame.
++            // clock_gettime hands over seconds and nanoseconds separately, so
++            // no 64-bit division (three libgcc calls per call through chrono).
++            std::uint32_t seconds = 0u;
++            std::uint32_t micros_part = 0u;
++#if defined(_WIN32)
+             const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::system_clock::now().time_since_epoch()).count();
++            seconds = static_cast<std::uint32_t>(micros / 1000000);
++            micros_part = static_cast<std::uint32_t>(micros % 1000000);
++#else
++            timespec ts{};
++            clock_gettime(CLOCK_REALTIME, &ts);
++            seconds = static_cast<std::uint32_t>(ts.tv_sec);
++            micros_part = static_cast<std::uint32_t>(ts.tv_nsec) / 1000u;
++#endif
+             if (ctx.gpr[4] != 0u && rt.memory().contains(ctx.gpr[4], 8u)) {
+-                rt.memory().store32(ctx.gpr[4], static_cast<std::uint32_t>(micros / 1000000));
+-                rt.memory().store32(ctx.gpr[4] + 4u, static_cast<std::uint32_t>(micros % 1000000));
++                rt.memory().store32(ctx.gpr[4], seconds);
++                rt.memory().store32(ctx.gpr[4] + 4u, micros_part);
+             }
+             if (ctx.gpr[5] != 0u && rt.memory().contains(ctx.gpr[5], 8u)) rt.memory().zero(ctx.gpr[5], 8u);
+             set_success(ctx);

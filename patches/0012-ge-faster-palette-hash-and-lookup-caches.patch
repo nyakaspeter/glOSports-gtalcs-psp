@@ -1,0 +1,170 @@
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -4132,19 +4132,20 @@ struct ClutChecksum {
+ std::array<ClutChecksum, 1024> g_clut_checksums{};
+ std::uint32_t g_clut_generation = 1u;
+ 
+-ClutChecksum &clut_slot(std::uint32_t address) noexcept {
+-    return g_clut_checksums[((address >> 4u) ^ (address >> 14u)) & (g_clut_checksums.size() - 1u)];
++ClutChecksum &clut_slot(std::uint32_t address, std::uint32_t bytes) noexcept {
++    const std::uint32_t mixed = (address >> 4u) ^ (address >> 14u) ^ (bytes * 0x9E3779B1u >> 22u);
++    return g_clut_checksums[mixed & (g_clut_checksums.size() - 1u)];
+ }
+ 
+ const std::uint32_t *cached_clut_checksum(std::uint32_t address, std::uint32_t bytes) noexcept {
+-    const ClutChecksum &entry = clut_slot(address);
++    const ClutChecksum &entry = clut_slot(address, bytes);
+     if (entry.generation == g_clut_generation && entry.address == address && entry.bytes == bytes)
+         return &entry.checksum;
+     return nullptr;
+ }
+ 
+ void remember_clut_checksum(std::uint32_t address, std::uint32_t bytes, std::uint32_t checksum) noexcept {
+-    clut_slot(address) = {g_clut_generation, address, bytes, checksum};
++    clut_slot(address, bytes) = {g_clut_generation, address, bytes, checksum};
+ }
+ 
+ }  // namespace
+@@ -4285,22 +4286,19 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             if (const std::uint32_t *cached = cached_clut_checksum(clut_start, clut_bytes)) {
+                 gpu_draw.clut_checksum = *cached;
+             } else if (const std::uint8_t *clut = memory.raw_pointer(clut_start, clut_bytes)) {
+-                std::uint32_t checksum = 2166136261u;
++                // Two 32-bit lanes over whole words (~400 palettes, ~400 KB a
++                // frame in GTA: byte-at-a-time FNV was ~3.5% of the GE thread).
++                std::uint32_t lane0 = 2166136261u;
++                std::uint32_t lane1 = 0x9E3779B9u ^ clut_bytes;
+                 std::uint32_t offset = 0u;
+-                for (; offset + 4u <= clut_bytes; offset += 4u) {
+-                    const std::uint32_t word = static_cast<std::uint32_t>(clut[offset]) |
+-                        (static_cast<std::uint32_t>(clut[offset + 1u]) << 8u) |
+-                        (static_cast<std::uint32_t>(clut[offset + 2u]) << 16u) |
+-                        (static_cast<std::uint32_t>(clut[offset + 3u]) << 24u);
+-                    checksum ^= word;
+-                    checksum *= 16777619u;
+-                }
+-                if (offset < clut_bytes) {
+-                    std::uint32_t tail = clut[offset];
+-                    if (offset + 1u < clut_bytes) tail |= static_cast<std::uint32_t>(clut[offset + 1u]) << 8u;
+-                    checksum ^= tail;
+-                    checksum *= 16777619u;
++                for (; offset + 8u <= clut_bytes; offset += 8u) {
++                    std::uint32_t words[2];
++                    std::memcpy(words, clut + offset, sizeof(words));
++                    lane0 = (lane0 ^ words[0]) * 16777619u;
++                    lane1 = (lane1 ^ words[1]) * 0x85EBCA77u;
+                 }
++                for (; offset < clut_bytes; ++offset) lane0 = (lane0 ^ clut[offset]) * 16777619u;
++                std::uint32_t checksum = lane0 ^ (lane1 * 0xC2B2AE35u) ^ (lane1 >> 16u);
+                 gpu_draw.clut_checksum = checksum;
+                 remember_clut_checksum(clut_start, clut_bytes, checksum);
+             }
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -287,6 +287,12 @@ struct Gles2State {
+     std::vector<TextureUpload> uploads;
+     std::vector<std::uint64_t> deletes;
+     std::unordered_map<std::uint32_t, TargetSize> targets;
++    // Last texture and target lookups: each draw asks several times, and
++    // consecutive draws mostly share a texture. Reset when entries go away.
++    std::uint64_t last_texture_key{};
++    TextureInfo *last_texture{};
++    std::uint32_t last_target_query{0xFFFFFFFFu};
++    bool last_target_result{};
+     std::uint64_t culled_draws{};
+     std::uint64_t culled_vertices{};
+     std::vector<std::byte> last_texture_rgba;
+@@ -1782,6 +1788,8 @@ void destroy_backend(Gles2State &s) noexcept {
+     r.context = EGL_NO_CONTEXT;
+     s.textures.clear();
+     s.targets.clear();
++    s.last_texture = nullptr;
++    s.last_target_query = 0xFFFFFFFFu;
+     s.uploads.clear();
+     s.deletes.clear();
+     s.texture_bytes = 0u;
+@@ -1877,10 +1885,30 @@ bool create_backend(Gles2State &s, std::string &error) {
+ namespace {
+ 
+ bool is_target(Gles2State &s, std::uint32_t address) {
+-    return s.targets.find(address & 0x001FFFF0u) != s.targets.end();
++    address &= 0x001FFFF0u;
++    if (address != s.last_target_query) {
++        s.last_target_query = address;
++        s.last_target_result = s.targets.find(address) != s.targets.end();
++    }
++    return s.last_target_result;
++}
++
++TextureInfo *find_texture(Gles2State &s, std::uint64_t key) {
++    if (s.last_texture != nullptr && s.last_texture_key == key) return s.last_texture;
++    const auto found = s.textures.find(key);
++    if (found == s.textures.end()) return nullptr;
++    s.last_texture_key = key;
++    s.last_texture = &found->second;
++    return s.last_texture;
++}
++
++void forget_lookups(Gles2State &s) {
++    s.last_texture = nullptr;
++    s.last_target_query = 0xFFFFFFFFu;
+ }
+ 
+ void note_target(Gles2State &s, std::uint32_t address, std::uint32_t width, std::uint32_t height) {
++    if (s.targets.find(address & 0x001FFFF0u) == s.targets.end()) forget_lookups(s);
+     TargetSize &target = s.targets[address & 0x001FFFF0u];
+     target.address = address & 0x001FFFF0u;
+     if (width != 0u) target.logical_width = width;
+@@ -1922,6 +1950,7 @@ void evict_textures(Gles2State &s) {
+         if (found == s.textures.end()) continue;
+         s.texture_bytes -= std::min(s.texture_bytes, found->second.bytes);
+         s.textures.erase(found);
++        forget_lookups(s);
+         s.deletes.push_back(item.second);
+         ++s.report.evicted_textures;
+     }
+@@ -2019,12 +2048,12 @@ bool ge_gpu_backend_texture_needed(const GeGpuDrawDescriptor &draw) noexcept {
+         return false;
+     }
+     ++s.report.texture_decode_requests;
+-    const auto found = s.textures.find(texture_key(draw));
+-    if (found == s.textures.end()) return true;
+-    found->second.signature_epoch = s.frame_epoch;
+-    found->second.last_used_epoch = s.frame_epoch;
++    TextureInfo *found = find_texture(s, texture_key(draw));
++    if (found == nullptr) return true;
++    found->signature_epoch = s.frame_epoch;
++    found->last_used_epoch = s.frame_epoch;
+     if (draw.texture_content_signature != 0u &&
+-        found->second.descriptor.texture_content_signature != draw.texture_content_signature)
++        found->descriptor.texture_content_signature != draw.texture_content_signature)
+         return true;
+     ++s.report.texture_cache_hits;
+     return false;
+@@ -2047,8 +2076,8 @@ bool ge_gpu_backend_texture_signature_needed(const GeGpuDrawDescriptor &draw) no
+     if (!s.enabled || !draw.texture_enabled || draw.texture_width == 0u || draw.texture_height == 0u)
+         return false;
+     if (is_target(s, draw.texture_address)) return false;
+-    const auto found = s.textures.find(texture_key(draw));
+-    return found == s.textures.end() || found->second.signature_epoch != s.frame_epoch;
++    const TextureInfo *found = find_texture(s, texture_key(draw));
++    return found == nullptr || found->signature_epoch != s.frame_epoch;
+ }
+ 
+ bool ge_gpu_backend_is_framebuffer_feedback_texture(const GeGpuDrawDescriptor &draw) noexcept {
+@@ -2083,10 +2112,10 @@ bool ge_gpu_backend_texture_available(const GeGpuDrawDescriptor &draw) noexcept
+     std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled || !draw.texture_enabled) return false;
+     if (is_target(s, draw.texture_address)) return true;
+-    const auto found = s.textures.find(texture_key(draw));
+-    if (found == s.textures.end()) return false;
++    TextureInfo *found = find_texture(s, texture_key(draw));
++    if (found == nullptr) return false;
+     // Uploaded, or uploaded before this frame's draws on the render thread.
+-    found->second.last_used_epoch = s.frame_epoch;
++    found->last_used_epoch = s.frame_epoch;
+     return true;
+ }
+ 

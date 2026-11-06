@@ -1,0 +1,65 @@
+--- a/lcs/generated/generated_unit_0059.cpp
++++ b/lcs/generated/generated_unit_0059.cpp
+@@ -2,6 +2,7 @@
+ #include "psprecomp/runtime.hpp"
+ #include "generated_units.hpp"
+ #include "lcs_mouse.hpp"
++#include <algorithm>
+ #include <bit>
+ #include <cmath>
+ #include <cstdint>
+@@ -6072,6 +6073,8 @@
+     ctx.fpr[16] = ctx.fpr[16] + ctx.fpr[28];
+     aot_mem.aot_store32(ctx.gpr[20] + static_cast<std::uint32_t>(188), std::bit_cast<std::uint32_t>(ctx.fpr[16]));
+     ctx.fpr[12] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[29] + static_cast<std::uint32_t>(1100)));
++    // The follow camera's upward pitch limit, at most lcs::lcs_camera_pitch_up_limit().
++    ctx.fpr[12] = std::min(ctx.fpr[12], lcs::lcs_camera_pitch_up_limit());
+     ctx.set_fpu_condition((ctx.fpr[16] <= ctx.fpr[12]));
+     // nop
+     if (ctx.fpu_condition()) {
+--- a/lcs/generated/generated_unit_0060.cpp
++++ b/lcs/generated/generated_unit_0060.cpp
+@@ -1,6 +1,7 @@
+ #include "psprecomp/runtime.hpp"
+ #include "generated_units.hpp"
+ #include "lcs_mouse.hpp"
++#include <algorithm>
+ #include <bit>
+ #include <cmath>
+ #include <cstdint>
+@@ -3747,6 +3748,8 @@
+     ctx.fpr[15] = ctx.fpr[15] + ctx.fpr[30];
+     aot_mem.aot_store32(ctx.gpr[17] + static_cast<std::uint32_t>(188), std::bit_cast<std::uint32_t>(ctx.fpr[15]));
+     ctx.fpr[13] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[29] + static_cast<std::uint32_t>(956)));
++    // The follow camera's upward pitch limit, at most lcs::lcs_camera_pitch_up_limit().
++    ctx.fpr[13] = std::min(ctx.fpr[13], lcs::lcs_camera_pitch_up_limit());
+     ctx.set_fpu_condition((ctx.fpr[15] <= ctx.fpr[13]));
+     // nop
+     { const bool branch_taken = ctx.fpu_condition();
+--- a/lcs/host/lcs_mouse.hpp
++++ b/lcs/host/lcs_mouse.hpp
+@@ -7,6 +7,13 @@
+ [[nodiscard]] float lcs_mouse_camera_turn_speed(float game_speed, float timestep) noexcept;
+ 
+ [[nodiscard]] float lcs_mouse_camera_pitch_speed(float game_speed, float timestep) noexcept;
++// The on-foot follow camera's upward pitch (CCam +188, guest 0x088F4C4C)
++// stops at 0.27 rad (about 15 degrees): the view itself never pitches up
++// further (0.27-0.30 at most in the camera log, 2026-11-06), and past it the
++// camera only sinks toward the ground, where the game stopped updating the
++// view for 2-6 s (from about 0.45; a 0.40 cap still locked). The game's own
++// limit is 0.785; only the right-stick camera could reach it.
++[[nodiscard]] float lcs_camera_pitch_up_limit() noexcept;
+ 
+ [[nodiscard]] float lcs_mouse_camera_turn_angle(float game_angle) noexcept;
+ 
+--- a/lcs/host/lcs_controls.cpp
++++ b/lcs/host/lcs_controls.cpp
+@@ -179,6 +179,8 @@
+     return value;
+ }
+ 
++float lcs_camera_pitch_up_limit() noexcept { return 0.27f; }
++
+ int lcs_camera_axis_x() noexcept {
+     return g_axis_x.load(std::memory_order_relaxed);
+ }

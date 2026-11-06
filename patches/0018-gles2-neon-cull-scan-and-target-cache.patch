@@ -1,0 +1,77 @@
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -23,6 +23,9 @@
+ #include "lcs_runtime_log.hpp"
+ 
+ #define EGL_NO_X11 1
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
+ #include <EGL/egl.h>
+ #include <GLES2/gl2.h>
+ #include <GLES2/gl2ext.h>
+@@ -2205,13 +2208,23 @@
+ 
+ bool off_screen(const Gles2State &s, const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &hw,
+                 const std::array<float, 3> &low, const std::array<float, 3> &high) {
+-    std::uint32_t width = kReferenceWidth;
+-    std::uint32_t height = kReferenceHeight;
+-    if (const auto found = s.targets.find(draw.framebuffer_address & 0x001FFFF0u); found != s.targets.end()) {
+-        width = std::max<std::uint32_t>(1u, found->second.logical_width);
+-        height = std::max<std::uint32_t>(1u, found->second.logical_height);
++    // Consecutive draws share a target: one hash find per target change.
++    static thread_local std::uint32_t cached_target = 0xFFFFFFFFu;
++    static thread_local std::uint64_t cached_epoch = 0u;
++    static thread_local std::uint32_t cached_width = kReferenceWidth;
++    static thread_local std::uint32_t cached_height = kReferenceHeight;
++    const std::uint32_t target_address = draw.framebuffer_address & 0x001FFFF0u;
++    if (target_address != cached_target || cached_epoch != s.frame_epoch) {
++        cached_target = target_address;
++        cached_epoch = s.frame_epoch;
++        cached_width = kReferenceWidth;
++        cached_height = kReferenceHeight;
++        if (const auto found = s.targets.find(target_address); found != s.targets.end()) {
++            cached_width = std::max<std::uint32_t>(1u, found->second.logical_width);
++            cached_height = std::max<std::uint32_t>(1u, found->second.logical_height);
++        }
+     }
+-    const ClipRows rows = clip_rows(hw, width, height);
++    const ClipRows rows = clip_rows(hw, cached_width, cached_height);
+     // Outside when all 8 corners are on the far side of one plane:
+     // w + x, w - x, w + y, w - y >= 0 and (depth clip) z >= 0, w - z >= 0.
+     std::uint32_t outside = 0x3Fu;
+@@ -2314,7 +2327,32 @@
+     const std::size_t count = packed_vertices.size() / sizeof(Packed0115);
+     std::int16_t low[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
+     std::int16_t high[3] = {INT16_MIN, INT16_MIN, INT16_MIN};
+-    for (std::size_t i = 0u; i < count; ++i) {
++    std::size_t i = 0u;
++#if defined(__ARM_NEON)
++    // Four halfwords at a time: x, y, z and the next vertex's first two bytes
++    // (lane 3, ignored). The last vertex is done below so nothing is read past
++    // the end of the data. Two pairs of accumulators hide the vmin/vmax latency.
++    if (count >= 3u) {
++        int16x4_t lo0 = vdup_n_s16(INT16_MAX), hi0 = vdup_n_s16(INT16_MIN);
++        int16x4_t lo1 = lo0, hi1 = hi0;
++        const std::size_t pairs_end = count - 1u;
++        for (; i + 2u <= pairs_end; i += 2u) {
++            const int16x4_t a = vld1_s16(reinterpret_cast<const std::int16_t *>(bytes + i * sizeof(Packed0115) + 4u));
++            const int16x4_t b = vld1_s16(reinterpret_cast<const std::int16_t *>(bytes + (i + 1u) * sizeof(Packed0115) + 4u));
++            lo0 = vmin_s16(lo0, a); hi0 = vmax_s16(hi0, a);
++            lo1 = vmin_s16(lo1, b); hi1 = vmax_s16(hi1, b);
++        }
++        for (; i < pairs_end; ++i) {
++            const int16x4_t a = vld1_s16(reinterpret_cast<const std::int16_t *>(bytes + i * sizeof(Packed0115) + 4u));
++            lo0 = vmin_s16(lo0, a); hi0 = vmax_s16(hi0, a);
++        }
++        lo0 = vmin_s16(lo0, lo1); hi0 = vmax_s16(hi0, hi1);
++        std::int16_t l[4], h[4];
++        vst1_s16(l, lo0); vst1_s16(h, hi0);
++        for (int c = 0; c < 3; ++c) { low[c] = l[c]; high[c] = h[c]; }
++    }
++#endif
++    for (; i < count; ++i) {
+         std::int16_t p[3];
+         std::memcpy(p, bytes + i * sizeof(Packed0115) + 4u, sizeof(p));
+         for (int c = 0; c < 3; ++c) {

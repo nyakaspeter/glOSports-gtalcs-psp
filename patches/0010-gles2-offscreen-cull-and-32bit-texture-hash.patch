@@ -1,0 +1,222 @@
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -141,6 +141,8 @@ struct Frame {
+     bool publish{};
+     float display_aspect{};  // >0: the aspect to show the frame at (Widescreen.AspectRatio)
+     std::uint64_t psp_draws{};
++    std::uint64_t culled_draws{};     // dropped as entirely off screen (GE side)
++    std::uint64_t culled_vertices{};
+     std::vector<std::byte> guest_rgba;
+     std::uint32_t guest_width{};
+     std::uint32_t guest_height{};
+@@ -259,6 +261,8 @@ struct RenderState {
+     std::uint64_t fps_gl_draws{};
+     // LCS_FPS_LOG: bytes per frame sent to the GPU (vertices, packed, indices, textures).
+     std::array<std::uint64_t, 4> fps_bytes{};
++    std::uint64_t fps_culled{};
++    std::uint64_t fps_culled_vertices{};
+ };
+ 
+ // -------------------------------------------------------------- GE side --
+@@ -283,6 +287,8 @@ struct Gles2State {
+     std::vector<TextureUpload> uploads;
+     std::vector<std::uint64_t> deletes;
+     std::unordered_map<std::uint32_t, TargetSize> targets;
++    std::uint64_t culled_draws{};
++    std::uint64_t culled_vertices{};
+     std::vector<std::byte> last_texture_rgba;
+     std::uint32_t display_framebuffer{};
+     std::uint32_t display_logical_width{kReferenceWidth};
+@@ -1351,6 +1357,10 @@ void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
+                      r.fps_bytes[0] / frames / 1024.0, r.fps_bytes[1] / frames / 1024.0,
+                      r.fps_bytes[2] / frames / 1024.0, r.fps_bytes[3] / frames / 1024.0);
+     r.fps_bytes = {};
++    if (r.log_fps)
++        std::fprintf(stderr, "glos: culled draws %.0f vertices %.0f\n", r.fps_culled / frames,
++                     r.fps_culled_vertices / frames);
++    r.fps_culled = r.fps_culled_vertices = 0u;
+     r.fps_frames = 0u;
+     r.fps_psp_draws = 0u;
+     r.fps_gl_draws = 0u;
+@@ -1479,6 +1489,8 @@ void render_frame(RenderState &r, Frame &frame) {
+     }
+     flush();
+ 
++    r.fps_culled += frame.culled_draws;
++    r.fps_culled_vertices += frame.culled_vertices;
+     r.fps_bytes[0] += frame.vertices.size() * sizeof(Vertex);
+     r.fps_bytes[1] += frame.packed.size();
+     r.fps_bytes[2] += r.index16.size() * sizeof(std::uint16_t);
+@@ -2150,6 +2162,49 @@ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
+ 
+ namespace {
+ 
++// LCS_GLES_CULL=0: keep draws that are entirely off screen. GTA culls whole
++// objects; the meshes of a partly visible one all arrive here, and every one
++// costs the GE thread, a GL draw and vertex shading. A mesh whose model-space
++// bounding box is outside one clip plane draws nothing.
++bool cull_enabled() {
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_GLES_CULL");
++        return text == nullptr || *text == '\0' || std::strcmp(text, "0") != 0;
++    }();
++    return enabled;
++}
++
++bool off_screen(const Gles2State &s, const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &hw,
++                const std::array<float, 3> &low, const std::array<float, 3> &high) {
++    std::uint32_t width = kReferenceWidth;
++    std::uint32_t height = kReferenceHeight;
++    if (const auto found = s.targets.find(draw.framebuffer_address & 0x001FFFF0u); found != s.targets.end()) {
++        width = std::max<std::uint32_t>(1u, found->second.logical_width);
++        height = std::max<std::uint32_t>(1u, found->second.logical_height);
++    }
++    const ClipRows rows = clip_rows(hw, width, height);
++    // Outside when all 8 corners are on the far side of one plane:
++    // w + x, w - x, w + y, w - y >= 0 and (depth clip) z >= 0, w - z >= 0.
++    std::uint32_t outside = 0x3Fu;
++    for (std::uint32_t corner = 0u; corner < 8u && outside != 0u; ++corner) {
++        const float p[4] = {(corner & 1u) ? high[0] : low[0], (corner & 2u) ? high[1] : low[1],
++                            (corner & 4u) ? high[2] : low[2], 1.0f};
++        const auto dot = [&](const std::array<float, 4> &row) {
++            return row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3] * p[3];
++        };
++        const float x = dot(rows[0]), y = dot(rows[1]), z = dot(rows[2]), w = dot(rows[3]);
++        std::uint32_t mask = 0u;
++        if (w + x < 0.0f) mask |= 1u;
++        if (w - x < 0.0f) mask |= 2u;
++        if (w + y < 0.0f) mask |= 4u;
++        if (w - y < 0.0f) mask |= 8u;
++        if (hw.depth_clip_enabled && z < 0.0f) mask |= 16u;
++        if (hw.depth_clip_enabled && w - z < 0.0f) mask |= 32u;
++        outside &= mask;
++    }
++    return outside != 0u;
++}
++
+ // Appends a hardware-transform draw: fill(out) writes vertex_count vertices
+ // straight into the frame's vertex array (no temporary per draw).
+ template <typename Fill>
+@@ -2174,6 +2229,23 @@ void append_hardware_batch(Gles2State &s, const GeGpuDrawDescriptor &draw, const
+     const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
+     s.vertices.resize(first_vertex + vertex_count);
+     fill(s.vertices.data() + first_vertex);
++    if (cull_enabled() && !draw.clear_mode) {
++        std::array<float, 3> low{INFINITY, INFINITY, INFINITY};
++        std::array<float, 3> high{-INFINITY, -INFINITY, -INFINITY};
++        bool unit_w = true;  // the box test assumes w = 1 (model space)
++        for (std::size_t i = 0u; i < vertex_count; ++i) {
++            const Vertex &v = s.vertices[first_vertex + i];
++            low = {std::min(low[0], v.x), std::min(low[1], v.y), std::min(low[2], v.z)};
++            high = {std::max(high[0], v.x), std::max(high[1], v.y), std::max(high[2], v.z)};
++            unit_w &= v.w == 1.0f;
++        }
++        if (unit_w && low[0] <= high[0] && off_screen(s, draw, transform, low, high)) {
++            s.vertices.resize(first_vertex);
++            ++s.culled_draws;
++            s.culled_vertices += vertex_count;
++            return;
++        }
++    }
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+     Batch &batch = s.batches.emplace_back();
+     batch.draw = draw;
+@@ -2232,9 +2304,27 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
+             return true;
+         }
+     }
++    const auto *bytes = reinterpret_cast<const std::uint8_t *>(packed_vertices.data());
++    if (cull_enabled() && !draw.clear_mode) {
++        std::int16_t low[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
++        std::int16_t high[3] = {INT16_MIN, INT16_MIN, INT16_MIN};
++        for (std::uint32_t i = 0u; i < vertex_count; ++i) {
++            std::int16_t p[3];
++            std::memcpy(p, bytes + i * sizeof(Packed0115) + 4u, sizeof(p));
++            for (int c = 0; c < 3; ++c) {
++                low[c] = std::min(low[c], p[c]);
++                high[c] = std::max(high[c], p[c]);
++            }
++        }
++        constexpr float k = 1.0f / 32768.0f;
++        if (off_screen(s, draw, transform, {low[0] * k, low[1] * k, low[2] * k}, {high[0] * k, high[1] * k, high[2] * k})) {
++            ++s.culled_draws;
++            s.culled_vertices += vertex_count;
++            return true;
++        }
++    }
+     const std::uint32_t first_vertex = static_cast<std::uint32_t>(s.packed.size() / sizeof(Packed0115));
+     const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
+-    const auto *bytes = reinterpret_cast<const std::uint8_t *>(packed_vertices.data());
+     s.packed.insert(s.packed.end(), bytes, bytes + packed_vertices.size());
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+     Batch &batch = s.batches.emplace_back();
+@@ -2311,6 +2401,9 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+     frame->publish = publish;
+     frame->display_aspect = resolve_widescreen_aspect_ratio(lcs_render_configuration(), 0u, 0u);
+     frame->psp_draws = psp_draws;
++    frame->culled_draws = s.culled_draws;
++    frame->culled_vertices = s.culled_vertices;
++    s.culled_draws = s.culled_vertices = 0u;
+     // The swaps left the spare frame's (empty) buffers here, capacity and all.
+     s.vertices.clear();
+     s.packed.clear();
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -2012,24 +2012,28 @@ std::uint64_t texture_source_signature(const psprecomp::GuestMemory &memory,
+     const std::uint8_t *pixels = memory.raw_pointer(texture.base, size);
+     if (pixels == nullptr) return 0u;
+ 
+-    std::uint64_t hash = 0x9E3779B97F4A7C15ull;
+-    const auto mix64 = [&hash](std::uint64_t value) noexcept {
+-        hash ^= value + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
+-        hash *= 0xD6E8FEB86659FD93ull;
+-        hash ^= hash >> 29u;
++    // Two 32-bit lanes (one per half of each 8-byte word): 64-bit multiplies
++    // are several instructions each on 32-bit ARM. A change detector, kept in
++    // memory only.
++    std::uint32_t lane0 = 0x9E3779B9u;
++    std::uint32_t lane1 = 0x85EBCA77u;
++    const auto rotl = [](std::uint32_t v, int r) noexcept { return (v << r) | (v >> (32 - r)); };
++    const auto mix = [&](std::uint32_t low, std::uint32_t high) noexcept {
++        lane0 = rotl((lane0 ^ low) * 0x9E3779B1u, 13);
++        lane1 = rotl((lane1 ^ high) * 0x85EBCA77u, 17);
+     };
+     const auto hash_range = [&](std::size_t begin, std::size_t end) noexcept {
+         std::size_t i = begin;
+         while (i + 8u <= end) {
+-            std::uint64_t word{};
+-            std::memcpy(&word, pixels + i, sizeof(word));
+-            mix64(word);
++            std::uint32_t words[2];
++            std::memcpy(words, pixels + i, sizeof(words));
++            mix(words[0], words[1]);
+             i += 8u;
+         }
+         if (i < end) {
+-            std::uint64_t tail = 0u;
+-            std::memcpy(&tail, pixels + i, end - i);
+-            mix64(tail ^ (static_cast<std::uint64_t>(end - i) << 56u));
++            std::uint32_t words[2] = {};
++            std::memcpy(words, pixels + i, end - i);
++            mix(words[0] ^ static_cast<std::uint32_t>(end - i), words[1]);
+         }
+     };
+     if (size <= 4096u) {
+@@ -2043,9 +2047,12 @@ std::uint64_t texture_source_signature(const psprecomp::GuestMemory &memory,
+             hash_range(begin, std::min(size, begin + block_bytes));
+         }
+     }
+-    hash ^= static_cast<std::uint64_t>(size) +
+-            (static_cast<std::uint64_t>(texture.width) << 32u) + texture.height;
+-    hash *= 1099511628211ull;
++    mix(static_cast<std::uint32_t>(size), (texture.width << 16u) ^ texture.height);
++    lane0 ^= lane1 >> 15u;
++    lane0 *= 0x2C1B3C6Du;
++    lane1 ^= lane0 >> 13u;
++    lane1 *= 0x297A2D39u;
++    const std::uint64_t hash = (static_cast<std::uint64_t>(lane1) << 32u) | (lane0 ^ (lane1 >> 16u));
+     return hash == 0u ? 1u : hash;
+ }
+ 

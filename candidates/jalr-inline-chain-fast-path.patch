@@ -1,0 +1,96 @@
+--- a/include/psprecomp/runtime.hpp
++++ b/include/psprecomp/runtime.hpp
+@@ -130,8 +130,46 @@
+     // only the return PC is insufficient because another PSP thread can resume
+     // at the same address.  Depth is bounded so guest recursion cannot exhaust
+     // the native stack.  PSPRECOMP_NO_CHAIN=1 disables it for A/B checks.
+-    [[nodiscard]] bool invoke_chained_call(AllegrexContext &ctx,
+-                                           GuestMemory::AotFastView *shared_aot_mem = nullptr);
++    //
++    // Inline fast path for dynamic jalr/jr targets, mirroring
++    // invoke_chained_direct(): when the target lies in a clean dense-table
++    // unit that has an entry form, do the stack-limit compare, the entry call
++    // and the 32-bit countdown here.  Everything else (exact per-PC targets,
++    // poisoned buckets, the function form, the chain diagnostics) stays in the
++    // out-of-line invoke_chained_call_slow().
++    //
++    // No thread-switch generation is read around the call.  register_function()
++    // poisons every dense bucket that an import/HLE/host replacement overlaps,
++    // so the dense table only ever resolves to plain generated units, and
++    // generated code reaches host code that can switch PSP ownership only
++    // through run_starvation_boundary() (import stubs leave through the outer
++    // dispatcher).  That boundary sets chain_budget_ to 1, so this frame lands
++    // in chain_boundary() on return and unwinds like a direct chain.
++    [[nodiscard]] PSPRECOMP_RUNTIME_FORCEINLINE bool invoke_chained_call(
++        AllegrexContext &ctx, GuestMemory::AotFastView *shared_aot_mem = nullptr) {
++#if !defined(PSPRECOMP_AOT_PRODUCTION_FASTPATHS)
++        if (g_runtime_chain_observers_active) return invoke_chained_call_slow(ctx, shared_aot_mem);
++#endif
++        // A 16 KiB span implies a valid layout: invalidation zeroes the span.
++        if (shared_aot_mem == nullptr || generated_unit_span_ != 16384u)
++            return invoke_chained_call_slow(ctx, shared_aot_mem);
++        // A target below generated_unit_base_ wraps past the capacity.
++        const std::uint32_t unit_index = (memory_.canonical(ctx.pc) - generated_unit_base_) >> 14u;
++        if (unit_index >= kGeneratedUnitFastCapacity || generated_unit_disabled_[unit_index] != 0u)
++            return invoke_chained_call_slow(ctx, shared_aot_mem);
++        const RecompiledEntryFunction entry = generated_unit_entries_[unit_index];
++        if (entry == nullptr) return invoke_chained_call_slow(ctx, shared_aot_mem);
++        if (reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)) < chain_stack_limit_) return false;
++        entry(*this, ctx, 0u, *shared_aot_mem);
++#if !defined(PSPRECOMP_AOT_PRODUCTION_FASTPATHS)
++        if (track_dispatch_counters_) {
++            ++chained_dispatches_;
++            ++dispatch_work_count_;
++        }
++#endif
++        if (--chain_budget_ != 0u) [[likely]] return true;
++        return chain_boundary(ctx);
++    }
+     // Fast path for compile-time-known cross-unit targets.  Automatic AOT knows
+     // the 16 KiB unit index and can avoid the large guest-PC dispatch table.
+     // Units containing an import/HLE/host override fall back to the exact
+@@ -171,7 +209,7 @@
+             // the mixed bucket. Host/HLE overrides are still non-chainable there.
+             if constexpr (DirectTargetPc != 0u) {
+                 ctx.pc = DirectTargetPc;
+-                return invoke_chained_call(ctx, shared_aot_mem);
++                return invoke_chained_call_slow(ctx, shared_aot_mem);
+             } else {
+                 return false;
+             }
+@@ -314,6 +352,10 @@
+     // The slow end of the direct-chain countdown: unwind after an
+     // invalidation, otherwise reload the budget and run the boundary.
+     bool chain_boundary(AllegrexContext &ctx);
++    // Out-of-line remainder of invoke_chained_call(): exact per-PC targets,
++    // poisoned buckets, the function form and the chain diagnostics.
++    [[nodiscard]] bool invoke_chained_call_slow(AllegrexContext &ctx,
++                                                GuestMemory::AotFastView *shared_aot_mem);
+     // Set only when a scheduler safe-point actually changes PSP execution
+     // ownership while native AOT frames may still be nested. Cleared at the
+     // beginning of each outer Runtime dispatch.
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -232,7 +232,7 @@
+     return run_starvation_boundary(ctx);
+ }
+ 
+-bool Runtime::invoke_chained_call(AllegrexContext &ctx, GuestMemory::AotFastView *shared_aot_mem) {
++bool Runtime::invoke_chained_call_slow(AllegrexContext &ctx, GuestMemory::AotFastView *shared_aot_mem) {
+ #if !defined(PSPRECOMP_AOT_PRODUCTION_FASTPATHS)
+     count_pc(ctx.pc);
+ #endif
+@@ -302,10 +302,9 @@
+     if (track_dispatch_counters_) ++chained_dispatches_;
+ #endif
+ 
+-    // Dynamic targets may enter a profile/native function which switches PSP
+-    // ownership without passing through run_starvation_boundary(). Keep the
+-    // generation guard here even in production; compile-time direct chains use
+-    // chain_context_invalidated_ and retain their cheaper hot path.
++    // Cold path (the inline invoke_chained_call() fast path takes clean dense
++    // units with the direct chains' countdown): keep the generation guard
++    // here even in production for the exact per-PC targets.
+     if (caller_generation != g_runtime_thread_switch_generation_fast) {
+         (void)account_dispatch_work(ctx, false);
+         return false;

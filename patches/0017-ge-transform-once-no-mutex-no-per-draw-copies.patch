@@ -1,0 +1,476 @@
+diff --git a/lcs/host/ge_gpu_backend.hpp b/lcs/host/ge_gpu_backend.hpp
+--- a/lcs/host/ge_gpu_backend.hpp
++++ b/lcs/host/ge_gpu_backend.hpp
+@@ -7,6 +7,12 @@
+ #include <string>
+ #include <vector>
+ 
++#include <memory>
++#include <new>
++#include <type_traits>
++#include <utility>
++#include <vector>
++
+ namespace lcs {
+ 
+ enum class GeGpuBackendKind : std::uint8_t {
+@@ -134,6 +140,19 @@
+     std::uint32_t transform_control{};
+ };
+ 
++// std::vector whose resize() leaves new elements uninitialised: the per-draw
++// vertex and index buffers are resized and then fully overwritten, and the
++// zero fill was a measurable share of the GE thread's memset time.
++template <typename T>
++struct DefaultInitAllocator : std::allocator<T> {
++    using std::allocator<T>::allocator;
++    template <typename U> struct rebind { using other = DefaultInitAllocator<U>; };
++    template <typename U> void construct(U *p) noexcept(std::is_nothrow_default_constructible_v<U>) { ::new (static_cast<void *>(p)) U; }
++    template <typename U, typename... Args> void construct(U *p, Args &&...args) { ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...); }
++};
++using GeGpuVertexVector = std::vector<GeGpuVertex, DefaultInitAllocator<GeGpuVertex>>;
++using GeIndexVector = std::vector<std::uint32_t, DefaultInitAllocator<std::uint32_t>>;
++
+ struct GeGpuDecodedMipLevel {
+     std::uint32_t width{};
+     std::uint32_t height{};
+diff --git a/lcs/host/ge_renderer.cpp b/lcs/host/ge_renderer.cpp
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -28,6 +28,7 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++
+ #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+ #include <immintrin.h>
+ #define PSPRECOMP_GE_X86_SIMD 1
+@@ -1649,7 +1650,7 @@
+     struct Entry {
+         std::uint64_t signature{};
+         std::uint64_t last_used{};
+-        std::vector<GeGpuVertex> vertices;
++        GeGpuVertexVector vertices;
+         std::uint8_t volatile_misses{};
+     };
+     std::unordered_map<StaticVertexKey, Entry, StaticVertexKeyHash> entries;
+@@ -1722,7 +1723,7 @@
+     return probe;
+ }
+ 
+-bool reuse_static_vertices(const StaticVertexProbe &probe, std::vector<GeGpuVertex> &decoded) {
++bool reuse_static_vertices(const StaticVertexProbe &probe, GeGpuVertexVector &decoded) {
+     if (!probe.valid) return false;
+     StaticVertexCache &cache = static_vertex_cache();
+     const auto found = cache.entries.find(probe.key);
+@@ -1734,7 +1735,7 @@
+ }
+ 
+ void remember_static_vertices(const StaticVertexProbe &probe,
+-                              const std::vector<GeGpuVertex> &vertices) {
++                              const GeGpuVertexVector &vertices) {
+     if (!probe.valid || vertices.size() != probe.key.count) return;
+     StaticVertexCache &cache = static_vertex_cache();
+     const auto existing = cache.entries.find(probe.key);
+@@ -3808,12 +3809,17 @@
+ struct HwDrawJob {
+     enum class Submit : std::uint8_t { Direct, Indexed };
+ 
+-    // Inputs captured at setup time.
++    // Inputs captured at setup time. The inline job (no decode workers) points
++    // at the executor's own command array, transform state and lighting; a
++    // deferred job copies them into *_copy first, since the executor moves on.
+     const psprecomp::GuestMemory *memory{};
+-    std::array<std::uint32_t, 256> commands{};
+-    GeTransformState transform{};
++    const std::array<std::uint32_t, 256> *commands{};
++    const GeTransformState *transform{};
++    const PreparedLighting *prepared_lighting{};
++    std::array<std::uint32_t, 256> commands_copy{};
++    GeTransformState transform_copy{};
++    PreparedLighting lighting_copy{};
+     VertexLayout layout{};
+-    PreparedLighting prepared_lighting{};
+     GeGpuDrawDescriptor effective_draw{};
+     GeGpuHardwareTransform hw{};
+     std::vector<std::uint32_t> unique_indices;
+@@ -3839,10 +3845,10 @@
+     bool sampled_texture_ready{};
+ 
+     // Outputs of prepare.
+-    std::vector<GeGpuVertex> decoded_vertices;
+-    std::vector<GeGpuVertex> cache_vertices;  // decoded_vertices before finalize
+-    std::vector<GeGpuVertex> submitted_vertices;
+-    std::vector<std::uint32_t> triangle_indices;
++    GeGpuVertexVector decoded_vertices;
++    GeGpuVertexVector cache_vertices;  // decoded_vertices before finalize
++    GeGpuVertexVector submitted_vertices;
++    GeIndexVector triangle_indices;
+     Submit submit{Submit::Indexed};
+     bool failed{};
+     std::string error;
+@@ -3859,7 +3865,7 @@
+         job.decoded_vertices.resize(job.decode_count);
+         const Vec3 *world_normal = job.has_world_normal ? &job.fast_0115_world_normal : nullptr;
+         const PreparedLighting *lighting =
+-            job.cpu_lighting_effective ? &job.prepared_lighting : nullptr;
++            job.cpu_lighting_effective ? job.prepared_lighting : nullptr;
+         for (std::size_t i = 0u; i < job.decode_count; ++i) {
+             const std::uint32_t index = job.contiguous_decode
+                                             ? job.contiguous_first + static_cast<std::uint32_t>(i)
+@@ -3872,14 +3878,14 @@
+             const bool ok =
+                 job.fast_0115_raw != nullptr
+                     ? decode_model_vertex_0115_for_gpu_fast(
+-                          memory, address, job.layout, job.transform, job.commands,
++                          memory, address, job.layout, *job.transform, *job.commands,
+                           job.cpu_lighting_effective, lighting, job.decoded_vertices[i], job.error,
+                           raw != nullptr ? raw
+                                          : job.fast_0115_raw +
+                                                i * static_cast<std::size_t>(job.layout.stride),
+                           world_normal)
+-                    : decode_model_vertex_for_gpu(memory, address, job.layout, job.transform,
+-                                                  job.commands, job.cpu_lighting_effective,
++                    : decode_model_vertex_for_gpu(memory, address, job.layout, *job.transform,
++                                                  *job.commands, job.cpu_lighting_effective,
+                                                   lighting, job.uv_generation,
+                                                   job.decoded_vertices[i], job.error, raw);
+             if (!ok) return false;
+@@ -4173,6 +4179,19 @@
+     VertexLayout layout;
+     if (!build_vertex_layout_cached(data24(commands[0x12u]), layout, error)) return false;
+ 
++    // The model-to-clip transform for this draw (two 4x4 products and a dozen
++    // float24 decodes): built once here and reused by the hardware path below
++    // unless that path needs the world-space or generated-UV variant.
++    GeGpuHardwareTransform plain_hw{};
++    bool plain_hw_built = false;
++    const auto plain_transform = [&]() -> const GeGpuHardwareTransform & {
++        if (!plain_hw_built) {
++            plain_hw = build_gpu_hardware_transform(commands, transform, false, false);
++            plain_hw_built = true;
++        }
++        return plain_hw;
++    };
++
+     // Packed 0115 meshes (most of the world) entirely off screen draw nothing:
+     // drop them before the descriptor, palette, texture and lighting work.
+     if (layout.type == 0x000115u && layout.stride == 10u && !layout.through && primitive >= 3u &&
+@@ -4182,7 +4201,7 @@
+             GeGpuDrawDescriptor target{};
+             target.framebuffer_address = framebuffer_address(commands);
+             if (ge_gpu_backend_packed_0115_off_screen(
+-                    target, build_gpu_hardware_transform(commands, transform, false, false),
++                    target, plain_transform(),
+                     std::span<const std::byte>(reinterpret_cast<const std::byte *>(raw),
+                                                static_cast<std::size_t>(count) * 10u))) {
+                 stats.next_vertex_address = vertex_address + count * 10u;
+@@ -4466,7 +4485,7 @@
+         static thread_local std::vector<std::uint32_t> occurrence_indices;
+         static thread_local std::vector<std::uint32_t> unique_indices;
+         static thread_local std::vector<std::uint32_t> occurrence_remap;
+-        static thread_local std::vector<std::uint32_t> triangle_indices;
++        static thread_local GeIndexVector triangle_indices;
+         occurrence_indices.clear();
+         unique_indices.clear();
+         occurrence_remap.clear();
+@@ -4561,7 +4580,9 @@
+             fast_0115_world_normal_ptr = &fast_0115_world_normal;
+         }
+ 
+-        const GeGpuDrawDescriptor effective_draw = gpu_effective_draw_descriptor(gpu_draw);
++        GeGpuDrawDescriptor clear_draw;
++        if (gpu_draw.clear_mode) clear_draw = gpu_effective_draw_descriptor(gpu_draw);
++        const GeGpuDrawDescriptor &effective_draw = gpu_draw.clear_mode ? clear_draw : gpu_draw;
+         const bool sampled_texture_ready = effective_draw.texture_enabled &&
+             ge_gpu_backend_texture_available(effective_draw);
+ 
+@@ -4576,9 +4597,10 @@
+         }
+         const bool cpu_lighting_effective = hw_lighting_on_cpu && !gpu_directional_lighting;
+         const bool flat_shading = (data24(commands[0x50u]) & 1u) == 0u;
+-        GeGpuHardwareTransform hw =
+-            build_gpu_hardware_transform(commands, transform, cpu_lighting_effective,
+-                                         uv_generation == 1u || uv_generation == 2u);
++        const bool generated_uv = uv_generation == 1u || uv_generation == 2u;
++        GeGpuHardwareTransform hw = (!cpu_lighting_effective && !generated_uv)
++            ? plain_transform()
++            : build_gpu_hardware_transform(commands, transform, cpu_lighting_effective, generated_uv);
+         hw.primitive = primitive == 5u ? 3u : primitive;
+         hw.vertex_color_affine = gpu_directional_lighting;
+         hw.vertex_color_mul = gpu_light_mul;
+@@ -4675,10 +4697,19 @@
+             job.reused_vertices = reuse_static_vertices(job.probe, job.decoded_vertices);
+         }
+         job.memory = &memory;
+-        job.commands = commands;
+-        job.transform = transform;
++        if (deferred) {
++            job.commands_copy = commands;
++            job.transform_copy = transform;
++            job.lighting_copy = prepared_lighting;
++            job.commands = &job.commands_copy;
++            job.transform = &job.transform_copy;
++            job.prepared_lighting = &job.lighting_copy;
++        } else {
++            job.commands = &commands;
++            job.transform = &transform;
++            job.prepared_lighting = &prepared_lighting;
++        }
+         job.layout = layout;
+-        job.prepared_lighting = prepared_lighting;
+         job.effective_draw = effective_draw;
+         job.hw = hw;
+         job.unique_indices.swap(unique_indices);
+diff --git a/lcs/host/ge_gpu_backend_gles2.cpp b/lcs/host/ge_gpu_backend_gles2.cpp
+--- a/lcs/host/ge_gpu_backend_gles2.cpp
++++ b/lcs/host/ge_gpu_backend_gles2.cpp
+@@ -89,7 +89,14 @@
+ #pragma pack(pop)
+ static_assert(sizeof(Packed0115) == 10u);
+ 
++using Index16Vector = std::vector<std::uint16_t, DefaultInitAllocator<std::uint16_t>>;
++
+ struct Batch {
++    Batch() = default;
++    // Copy-constructs the two big members straight from the draw: a
++    // value-initialised Batch is ~600 bytes of zeroing per draw.
++    Batch(const GeGpuDrawDescriptor &d, const GeGpuHardwareTransform &t) : draw(d), transform(t) {}
++    explicit Batch(const GeGpuDrawDescriptor &d) : draw(d) {}
+     GeGpuDrawDescriptor draw{};
+     std::uint64_t texture_key{};
+     std::uint32_t first_vertex{};
+@@ -128,7 +135,7 @@
+ // One frame, handed from the GE thread to the render thread.
+ struct Frame {
+     bool guest{};  // a guest (movie) frame: only guest_rgba
+-    std::vector<Vertex> vertices;
++    std::vector<Vertex, DefaultInitAllocator<Vertex>> vertices;
+     std::vector<std::uint8_t> packed;  // 0115 vertices, 10 bytes each, as the PSP stores them
+     std::vector<std::uint32_t> indices;
+     std::vector<Batch> batches;
+@@ -224,7 +231,7 @@
+     GLuint guest_texture{};
+     std::uint32_t guest_width{};
+     std::uint32_t guest_height{};
+-    std::vector<std::uint16_t> index16;
++    Index16Vector index16;
+     // LCS_GLES_VBO: 1 (default) the frame's vertices go to the GPU in one
+     // upload, from a ring of buffers; 2 the indices too (slower on ARM's
+     // driver: it reads each draw's indices back from uncached memory); 0
+@@ -274,11 +281,17 @@
+     std::uint64_t last_used_epoch{};
+ };
+ 
++// GE-side state. Every ge_gpu_backend_* entry point below that reads or writes
++// it runs on the thread that executes display lists (the GE worker, or the
++// game thread with LCS_GE_ASYNC=0), one list at a time, so they take no lock:
++// the recursive mutex they used to take six to eight times per draw was ~7% of
++// the GE thread. The mutex guards only initialization, shutdown and the report
++// snapshot other threads read; the frame queues have their own mutex.
+ struct Gles2State {
+     std::recursive_mutex mutex;
+     GeGpuBackendReport report{};
+     bool enabled{};
+-    std::vector<Vertex> vertices;
++    std::vector<Vertex, DefaultInitAllocator<Vertex>> vertices;
+     std::vector<std::uint8_t> packed;
+     std::vector<std::uint32_t> indices;
+     std::vector<Batch> batches;
+@@ -1226,7 +1239,7 @@
+ 
+ // A PSP draw as triangle-list indices (strips unrolled with the odd
+ // triangles' winding swapped, as GL does), offset into the merged draw.
+-void append_triangles(std::vector<std::uint16_t> &out, const Frame &frame, const Batch &batch,
++void append_triangles(Index16Vector &out, const Frame &frame, const Batch &batch,
+                       std::uint32_t offset) {
+     const bool strip = batch.hardware_transform && batch.transform.primitive == 4u;
+     const std::uint32_t count = batch.indexed ? batch.index_count : batch.vertex_count;
+@@ -1254,7 +1267,7 @@
+ // A PSP strip appended to the group's strip (which starts at first_index):
+ // joined by repeating the last and first index (degenerate triangles), plus
+ // one more when the group's length is odd so every triangle keeps its winding.
+-void append_strip(std::vector<std::uint16_t> &out, const Frame &frame, const Batch &batch, std::uint32_t offset,
++void append_strip(Index16Vector &out, const Frame &frame, const Batch &batch, std::uint32_t offset,
+                   std::uint32_t first_index) {
+     const std::uint32_t count = batch.indexed ? batch.index_count : batch.vertex_count;
+     if (count < 3u) return;
+@@ -2007,7 +2020,6 @@
+ 
+ void ge_gpu_backend_record_draw(const GeGpuDrawDescriptor &draw) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled) return;
+     ++s.report.draw_calls;
+     s.report.vertices += draw.vertex_count;
+@@ -2031,7 +2043,6 @@
+ 
+ bool ge_gpu_backend_stage_vertices(const GeGpuDrawDescriptor &, std::span<const GeGpuVertex> vertices) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled) return false;
+     ++s.report.staged_draw_calls;
+     s.report.staged_vertices += vertices.size();
+@@ -2040,7 +2051,6 @@
+ 
+ bool ge_gpu_backend_texture_needed(const GeGpuDrawDescriptor &draw) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled || !draw.texture_enabled || draw.texture_format > 10u ||
+         draw.texture_width == 0u || draw.texture_height == 0u) return false;
+     if (is_target(s, draw.texture_address)) {
+@@ -2072,7 +2082,6 @@
+ 
+ bool ge_gpu_backend_texture_signature_needed(const GeGpuDrawDescriptor &draw) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled || !draw.texture_enabled || draw.texture_width == 0u || draw.texture_height == 0u)
+         return false;
+     if (is_target(s, draw.texture_address)) return false;
+@@ -2082,14 +2091,12 @@
+ 
+ bool ge_gpu_backend_is_framebuffer_feedback_texture(const GeGpuDrawDescriptor &draw) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     return s.enabled && draw.texture_enabled && is_target(s, draw.texture_address);
+ }
+ 
+ GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(const GeGpuDrawDescriptor &draw) noexcept {
+     GeGpuWidescreenHud hud{};
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled) return hud;
+     const LcsConfiguration &config = lcs_render_configuration();
+     if (!config.initialized || !config.widescreen.enabled) return hud;
+@@ -2109,7 +2116,6 @@
+ 
+ bool ge_gpu_backend_texture_available(const GeGpuDrawDescriptor &draw) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled || !draw.texture_enabled) return false;
+     if (is_target(s, draw.texture_address)) return true;
+     TextureInfo *found = find_texture(s, texture_key(draw));
+@@ -2123,7 +2129,6 @@
+                                            std::uint32_t height, std::span<const std::byte> rgba) noexcept {
+     if (rgba.empty()) return false;
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     return prepare_texture(s, draw, width, height, 1u, std::vector<std::byte>(rgba.begin(), rgba.end()));
+ }
+ 
+@@ -2138,7 +2143,6 @@
+         packed.insert(packed.end(), level.rgba8.begin(), level.rgba8.end());
+     }
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     return prepare_texture(s, draw, levels.front().width, levels.front().height,
+                            static_cast<std::uint32_t>(levels.size()), std::move(packed));
+ }
+@@ -2148,13 +2152,11 @@
+                                                         std::uint32_t mip_levels,
+                                                         std::vector<std::byte> packed) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     return prepare_texture(s, draw, width, height, mip_levels, std::move(packed));
+ }
+ 
+ bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte> destination) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (s.last_texture_rgba.empty() || destination.size() < s.last_texture_rgba.size()) return false;
+     std::memcpy(destination.data(), s.last_texture_rgba.data(), s.last_texture_rgba.size());
+     return true;
+@@ -2163,7 +2165,6 @@
+ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
+                                                std::span<const GeGpuVertex> triangle_vertices) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled || triangle_vertices.empty() || triangle_vertices.size() % 3u != 0u) return;
+     if (s.vertices.size() + triangle_vertices.size() > kMaxFrameVertices) {
+         ++s.report.game_vertex_overflows;
+@@ -2178,8 +2179,7 @@
+     Vertex *out = s.vertices.data() + first;
+     for (const GeGpuVertex &v : triangle_vertices)
+         *out++ = {v.x, v.y, v.z, v.w, v.rgba, v.u * su, v.v * sv, v.q, v.fog_factor};
+-    Batch &batch = s.batches.emplace_back();
+-    batch.draw = draw;
++    Batch &batch = s.batches.emplace_back(draw);
+     batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
+     batch.first_vertex = first;
+     batch.vertex_count = static_cast<std::uint32_t>(triangle_vertices.size());
+@@ -2276,8 +2276,7 @@
+         }
+     }
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+-    Batch &batch = s.batches.emplace_back();
+-    batch.draw = draw;
++    Batch &batch = s.batches.emplace_back(draw, transform);
+     batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
+     batch.first_vertex = first_vertex;
+     batch.vertex_count = static_cast<std::uint32_t>(vertex_count);
+@@ -2286,7 +2285,6 @@
+     batch.indexed = indexed;
+     batch.logical_draw_count = std::max<std::uint32_t>(1u, transform.logical_prim_batches);
+     batch.hardware_transform = true;
+-    batch.transform = transform;
+     batch.feedback_address = draw.texture_address & 0x001FFFF0u;
+     batch.framebuffer_feedback = draw.texture_enabled && is_target(s, batch.feedback_address);
+     s.report.game_draw_calls += batch.logical_draw_count;
+@@ -2300,7 +2298,6 @@
+     const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &transform,
+     std::span<const GeGpuVertex> vertices, std::span<const std::uint32_t> triangle_indices) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled || vertices.empty()) return;
+     append_hardware_batch(s, draw, transform, vertices.size(), triangle_indices, [&](Vertex *out) {
+         for (const GeGpuVertex &v : vertices)
+@@ -2327,7 +2324,6 @@
+     }
+     constexpr float k = 1.0f / 32768.0f;
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled ||
+         !off_screen(s, draw, transform, {low[0] * k, low[1] * k, low[2] * k}, {high[0] * k, high[1] * k, high[2] * k}))
+         return false;
+@@ -2341,7 +2337,6 @@
+     std::span<const std::byte> packed_vertices, std::uint32_t vertex_count,
+     std::span<const std::uint32_t> triangle_indices) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     if (!s.enabled || vertex_count == 0u ||
+         packed_vertices.size() != static_cast<std::size_t>(vertex_count) * sizeof(Packed0115))
+         return false;
+@@ -2366,8 +2361,7 @@
+     const std::uint32_t first_index = static_cast<std::uint32_t>(s.indices.size());
+     s.packed.insert(s.packed.end(), bytes, bytes + packed_vertices.size());
+     if (indexed) s.indices.insert(s.indices.end(), triangle_indices.begin(), triangle_indices.end());
+-    Batch &batch = s.batches.emplace_back();
+-    batch.draw = draw;
++    Batch &batch = s.batches.emplace_back(draw, transform);
+     batch.texture_key = draw.texture_enabled ? texture_key(draw) : 0u;
+     batch.first_vertex = first_vertex;
+     batch.vertex_count = vertex_count;
+@@ -2377,7 +2371,6 @@
+     batch.logical_draw_count = std::max<std::uint32_t>(1u, transform.logical_prim_batches);
+     batch.hardware_transform = true;
+     batch.packed = true;
+-    batch.transform = transform;
+     batch.feedback_address = draw.texture_address & 0x001FFFF0u;
+     batch.framebuffer_feedback = draw.texture_enabled && is_target(s, batch.feedback_address);
+     s.report.game_draw_calls += batch.logical_draw_count;
+@@ -2391,7 +2384,6 @@
+ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address, std::uint32_t logical_width,
+                                             std::uint32_t logical_height) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     s.display_framebuffer = address & 0x001FFFF0u;
+     s.display_logical_width = logical_width != 0u ? logical_width : kReferenceWidth;
+     s.display_logical_height = logical_height != 0u ? logical_height : kReferenceHeight;
+@@ -2407,7 +2399,6 @@
+ 
+ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+     Gles2State &s = state();
+-    std::lock_guard<std::recursive_mutex> guard(s.mutex);
+     const bool publish = ge_finish_shows_this_frame();
+     if (!s.enabled || (s.batches.empty() && s.uploads.empty() && s.deletes.empty())) {
+         s.vertices.clear();
