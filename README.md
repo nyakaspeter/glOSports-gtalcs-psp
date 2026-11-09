@@ -1,4 +1,4 @@
-# glOSports-lcsrecomp — GTA Liberty City Stories, native, on the GA36-MB
+# glOSports-gtalcs-psp — GTA Liberty City Stories, native, on the GA36-MB
 
 [lcs-recomp](https://github.com/elmasas/lcs-recomp) recompiles the PSP game's
 MIPS code ahead of time into C++ (no JIT) on top of the psprecomp runtime,
@@ -21,7 +21,7 @@ where the game thread does (no driving A/B was run).
 
 ## Game files
 
-From the US v1.05 UMD (ULUS-10041), into `/home/player/ports/lcs/game/`:
+From the US v1.05 UMD (ULUS-10041), into `/home/player/ports/gtalcs-psp/game/`:
 
 | Path | From the disc | Needed |
 |---|---|---|
@@ -32,7 +32,7 @@ From the US v1.05 UMD (ULUS-10041), into `/home/player/ports/lcs/game/`:
 
 `game/PSP/SAVEDATA/` (the saves) is created by the game.
 
-## The game folder on the console (`/home/player/ports/lcs/`)
+## The game folder on the console (`/home/player/ports/gtalcs-psp/`)
 
 | | |
 |---|---|
@@ -43,19 +43,19 @@ From the US v1.05 UMD (ULUS-10041), into `/home/player/ports/lcs/game/`:
 | `game/` | the game files; `game/PSP/SAVEDATA/` the saves (never touched by tooling) |
 | `glos/` | the ARM driver set from `goodluckOS-mali-driver` plus this port's `fbpan.so` |
 | `start.sh` | sets the environment and ends with `exec ./glos/glos-gpu run mali ./LCSNative --game game` |
-| `icon.png`, `~/.local/share/applications/lcs.puppy` | the launcher entry |
+| `icon.png`, `~/.local/share/applications/gtalcs-psp.puppy` | the launcher entry |
 
 ## Repo layout
 
 | Path | What |
 |---|---|
 | `build.sh` | Clones lcs-recomp at `1132a76` into `upstream/`, applies `patches/`, cross-compiles `LCSNative` in Docker (Debian bookworm, GCC 12). `build/` is kept: later builds are incremental. |
-| `package.sh` | `out/lcs/`: the stripped binary, `lib/`, `start.sh`, `config/`, `lcs.puppy`, `glos/` (from `../goodluckOS-mali-driver/glos` + `glos/fbpan.so`). |
+| `package.sh` | `out/gtalcs-psp/`: the stripped binary, `lib/`, `start.sh`, `config/`, `gtalcs-psp.puppy`, `glos/` (from `../goodluckOS-mali-driver/glos` + `glos/fbpan.so`). |
 | `patches/` | `0001`–`0050`, every change to upstream, applied in order. A kept change is a new patch (`tools/mkpatch.sh NNNN-name <files under upstream>`) and an entry in this README. |
 | `config/` | `LCSNative.ini` and the shader cache. |
 | `pgo/` | the profile for profile-guided optimisation (trained in the safehouse and on the street). |
-| `start.sh`, `lcs.puppy`, `icon.png` | as shipped (the icon is a crop of the game's own `PIC1.PNG`). |
-| `glos/fbpan.so` | runtime extra, see "Rendering". `glos/testing/`: console-side tools, copied over only when a bench needs them (`../goodluckOS-tools/testing-sync.sh lcs`), removed with `testing-clean.sh lcs`; never shipped. |
+| `start.sh`, `gtalcs-psp.puppy`, `icon.png` | as shipped (the icon is a crop of the game's own `PIC1.PNG`). |
+| `glos/fbpan.so` | runtime extra, see "Rendering". `glos/testing/`: console-side tools, copied over only when a bench needs them (`../goodluckOS-tools/testing-sync.sh gtalcs-psp`), removed with `testing-clean.sh gtalcs-psp`; never shipped. |
 | `tools/` | Mac-side scripts (benches, profiling, training, patch making, the VFPU lowering and its test, the profile ranking) and `tools/src/fbpan.c` (`tools/build-tools.sh` builds `glos/fbpan.so`). The console-side test tools are shared, in `goodluckOS-tools/testing/`. |
 | `candidates/` | changes that were built and measured and not kept, as patches, with the numbers in "Tried and dropped". |
 | `docs/` | an outside review (2026-10-28) and profile samples. |
@@ -65,9 +65,9 @@ From the US v1.05 UMD (ULUS-10041), into `/home/player/ports/lcs/game/`:
 ```sh
 ./build.sh && ./package.sh           # PGO=use by default once pgo/ has a profile
 ```
-Deploy: `python3 ../goodluckOS-tools/mtp_send.py / out/lcs/LCSNative`, then over the console
-`mv /home/player/LCSNative /home/player/ports/lcs/LCSNative` (MTP never
-overwrites, hence send-then-move). A first install copies all of `out/lcs/`
+Deploy: `python3 ../goodluckOS-tools/mtp_send.py / out/gtalcs-psp/LCSNative`, then over the console
+`mv /home/player/LCSNative /home/player/ports/gtalcs-psp/LCSNative` (MTP never
+overwrites, hence send-then-move). A first install copies all of `out/gtalcs-psp/`
 and the launcher entry, then the game files.
 
 `JOBS=<n>` (default 8; the instrumented builds of the big generated units
@@ -317,7 +317,7 @@ the player's save (night, rain):
 
 ## Benchmarks and profiling
 
-`../goodluckOS-tools/testing-sync.sh lcs` first (puts `glos/testing/` on the console); the
+`../goodluckOS-tools/testing-sync.sh gtalcs-psp` first (puts `glos/testing/` on the console); the
 scripts assume the save in `game/PSP/SAVEDATA` (Toni standing in the
 safehouse) and that the controls are not touched.
 
@@ -377,7 +377,7 @@ safehouse) and that the controls are not touched.
 | 0038 | program binary cache |
 | 0039 | `LCS_FPS_CAP` inside the vblank wait; radial stick dead zone; game clock and GE waits in the FPS log |
 | 0040 | `LCS_STICK_SCALE`, `LCS_STICK_DEADZONE` |
-| 0041 | the 4:3 HUD squeeze picks the top or bottom edge by the centre of what the clip rectangle lets through, not the whole element (from `glOSports-vcsrecomp`: radar tiles are rotated quads far larger than the radar, and by their whole extent some were squeezed towards the top at some camera angles, a strip of the map above the circle) |
+| 0041 | the 4:3 HUD squeeze picks the top or bottom edge by the centre of what the clip rectangle lets through, not the whole element (from `glOSports-gtavcs-psp`: radar tiles are rotated quads far larger than the radar, and by their whole extent some were squeezed towards the top at some camera angles, a strip of the map above the circle) |
 | 0042 | VFPU compile-time forms: vcrsp/vqmul, vhdp, vx2i, vh2f, vf2h, vocp, vmin/vmax, vscmp/vsge/vslt with no prefix work while none is pending, vmmul in NEON, matrix moves with constant slots, the prefix-aware vtfm on 0036's NEON form while no prefix is pending, a plain write behind a zero destination prefix; the generator's lowering pass emits them (units rewritten by `tools/vfpu-lower.py`) |
 | 0043 | guest stores mark pages in a byte table, folded into the page generations at each display-list hand-over |
 | 0044 | `LCS_SMOOTH_CLOCK`: the game's timer reads follow real time, the scheduler keeps the guest clock; `LCS_FRAME_LOG` |

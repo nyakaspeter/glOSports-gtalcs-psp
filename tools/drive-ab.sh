@@ -15,6 +15,6 @@ for b in "$@"; do
     goodluckOS-tools/console-idle.sh >/dev/null || { echo "console not idle: A/B stopped before $b"; unlock; exit 1; }
     echo "== $b $(date +%H:%M)"
     # fps, minimum and seconds under 22 over the 30 s window (drive-profile.sh)
-    DRIVE=45 glOSports-lcsrecomp/tools/drive-profile.sh $b 2>&1 | tr -d '\r' | grep -a "gameplay\|fps\|thread\|pid\|no frames\|measured"
+    DRIVE=45 glOSports-gtalcs-psp/tools/drive-profile.sh $b 2>&1 | tr -d '\r' | grep -a "gameplay\|fps\|thread\|pid\|no frames\|measured"
 done
 unlock; echo ab-done

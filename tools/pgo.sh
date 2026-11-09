@@ -36,13 +36,13 @@ m = (math.cos(h), -math.sin(h), 0, 0, math.sin(h), math.cos(h), 0, 0, 0, 0, 1, 0
 t = math.atan2(-math.sin(h), math.cos(h))
 print("".join("\\%03o" % b for b in struct.pack("<16f", *m)), "".join("\\%03o" % b for b in struct.pack("<ff", t, t)))' $PGO_TELEPORT)
     rot=${tp#* }; tp=${tp%% *}
-    street="p=\$(pidof LCSNative.pgo); m=\$(grep -m1 psprecomp-vram /proc/\$p/maps | cut -d- -f1); base=\$((0x\$m - 0x04000000)); h=\$(dd if=/proc/\$p/mem bs=4 skip=\$(( (base + 0x09947754) / 4 )) count=1 2>/dev/null | hexdump -v -e '1/4 \"%08x\"'); if [ \"\$h\" = 42c80000 ]; then printf '$tp' | dd of=/proc/\$p/mem bs=1 seek=\$((base + 0x099476f0)) conv=notrunc 2>/dev/null; printf '$rot' | dd of=/proc/\$p/mem bs=1 seek=\$((base + 0x09947bd0)) conv=notrunc 2>/dev/null; echo teleported for training; sleep 5; /home/player/ports/lcs/glos/testing/padpress l 600; sleep 55; else echo \"no teleport: health word \$h\"; fi"
+    street="p=\$(pidof LCSNative.pgo); m=\$(grep -m1 psprecomp-vram /proc/\$p/maps | cut -d- -f1); base=\$((0x\$m - 0x04000000)); h=\$(dd if=/proc/\$p/mem bs=4 skip=\$(( (base + 0x09947754) / 4 )) count=1 2>/dev/null | hexdump -v -e '1/4 \"%08x\"'); if [ \"\$h\" = 42c80000 ]; then printf '$tp' | dd of=/proc/\$p/mem bs=1 seek=\$((base + 0x099476f0)) conv=notrunc 2>/dev/null; printf '$rot' | dd of=/proc/\$p/mem bs=1 seek=\$((base + 0x09947bd0)) conv=notrunc 2>/dev/null; echo teleported for training; sleep 5; /home/player/ports/gtalcs-psp/glos/testing/padpress l 600; sleep 55; else echo \"no teleport: health word \$h\"; fi"
 fi
 
 case "${1:-}" in
 train)
     tmp=$(mktemp -d)
-    cp "$HERE/$OUT/lcs/LCSNative" "$tmp/LCSNative.pgo"
+    cp "$HERE/$OUT/gtalcs-psp/LCSNative" "$tmp/LCSNative.pgo"
     console "/usr/local/bin/appctl stop-application; rm -f /home/player/LCSNative.pgo /home/player/lcspgo.tar"
     pkill -9 -x ptpcamerad 2>/dev/null || true  # macOS claims the console's MTP interface after the first transfer
     (cd "$ROOT" && python3 -I mtp_send.py / "$tmp/LCSNative.pgo" | tail -1)
@@ -50,16 +50,16 @@ train)
     if ! console "ls /home/player/LCSNative.pgo" | grep -q LCSNative.pgo; then
         echo "pgo.sh: LCSNative.pgo did not reach the console (MTP busy? quit Photos / kill ptpcamerad)" >&2; rm -rf "$tmp"; exit 1
     fi
-    T=600 console "cd /home/player/ports/lcs && mv /home/player/LCSNative.pgo . && chmod +x LCSNative.pgo && rm -rf /dev/shm/lcspgo
+    T=600 console "cd /home/player/ports/gtalcs-psp && mv /home/player/LCSNative.pgo . && chmod +x LCSNative.pgo && rm -rf /dev/shm/lcspgo
 sed 's|\./LCSNative --game|./LCSNative.pgo --game|' start.sh > start.bench.sh; chmod +x start.bench.sh
-/usr/local/bin/appctl launch-application 'cd /home/player/ports/lcs && ./start.bench.sh'
+/usr/local/bin/appctl launch-application 'cd /home/player/ports/gtalcs-psp && ./start.bench.sh'
 sleep 40; i=0
-while [ \$i -lt 120 ]; do set -- \$(/home/player/ports/lcs/glos/testing/fbprobe 494 82 126 12); [ \$2 -gt \$((\$1 + 15)) ] && [ \$2 -gt \$((\$3 + 15)) ] && break; /home/player/ports/lcs/glos/testing/padpress a 120; sleep 2; i=\$((i + 1)); done
+while [ \$i -lt 120 ]; do set -- \$(/home/player/ports/gtalcs-psp/glos/testing/fbprobe 494 82 126 12); [ \$2 -gt \$((\$1 + 15)) ] && [ \$2 -gt \$((\$3 + 15)) ] && break; /home/player/ports/gtalcs-psp/glos/testing/padpress a 120; sleep 2; i=\$((i + 1)); done
 echo \"in gameplay after \$i presses\"; sleep 60
 $street
 kill -USR1 \$(pidof LCSNative.pgo); sleep 20; pidof LCSNative.pgo && echo 'still running?'
 ls /dev/shm/lcspgo | wc -l; du -sh /dev/shm/lcspgo
-cd /dev/shm/lcspgo && tar cf /home/player/lcspgo.tar . && ls -la /home/player/lcspgo.tar; rm -f /home/player/ports/lcs/LCSNative.pgo /home/player/ports/lcs/start.bench.sh"
+cd /dev/shm/lcspgo && tar cf /home/player/lcspgo.tar . && ls -la /home/player/lcspgo.tar; rm -f /home/player/ports/gtalcs-psp/LCSNative.pgo /home/player/ports/gtalcs-psp/start.bench.sh"
     pkill -9 -x ptpcamerad 2>/dev/null || true
     (cd "$ROOT" && python3 -I -c "import sys; sys.path.insert(0, '$ROOT'); sys.argv = ['mtp_get.py', 'lcspgo.tar', '$tmp/lcspgo.tar']; import mtp_get; mtp_get.main()" | tail -1)
     if ! [ -s "$tmp/lcspgo.tar" ]; then
