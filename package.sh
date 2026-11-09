@@ -50,6 +50,7 @@ rm -rf "$OUT/gtalcs-psp/glos" && mkdir -p "$OUT/gtalcs-psp/glos/lib"
 cp "$GLOS"/glos-gpu "$GLOS"/glos-gpu-switch "$GLOS"/mali.ko "$GLOS"/glos_fbfix.ko "$OUT/gtalcs-psp/glos/" && cp "$GLOS"/lib/* "$OUT/gtalcs-psp/glos/lib/"
 cp glos/fbpan.so "$OUT/gtalcs-psp/glos/"
 rm -rf "$OUT/gtalcs-psp/licenses" && cp -R licenses "$OUT/gtalcs-psp/licenses"
+cp LICENSE "$OUT/gtalcs-psp/licenses/LICENSE.txt"
 mkdir -p "$OUT/gtalcs-psp/config" && cp config/LCSNative.ini "$OUT/gtalcs-psp/config/"
 # Program variants seen so far, with the driver's binaries: made at startup
 # (config/shader-cache/<key>.bin, LCS_GLES_SHADER_WARMUP / LCS_GLES_SHADER_CACHE).

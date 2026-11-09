@@ -500,3 +500,8 @@ Each measured as an A/B against the build of the time, usually two pairs:
   strides share the array; tracked attribute-array enables need a "set
   everything" state at frame start.
 - Instrumented `-O3` builds of the big units need ~1.5 GB each.
+
+## Licence
+
+The port's own code is MIT (`LICENSE`); `package.sh` puts a copy into the game folder's
+`licenses/`. Third-party components and their licences: `licenses/README.md`.
