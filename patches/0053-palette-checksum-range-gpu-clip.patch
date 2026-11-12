@@ -1,0 +1,56 @@
+--- a/lcs/host/ge_renderer.cpp
++++ b/lcs/host/ge_renderer.cpp
+@@ -4621,7 +4621,16 @@
+             gpu_draw.clut_address != 0u) {
+             const std::uint32_t entry_bytes = gpu_draw.clut_format == 3u ? 4u : 2u;
+             const std::uint32_t first = std::min(gpu_draw.clut_start, 255u);
+-            const std::uint32_t last = std::min(first + gpu_draw.clut_mask, 255u);
++            // No further than the texture's own index width reaches: a 4-bit
++            // texture reads 16 entries whatever the mask says (GTA leaves it at
++            // 0xFF). With the mask alone the 240 entries after a 16-colour
++            // palette were part of its checksum: whatever lay there changed,
++            // the texture got a new key and was decoded and uploaded again
++            // (found in glOSports-gtavcs-psp: a 256 x 256 font page every frame).
++            const std::uint32_t widest_index = gpu_draw.texture_format == 4u ? 0xFu
++                : gpu_draw.texture_format == 5u ? 0xFFu : 0xFFFFu;
++            const std::uint32_t reach = std::min(gpu_draw.clut_mask, widest_index >> std::min(gpu_draw.clut_shift, 31u));
++            const std::uint32_t last = std::min(first + reach, 255u);
+             const std::uint32_t offset_bytes = first * entry_bytes;
+             const std::uint32_t clut_bytes = (last - first + 1u) * entry_bytes;
+             const std::uint32_t clut_start = gpu_draw.clut_address + offset_bytes;
+--- /dev/null
++++ b/lcs/host/lcs_world_clip.hpp
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <cstdlib>
++
++namespace lcs {
++
++// The game clips its world geometry itself: the PSP's graphics chip drops a
++// triangle that leaves its 4096 x 4096 drawing space instead of clipping it,
++// so for every mesh that crosses an edge of the view the game walks the
++// strip vertex by vertex (0x08A49750: int16 position to float, a 4 x 4
++// transform, four plane tests), cuts the strip at each triangle that crosses
++// a plane, clips that triangle on the CPU and draws the pieces
++// as separate primitives. A mesh wholly inside the view takes the game's
++// direct path: one strip, as stored.
++//
++// A GL driver clips every triangle against the view volume itself, so under
++// GLES 2 every mesh takes that direct path (the place that chooses, in
++// generated unit 0084, asks here): the same picture without the per-vertex
++// walk (9% of the game thread on a busy street), the CPU clipper and the
++// extra primitives. LCS_GPU_CLIP=0: the game clips, as on the PSP.
++[[nodiscard]] inline bool lcs_world_clipped_by_gpu() noexcept {
++#if defined(LCS_GLES2_GE_BACKEND)
++    static const bool enabled = [] {
++        const char *text = std::getenv("LCS_GPU_CLIP");
++        return text == nullptr || *text == '\0' || *text != '0';
++    }();
++    return enabled;
++#else
++    return false;
++#endif
++}
++
++}  // namespace lcs

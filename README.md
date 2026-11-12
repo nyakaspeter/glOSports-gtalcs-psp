@@ -18,6 +18,10 @@ own cap is 30. It started at 0.5 fps (software rasterizer) and 6.6 (first GLES
 store bookkeeping) run on a retrained profile: a tie on the street
 benchmark, where the draw work sets the pace; not measured while driving,
 where the game thread does (no driving A/B was run).
+Patches 0051–0054 (2026-11-12, carried over from `glOSports-gtavcs-psp`)
+take a fifth off the game thread: moving along the street at the cap it
+uses 69% of a core instead of 86%, at 29.2 fps both; without the cap 35.1–35.2
+against 35.5, where another thread is the limit (105% in both).
 
 ## Game files
 
@@ -331,6 +335,8 @@ safehouse) and that the controls are not touched.
   (south of the Portland hospital, looking west; ~1,600–1,700 PSP draws a
   frame; traffic is random, so its spread is twice the safehouse's ±0.7 fps:
   two A/B pairs per candidate, alternating). `SHOT=x.png`, `PROFILE=dir`.
+- `UNCAP=1` on either bench runs without `start.sh`'s `LCS_FPS_CAP` line, to
+  compare builds above the cap.
 - `tools/sweep-bench.sh`: the same with the player moved 40 m along the
   street every 2 s (motion proxy). `tools/drive-profile.sh`: you drive,
   it samples the busiest threads. `tools/drive-ab.sh`: binaries in turn,
@@ -387,6 +393,10 @@ safehouse) and that the controls are not touched.
 | 0048 | the FPS counter counts whole seconds (the log keeps its half seconds): presentation lags the game's frames by a varying few ms, and over half a second a capped 30 read 31 now and then |
 | 0049 | `LCS_FPS_CAP` also paces the presents (no frame on screen sooner than 1/n s after the last, the grid restarted by a late one): frames queued in the GE and render threads during a dip reached the screen in a burst, 31–32 on the counter; street run after: no half second over 30.0, average 29.0 as before |
 | 0050 | the on-foot follow camera's upward pitch stops at 0.27 rad (both copies of the pitch update, units 0059 and 0060, CCam +188): pushing the right stick up lowers the camera, and past about 0.45 rad it went below the pavement (1.9–2.7 m under the player in a camera log) and the game stopped updating the view for 2–6 s; the view never pitched up more than 0.27–0.30 anyway. The game's limit is 0.785, which only the port's right-stick camera reached |
+| 0051 | the generator's `--indirect-functions` and `--context-gpr <list>` (from `glOSports-gtavcs-psp`): functions no `jal` names (virtual methods, callbacks), functions that end in a tail call, routines with several entry points merged into one function, functions with a jump table (a `switch` over their own labels), functions that keep `$ra` elsewhere and functions that cross into the next unit become host functions too; every inner unit entry of a function is a continuation. A function holding one of the listed PCs keeps its registers in the context (the hand-made hooks name `ctx.gpr`) and, if it crosses a unit boundary, stays in its units. Without the new flags the output is byte for byte what it was |
+| 0052 | the units regenerated with those (7,210 functions holding 88% of the game's instructions, against 5,418 and 50%; `tools/gpr-cache-check.py` clean) and the 89 hand-made hook hunks re-applied (`tools/unit-hooks.patch`), plus `LCS_GPU_CLIP` in unit 0084 |
+| 0053 | palette checksums over the entries the texture's index width reaches (a 4-bit texture's checksum took in the 240 entries after its 16 colours, so a neighbour's palette change re-keyed and re-uploaded it; found in `glOSports-gtavcs-psp`); `LCS_GPU_CLIP` (`host/lcs_world_clip.hpp`, on; 0: the game clips): a world mesh that crosses the view's edge takes the game's own unclipped path and the GL driver clips it, instead of the game's per-vertex clip loop (`0x08A49750`); moving along the street without the cap 35.2 fps at 1,022 PSP draws a frame against 34.7 at 1,048 with `LCS_GPU_CLIP=0` in the same binary |
+| 0054 | identity fastmem (`IDENTITY=0 ./build.sh` builds without): the PSP's memory mapped at its own addresses, guest address = host address, the executable linked at 0x10000000; other mirrors and the null page are handled in the fault handler (`PSPRECOMP_FASTMEM_SELFTEST=1` passes on the console); lwl/lwr inline. From `glOSports-gtavcs-psp` 0019 unchanged |
 
 ## Progress (street benchmark unless noted)
 
@@ -500,6 +510,17 @@ Each measured as an A/B against the build of the time, usually two pairs:
   strides share the array; tracked attribute-array enables need a "set
   everything" state at frame start.
 - Instrumented `-O3` builds of the big units need ~1.5 GB each.
+- Regenerating the units (generator built natively in the builder image:
+  `g++ -O2 -std=c++20 -Iupstream/include upstream/tools/codegen_main.cpp
+  upstream/src/*.cpp`): `psp_recomp EBOOT.ELF --auto <dir> 0x08804000 16384
+  --leaf-functions --call-functions --cache-gpr --neon --indirect-functions
+  --leaf-exclude tools/hooked-pcs.txt --context-gpr tools/hook-pcs.txt`, then
+  `patch -p1 < tools/unit-hooks.patch` in `<dir>` (the hand-made hooks: 26
+  hooked functions stay in their units, `hooked-pcs.txt`; the blocks the
+  other hooks edit are in `hook-pcs.txt`), then `tools/gpr-cache-check.py
+  <dir>`, which must report no violations. After a generator change the
+  hooks patch is rebuilt the same way: regenerate, apply, fix rejects by
+  hand, `diff -u -r`.
 
 ## Licence
 

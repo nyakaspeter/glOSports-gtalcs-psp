@@ -5,7 +5,7 @@
 #   tools/cutscene-bench.sh <binary in ports/gtalcs-psp> [VAR=value ...]
 # e.g. tools/cutscene-bench.sh LCSNative PSPRECOMP_GE_DECODE_THREADS=1
 set -eu
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../goodluckOS-tools"
 binary=$1
 shift
 GLOS_TIMEOUT=900 python3 -I console.py "/usr/local/bin/appctl stop-application; sleep 3

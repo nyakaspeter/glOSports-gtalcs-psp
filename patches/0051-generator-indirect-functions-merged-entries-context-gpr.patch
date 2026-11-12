@@ -1,0 +1,603 @@
+--- a/tools/codegen_main.cpp
++++ b/tools/codegen_main.cpp
+@@ -1351,6 +1351,8 @@
+     out.append(text, written_to, std::string::npos);
+     return out;
+ }
++
++bool g_direct_tail_calls = false;  // --indirect-functions
+ 
+ void emit_target(std::ostringstream &body, std::uint32_t target,
+                  const std::set<std::uint32_t> &labels, const char *indent,
+@@ -1359,7 +1361,9 @@
+                  const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids = nullptr,
+                  const std::set<std::uint32_t> *import_stubs = nullptr,
+                  const std::set<std::uint32_t> *valid_units = nullptr,
+-                 GprCache *cache = nullptr) {
++                 GprCache *cache = nullptr,
++                 const std::map<std::uint32_t, std::string> *leaf_entries = nullptr,
++                 const std::map<std::uint32_t, std::string> *call_entries = nullptr) {
+     if (labels.contains(target)) {
+         body << indent << (cache != nullptr ? cache->edge(target) : std::string{}) << "goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
+         return;
+@@ -1385,8 +1389,16 @@
+     if (unit_span_bytes != 0u && target >= executable_base) {
+         const std::uint32_t unit = (target - executable_base) / unit_span_bytes;
+         if (valid_units == nullptr || valid_units->contains(unit)) {
+-            body << indent << "(void)" << direct_unit_chain_expression(unit, target, direct_entry_ids)
+-                 << "; return;\n";
++            // --indirect-functions: a jump to a leaf or call function (a tail
++            // call) calls it directly, as a `jal` to it does, instead of entering
++            // its unit, whose entry switch would forward to it.
++            if (g_direct_tail_calls && leaf_entries != nullptr && leaf_entries->contains(target))
++                body << indent << "(void)" << leaf_chain_expression(unit, target, direct_entry_ids) << "; return;\n";
++            else if (g_direct_tail_calls && call_entries != nullptr && call_entries->contains(target))
++                body << indent << "(void)" << call_function_chain_expression(unit, target) << "; return;\n";
++            else
++                body << indent << "(void)" << direct_unit_chain_expression(unit, target, direct_entry_ids)
++                     << "; return;\n";
+             return;
+         }
+     }
+@@ -1427,6 +1439,9 @@
+     const std::map<std::uint32_t, std::string> *call_forwards{};
+     bool call_function{};
+     const std::vector<std::uint32_t> *continuations{};
++    // --indirect-functions: the other entry points of merged functions, with
++    // the function's name and the entry's id: a `jal` to one calls it there.
++    const std::map<std::uint32_t, std::pair<std::string, std::uint32_t>> *call_aliases{};
+     // --cache-gpr (leaf and call functions only): guest registers in locals.
+     bool cache_gpr{};
+ };
+@@ -1462,6 +1477,16 @@
+         if (pending) { offending_pc = pending_pc; return false; }
+     }
+     return true;
++}
++
++// --context-gpr <pc_list>: a function that holds one of these PCs keeps its
++// registers in the context (hand-made hooks, applied to the generated units
++// as a patch, name ctx.gpr there).
++std::set<std::uint32_t> g_context_gpr_pcs;
++bool holds_context_gpr_pc(const GeneratedFunctionInput &function) {
++    for (const auto pc : g_context_gpr_pcs)
++        if (function.instructions.contains(pc)) return true;
++    return false;
+ }
+ 
+ std::string emit_function_source(const GeneratedFunctionInput &function,
+@@ -1469,7 +1494,8 @@
+                                  const std::string &cpp_name) {
+     std::ostringstream body;
+     GprCache gpr_cache;
+-    GprCache *gc = function.cache_gpr && (function.leaf || function.call_function) ? &gpr_cache : nullptr;
++    GprCache *gc = function.cache_gpr && (function.leaf || function.call_function) &&
++                   !holds_context_gpr_pc(function) ? &gpr_cache : nullptr;
+     const auto instruction = [&](std::string text) { return gc != nullptr ? gc->instruction(std::move(text)) : text; };
+     const auto store = [&](const char *indent) { return gc != nullptr ? gc->store(indent) : std::string{}; };
+     const auto resume_goto = [&](std::uint32_t to) {
+@@ -1673,17 +1699,17 @@
+                         const GprCache::State not_taken = gc != nullptr ? gc->save() : GprCache::State{};
+                         body << "    if (" << condition << ") {\n"
+                              << instruction(emit_regular(slot, pc + 4u, prefix));
+-                        emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc);
++                        emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc, function.leaf_entries, function.call_entries);
+                         body << "    }\n";
+                         if (gc != nullptr) gc->restore(not_taken);
+-                        emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc);
++                        emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc, function.leaf_entries, function.call_entries);
+                     } else {
+                         body << "    { const bool branch_taken = " << condition << ";\n"
+                              << instruction(emit_regular(slot, pc + 4u, prefix))
+                              << "      if (branch_taken) {\n";
+-                        emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc);
++                        emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc, function.leaf_entries, function.call_entries);
+                         body << "      }\n";
+-                        emit_target(body, fallthrough, function.entry_labels, "      ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc);
++                        emit_target(body, fallthrough, function.entry_labels, "      ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc, function.leaf_entries, function.call_entries);
+                         body << "    }\n";
+                     }
+                 } else if (decoded.kind == psprecomp::OpcodeKind::J ||
+@@ -1695,7 +1721,7 @@
+                     }
+                     body << instruction(emit_regular(slot, pc + 4u, prefix));
+                     if (decoded.kind == psprecomp::OpcodeKind::J) {
+-                        emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc);
++                        emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.valid_units, gc, function.leaf_entries, function.call_entries);
+                     } else if (function.leaf_entries != nullptr && function.leaf_entries->contains(target) &&
+                                function.unit_span_bytes != 0u && target >= function.executable_base) {
+                         // JAL to a leaf function: one direct call, the same
+@@ -1729,6 +1755,25 @@
+                             body << "    (void)" << call << ";\n";
+                         }
+                         body << "    return;\n";
++                    } else if (function.call_aliases != nullptr && function.call_aliases->contains(target) &&
++                               !function.entry_labels.contains(target) &&
++                               function.unit_span_bytes != 0u && target >= function.executable_base) {
++                        // JAL to another entry point of a merged function: the
++                        // same direct call, at that entry's id.
++                        const std::uint32_t return_pc = pc + 8u;
++                        const std::uint32_t target_unit = (target - function.executable_base) / function.unit_span_bytes;
++                        const auto &alias = function.call_aliases->at(target);
++                        const std::string call = "rt.invoke_chained_direct<&" + alias.first + ", " +
++                            std::to_string(target_unit) + "u, " + std::to_string(alias.second) + "u, " +
++                            psprecomp::hex32(target) + "u>(ctx, &aot_mem_ref)";
++                        body << store("    ");
++                        if (function.entry_labels.contains(return_pc)) {
++                            body << "    if (" << call << " && ctx.pc == " << psprecomp::hex32(return_pc)
++                                 << "u) " << resume_goto(return_pc) << "\n";
++                        } else {
++                            body << "    (void)" << call << ";\n";
++                        }
++                        body << "    return;\n";
+                     } else if (function.entry_labels.contains(target)) {
+                         // Fixed same-unit JAL: the destination is already a C++
+                         // label. Going through ctx.pc + LOCAL_DISPATCH needlessly
+@@ -1796,6 +1841,19 @@
+                             body << "    (void)rt.invoke_chained_call(ctx, &aot_mem_ref);\n";
+                         }
+                         body << "    return;\n";
++                    } else if ((function.leaf || function.call_function) && decoded.rs != 31u) {
++                        // A computed jump inside a function (--indirect-functions:
++                        // a jump table, or a tail call through a pointer): to
++                        // the block it names when that is one of the
++                        // function's own, otherwise out through ctx.pc like a
++                        // return.
++                        body << "    switch (jump_target) {\n";
++                        for (const auto label : function.entry_labels)
++                            body << "    case " << psprecomp::hex32(label) << "u: { " << edge(label) << "goto L_"
++                                 << psprecomp::hex32(label).substr(2) << "; }\n";
++                        body << "    default: break;\n    }\n"
++                             << store("    ") << "    ctx.pc = jump_target;\n"
++                             << "    return;\n";
+                     } else if (function.leaf || function.call_function) {
+                         // `jr $ra` of a leaf or call function: the caller (a
+                         // direct call, a unit's forwarding entry or the
+@@ -2276,6 +2334,7 @@
+     std::set<std::uint32_t> entry_labels;   // its blocks, as the unit had them
+     bool calls{};                           // a call function, not a leaf
+     std::vector<std::uint32_t> continuations;  // call PC + 8, ascending
++    std::set<std::uint32_t> extra_entries;  // the other entry points of a merged function
+ };
+ 
+ struct RegionSelection {
+@@ -2313,7 +2372,8 @@
+                                         const std::set<std::uint32_t> &valid_units,
+                                         std::uint32_t executable_base,
+                                         std::uint32_t unit_span_bytes,
+-                                        bool allow_calls) {
++                                        bool allow_calls,
++                                        bool indirect_targets) {
+     using K = psprecomp::OpcodeKind;
+     RegionSelection selection;
+     const auto &ranges = program.executable_ranges;
+@@ -2328,8 +2388,6 @@
+     // counts per target, and every j/branch edge in the program by target.
+     std::unordered_map<std::uint32_t, std::uint32_t> owner_count;
+     owner_count.reserve(program.covered_labels.size() * 2u);
+-    for (const auto &function : program.functions)
+-        for (const auto label : function.labels) ++owner_count[label];
+     std::unordered_map<std::uint32_t, std::size_t> jal_sites_by_target;
+     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> jump_sources_by_target;
+     for (const auto pc : program.covered_labels) {
+@@ -2337,26 +2395,186 @@
+         if (d.kind == K::Jal) ++jal_sites_by_target[jump_target(pc, d)];
+         else if (d.kind == K::J) jump_sources_by_target[jump_target(pc, d)].push_back(pc);
+         else if (is_branch(d.kind)) jump_sources_by_target[branch_target(pc, d)].push_back(pc);
++    }
++
++    // The instructions of each candidate. The analysis follows a `j` or a
++    // branch into the function it names, so a function that ends in a tail
++    // call owned its callee's instructions as well and both counted as
++    // sharing them. --indirect-functions: a candidate's own instructions are
++    // those reachable from its entry without entering another function some
++    // `jal` names; the jump into that function is then an exit (emit_target
++    // makes it a chained call and returns: a tail call).
++    const auto named = [&](std::uint32_t pc) {
++        const auto found = jal_sites_by_target.find(pc);
++        return found != jal_sites_by_target.end() && found->second != 0u;
++    };
++    std::vector<std::set<std::uint32_t>> own(program.functions.size());
++    for (std::size_t index = 0u; index < program.functions.size(); ++index) {
++        const auto &function = program.functions[index];
++        if (!indirect_targets) { own[index] = function.labels; continue; }
++        std::vector<std::uint32_t> work{function.entry};
++        std::set<std::uint32_t> &seen = own[index];
++        while (!work.empty()) {
++            const std::uint32_t pc = work.back();
++            work.pop_back();
++            if (!function.labels.contains(pc) || !seen.insert(pc).second) continue;
++            const auto d = psprecomp::decode_allegrex(memory.load32(pc));
++            const auto push = [&](std::uint32_t next) {
++                if (next != function.entry && named(next)) return;
++                work.push_back(next);
++            };
++            if (d.has_delay_slot()) {
++                if (is_branch(d.kind)) { push(branch_target(pc, d)); push(pc + 8u); }
++                else if (d.kind == K::J) push(jump_target(pc, d));
++                else if (d.kind == K::Jal || d.kind == K::Jalr) push(pc + 8u);
++            } else if (!d.is_control_flow()) {
++                push(pc + 4u);
++            }
++        }
++    }
++    for (const auto &labels : own)
++        for (const auto label : labels) ++owner_count[label];
++    const auto own_of = [&](const psprecomp::FunctionAnalysis &function) -> const std::set<std::uint32_t> & {
++        return own[static_cast<std::size_t>(&function - program.functions.data())];
++    };
++
++    // --indirect-functions: a candidate no `jal` names whose instructions all
++    // belong to one larger candidate is a label inside that function (a jump
++    // table case, a block the analysis seeded), not a function of its own:
++    // it is dropped, so the function around it no longer counts as sharing
++    // instructions and can be converted; the label stays one of its entries
++    // (a continuation).
++    std::set<std::uint32_t> nested;
++    if (indirect_targets) {
++        std::unordered_map<std::uint32_t, std::vector<const psprecomp::FunctionAnalysis *>> owners;
++        for (const auto &function : program.functions)
++            for (const auto label : own_of(function)) owners[label].push_back(&function);
++        for (const auto &function : program.functions) {
++            const auto &labels = own_of(function);
++            if (labels.empty() || named(function.entry)) continue;
++            for (const auto *other : owners[function.entry]) {
++                const auto &outer = own_of(*other);
++                if (other == &function || outer.size() <= labels.size()) continue;
++                if (std::includes(outer.begin(), outer.end(), labels.begin(), labels.end())) {
++                    nested.insert(function.entry);
++                    break;
++                }
++            }
++        }
++        for (const auto &function : program.functions)
++            if (nested.contains(function.entry))
++                for (const auto label : own_of(function)) --owner_count[label];
++    }
++
++    // --indirect-functions: candidates that share instructions (a routine
++    // with a second entry point, routines with a common tail) become one
++    // function: the union of their instructions, entered at the lowest entry
++    // (id 0) or at one of the others, which are continuations of it like any
++    // inner entry (a `jal` to one calls the function at that id). Groups of
++    // more than 8 candidates or 6,000 instructions are left alone (what the
++    // analysis made of data).
++    std::vector<std::set<std::uint32_t>> extra_entries(program.functions.size());
++    std::vector<char> merged_away(program.functions.size(), 0);
++    if (indirect_targets) {
++        const std::size_t count = program.functions.size();
++        std::vector<std::size_t> parent(count);
++        for (std::size_t index = 0u; index < count; ++index) parent[index] = index;
++        const auto root = [&](std::size_t index) {
++            while (parent[index] != index) index = parent[index] = parent[parent[index]];
++            return index;
++        };
++        std::unordered_map<std::uint32_t, std::size_t> first_owner;
++        for (std::size_t index = 0u; index < count; ++index) {
++            const auto &function = program.functions[index];
++            if (function.labels.empty() || nested.contains(function.entry)) continue;
++            for (const auto label : own[index]) {
++                const auto [found, fresh] = first_owner.try_emplace(label, index);
++                if (!fresh) parent[root(index)] = root(found->second);
++            }
++        }
++        std::map<std::size_t, std::vector<std::size_t>> groups;
++        for (std::size_t index = 0u; index < count; ++index) {
++            const auto &function = program.functions[index];
++            if (function.labels.empty() || nested.contains(function.entry)) continue;
++            groups[root(index)].push_back(index);
++        }
++        for (const auto &[group_root, members] : groups) {
++            if (members.size() < 2u || members.size() > 8u) continue;
++            std::set<std::uint32_t> all;
++            std::size_t primary = members.front();
++            bool usable = true;
++            for (const auto member : members) {
++                all.insert(own[member].begin(), own[member].end());
++                if (program.functions[member].truncated) usable = false;
++                if (program.functions[member].entry < program.functions[primary].entry) primary = member;
++            }
++            if (!usable || all.size() > 6000u) continue;
++            for (const auto member : members) {
++                if (member == primary) continue;
++                merged_away[member] = 1;
++                extra_entries[primary].insert(program.functions[member].entry);
++            }
++            own[primary] = std::move(all);
++            for (const auto label : own[primary]) owner_count[label] = 1u;
++        }
+     }
+ 
+     for (const auto &function : program.functions) {
+         if (function.labels.empty()) continue;
++        const std::set<std::uint32_t> &labels = own_of(function);
++        const std::size_t candidate_index = static_cast<std::size_t>(&function - program.functions.data());
++        const std::set<std::uint32_t> &extra = extra_entries[candidate_index];
++        // A jump out of the function into one a `jal` names: a tail call.
++        const auto tail_call = [&](std::uint32_t target) {
++            return indirect_targets && target != function.entry && named(target);
++        };
+         ++selection.candidates;
+-        const auto exclude = [&](const char *reason) { ++selection.excluded[reason]; };
++        const auto exclude = [&](const char *reason) {
++            ++selection.excluded[reason];
++            // PSPRECOMP_SELECTION_LOG=1: every candidate left in its unit, with its size and the reason.
++            static const bool log = std::getenv("PSPRECOMP_SELECTION_LOG") != nullptr;
++            if (log) std::cerr << "[selection] " << psprecomp::hex32(function.entry) << " " << labels.size()
++                               << " instructions: " << reason << "\n";
++        };
+         if (function.truncated) { exclude("truncated"); continue; }
+-        if (jal_sites_by_target[function.entry] == 0u) { exclude("not a jal target"); continue; }
++        if (merged_away[candidate_index]) { exclude("an entry of a merged function"); continue; }
++        {
++            bool entries_ok = true;
++            for (const auto entry : extra) if (!global_entries.contains(entry)) entries_ok = false;
++            if (!entries_ok) { exclude("entry not a unit entry"); continue; }
++        }
++        if (nested.contains(function.entry)) { exclude("a label inside another function"); continue; }
++        // A region no `jal` names (a virtual method, a callback) gains no
++        // direct call, but inside a function its registers live in locals
++        // (--cache-gpr): --indirect-functions converts those too. It is
++        // entered through the dispatcher's per-PC entry, as its unit was.
++        if (!indirect_targets && jal_sites_by_target[function.entry] == 0u) { exclude("not a jal target"); continue; }
+         if (!global_entries.contains(function.entry)) { exclude("entry not a unit entry"); continue; }
+         bool shared = false;
+-        for (const auto label : function.labels) if (owner_count[label] > 1u) { shared = true; break; }
++        for (const auto label : labels) if (owner_count[label] > 1u) { shared = true; break; }
+         if (shared) { exclude("shares instructions with another function"); continue; }
+-        const std::uint32_t first = *function.labels.begin();
+-        const std::uint32_t last = *function.labels.rbegin();
++        const std::uint32_t first = *labels.begin();
++        const std::uint32_t last = *labels.rbegin();
+         const std::uint32_t unit = (function.entry - executable_base) / unit_span_bytes;
+-        if (first < executable_base || (first - executable_base) / unit_span_bytes != unit ||
+-            (last + 4u - executable_base) / unit_span_bytes != unit) { exclude("straddles a unit boundary"); continue; }
++        // A function that crosses into the next unit(s): --indirect-functions
++        // emits it with the unit of its entry; its continuations in the other
++        // units keep their entry ids there and those units forward them.
++        const bool straddles = first < executable_base || (first - executable_base) / unit_span_bytes != unit ||
++                               (last + 4u - executable_base) / unit_span_bytes != unit;
++        // (One with a hand-made hook stays in its units: the hook is a patch to the unit's file.)
++        bool hooked_block = false;
++        if (straddles)
++            for (const auto pc : g_context_gpr_pcs) if (labels.contains(pc)) { hooked_block = true; break; }
++        if (straddles && (!indirect_targets || first < function.entry || hooked_block)) { exclude("straddles a unit boundary"); continue; }
+         if (!valid_units.contains(unit)) { exclude("unit not emitted"); continue; }
++        if (straddles) {
++            bool all_valid = true;
++            for (std::uint32_t other = unit; other <= (last - executable_base) / unit_span_bytes; ++other)
++                if (!valid_units.contains(other)) { all_valid = false; break; }
++            if (!all_valid) { exclude("unit not emitted"); continue; }
++        }
+         bool has_import = false, has_excluded = false;
+-        for (const auto label : function.labels) {
++        for (const auto label : labels) {
+             if (import_stubs.contains(label) || import_stubs.contains(label + 4u)) has_import = true;
+             if (excluded_pcs.contains(label) || excluded_pcs.contains(label + 4u)) has_excluded = true;
+         }
+@@ -2365,7 +2583,7 @@
+ 
+         const char *reason = nullptr;
+         std::vector<std::uint32_t> continuations;
+-        for (const auto pc : function.labels) {
++        for (const auto pc : labels) {
+             const auto d = psprecomp::decode_allegrex(memory.load32(pc));
+             psprecomp::DecodedInstruction slot{};
+             const bool delay = d.has_delay_slot();
+@@ -2375,7 +2593,7 @@
+                 if (is_link_branch(d.kind)) { reason = "link branch"; break; }
+                 if (d.kind == K::Jal) {
+                     const std::uint32_t target = jump_target(pc, d);
+-                    if (target != function.entry && function.labels.contains(target)) {
++                    if (target != function.entry && labels.contains(target)) {
+                         reason = "jal into its own body"; break;
+                     }
+                 }
+@@ -2383,7 +2601,7 @@
+                 // function after an unwind out of the call: it must be one of
+                 // its blocks and keep a unit entry id to be forwarded with.
+                 const std::uint32_t continuation = pc + 8u;
+-                if (!function.labels.contains(continuation) || !global_entries.contains(continuation)) {
++                if (!labels.contains(continuation) || !global_entries.contains(continuation)) {
+                     reason = "continuation not a unit entry of the function"; break;
+                 }
+                 continuations.push_back(continuation);
+@@ -2393,22 +2611,27 @@
+                 reason = "unsupported instruction"; break;
+             }
+             if (delay && slot.is_control_flow()) { reason = "control flow in delay slot"; break; }
+-            if (d.kind == K::Jr && d.rs != 31u) { reason = "computed jr"; break; }
+-            if (writes_ra_oddly(d) || (delay && writes_ra_oddly(slot))) { reason = "writes $ra"; break; }
++            if (!indirect_targets && d.kind == K::Jr && d.rs != 31u) { reason = "computed jr"; break; }
++            // A function that keeps $ra somewhere else than its stack frame (the
++            // world-geometry clip loop at 0x08A09B2C parks it in a VFPU register):
++            // its `jr $ra` stores ctx.pc and returns like any other, and a caller
++            // that sees another pc than its return address unwinds to the
++            // dispatcher, so --indirect-functions converts these too.
++            if (!indirect_targets && (writes_ra_oddly(d) || (delay && writes_ra_oddly(slot)))) { reason = "writes $ra"; break; }
+             if (d.kind == K::J) {
+-                if (!function.labels.contains(jump_target(pc, d))) { reason = "j leaves the function"; break; }
++                if (!labels.contains(jump_target(pc, d)) && !tail_call(jump_target(pc, d))) { reason = "j leaves the function"; break; }
+             } else if (is_branch(d.kind)) {
+                 const std::uint32_t taken = branch_target(pc, d);
+                 const std::uint32_t fallthrough = pc + 8u;
+-                if ((psprecomp::is_executable_address(ranges, taken) && !function.labels.contains(taken)) ||
+-                    (psprecomp::is_executable_address(ranges, fallthrough) && !function.labels.contains(fallthrough))) {
++                if ((psprecomp::is_executable_address(ranges, taken) && !labels.contains(taken) && !tail_call(taken)) ||
++                    (psprecomp::is_executable_address(ranges, fallthrough) && !labels.contains(fallthrough) && !tail_call(fallthrough))) {
+                     reason = "branch leaves the function"; break;
+                 }
+             } else if (!delay && !d.is_control_flow()) {
+                 // Linear flow must stay inside the function (a seed right after
+                 // a non-returning path would otherwise be fallen into).
+                 const std::uint32_t next = pc + 4u;
+-                if (psprecomp::is_executable_address(ranges, next) && !function.labels.contains(next)) {
++                if (psprecomp::is_executable_address(ranges, next) && !labels.contains(next)) {
+                     reason = "falls out of the function"; break;
+                 }
+             }
+@@ -2416,19 +2639,21 @@
+         }
+         if (reason != nullptr) { exclude(reason); continue; }
+         bool entered_from_outside = false;
+-        for (const auto label : function.labels) {
++        for (const auto label : labels) {
++            // (--indirect-functions: another function may jump to the entry, its tail call.)
++            if (indirect_targets && (label == function.entry || extra.contains(label))) continue;
+             const auto sources = jump_sources_by_target.find(label);
+             if (sources == jump_sources_by_target.end()) continue;
+             for (const auto source : sources->second)
+-                if (!function.labels.contains(source)) { entered_from_outside = true; break; }
++                if (!labels.contains(source)) { entered_from_outside = true; break; }
+             if (entered_from_outside) break;
+         }
+         if (entered_from_outside) { exclude("j/branch target from outside"); continue; }
+         if (allow_calls) {
+             // A jal anywhere to a label of the body other than the entry.
+             bool jal_into_body = false;
+-            for (const auto label : function.labels)
+-                if (label != function.entry && jal_sites_by_target.contains(label) &&
++            for (const auto label : labels)
++                if (label != function.entry && !extra.contains(label) && jal_sites_by_target.contains(label) &&
+                     jal_sites_by_target.at(label) != 0u) { jal_into_body = true; break; }
+             if (jal_into_body) { exclude("jal target inside the body"); continue; }
+         }
+@@ -2436,11 +2661,22 @@
+         FunctionRegion region;
+         region.entry = function.entry;
+         region.unit = unit;
+-        region.instructions = function.labels;
+-        for (const auto label : function.labels)
++        region.instructions = labels;
++        for (const auto label : labels)
+             if (global_entries.contains(label)) region.entry_labels.insert(label);
++        // --indirect-functions: every inner unit entry of the function is a
++        // continuation (the other entries of a merged function, a label that
++        // was a candidate of its own, a block a pointer may name), so the
++        // dispatcher and the units' forwarding cases can enter it there.
++        if (indirect_targets && allow_calls) {
++            for (const auto label : region.entry_labels)
++                if (label != function.entry) continuations.push_back(label);
++            std::sort(continuations.begin(), continuations.end());
++            continuations.erase(std::unique(continuations.begin(), continuations.end()), continuations.end());
++        }
+         region.calls = !continuations.empty();
+         region.continuations = std::move(continuations);
++        region.extra_entries = extra;
+         (region.calls ? selection.call_jal_sites : selection.jal_sites) += jal_sites_by_target[function.entry];
+         selection.regions.push_back(std::move(region));
+     }
+@@ -2468,7 +2704,8 @@
+                   bool leaf_functions,
+                   bool call_functions,
+                   const std::set<std::uint32_t> &leaf_excluded_pcs,
+-                  bool cache_gpr) {
++                  bool cache_gpr,
++                  bool indirect_functions) {
+     const auto elf = psprecomp::Elf32Image::from_file(elf_path);
+     psprecomp::GuestMemory memory;
+     (void)elf.load_and_relocate(memory, load_base);
+@@ -2539,9 +2776,6 @@
+         }
+     }
+ 
+-    // assign the same compact entry ids used by each unit's dense
+-    // dispatcher globally before emission. Fixed cross-unit edges can pass the
+-    // destination id directly and skip the target unit's PC->entry table lookup.
+     std::map<std::uint32_t, std::uint16_t> direct_entry_ids;
+     for (const auto &unit : units) {
+         std::uint16_t id = 1u;
+@@ -2558,6 +2792,8 @@
+     std::map<std::uint32_t, std::string> call_entries;
+     std::map<std::uint32_t, std::string> call_forwards;
+     std::set<std::uint32_t> call_continuations;
++    std::map<std::uint32_t, std::pair<std::string, std::uint32_t>> call_aliases;  // a merged function's other entries
++    g_direct_tail_calls = indirect_functions;
+     std::size_t leaf_instructions = 0u;
+     std::size_t call_instructions = 0u;
+     std::size_t leaves_dropped = 0u;
+@@ -2565,14 +2801,17 @@
+     if (leaf_functions || call_functions) {
+         region_selection = select_function_regions(program, memory, import_stubs, leaf_excluded_pcs, global_entries,
+                                                    valid_unit_buckets, executable_base, unit_span_bytes,
+-                                                   call_functions);
++                                                   call_functions, indirect_functions);
+         std::map<std::uint32_t, Unit *> unit_by_bucket;
+         for (auto &unit : units) unit_by_bucket[unit.bucket] = &unit;
+         for (const auto &region : region_selection.regions) {
+             if (!region.calls && !leaf_functions) { ++leaves_dropped; continue; }
+             Unit &unit = *unit_by_bucket.at(region.unit);
+-            for (const auto pc : region.instructions) unit.instructions.erase(pc);
+-            for (const auto label : region.entry_labels) unit.code_entries.erase(label);
++            // (A function that straddles units takes its instructions out of each.)
++            for (const auto pc : region.instructions)
++                unit_by_bucket.at((pc - executable_base) / unit_span_bytes)->instructions.erase(pc);
++            for (const auto label : region.entry_labels)
++                unit_by_bucket.at((label - executable_base) / unit_span_bytes)->code_entries.erase(label);
+             unit.regions.push_back(&region);
+             if (!region.calls) {
+                 leaf_entries[region.entry] = leaf_cpp_name(region.entry);
+@@ -2584,6 +2823,7 @@
+             call_forwards[region.entry] = name + "(rt, ctx, 0u, aot_mem_ref); return;";
+             std::uint32_t id = 1u;
+             for (const auto continuation : region.continuations) {
++                if (region.extra_entries.contains(continuation)) call_aliases[continuation] = {name, id};
+                 call_forwards[continuation] = name + "(rt, ctx, " + std::to_string(id++) + "u, aot_mem_ref); return;";
+                 call_continuations.insert(continuation);
+             }
+@@ -2641,6 +2881,9 @@
+             false,
+             call_functions ? &call_entries : nullptr,
+             call_functions ? &call_forwards : nullptr,
++            false,
++            nullptr,
++            indirect_functions ? &call_aliases : nullptr,
+         };
+ 
+         std::ostringstream out;
+@@ -2666,6 +2909,7 @@
+                 nullptr,
+                 region->calls,
+                 region->calls ? &region->continuations : nullptr,
++                indirect_functions ? &call_aliases : nullptr,
+                 cache_gpr,
+             };
+             source += emit_function_source(single, memory, single.name);
+@@ -2821,7 +3065,7 @@
+     try {
+         const char *auto_usage =
+             "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
+-            " [--leaf-functions] [--call-functions] [--leaf-exclude <pc_list>] [--cache-gpr] [--neon]\n";
++            " [--leaf-functions] [--call-functions] [--leaf-exclude <pc_list>] [--cache-gpr] [--neon] [--indirect-functions] [--context-gpr <pc_list>]\n";
+         if (const char *neon = std::getenv("PSPRECOMP_NEON");
+             neon != nullptr && *neon != '\0' && std::string_view(neon) != "0") g_neon = true;
+         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
+@@ -2829,6 +3073,7 @@
+             bool leaf_functions = false;
+             bool call_functions = false;
+             bool cache_gpr = false;
++            bool indirect_functions = false;
+             std::set<std::uint32_t> leaf_excluded_pcs;
+             for (int i = 4; i < argc; ++i) {
+                 const std::string_view argument(argv[i]);
+@@ -2840,6 +3085,11 @@
+                     cache_gpr = true;
+                 } else if (argument == "--neon") {
+                     g_neon = true;
++                } else if (argument == "--indirect-functions") {
++                    indirect_functions = true;
++                } else if (argument == "--context-gpr") {
++                    if (i + 1 >= argc) { std::cerr << auto_usage; return 2; }
++                    g_context_gpr_pcs = load_pc_list(argv[++i]);
+                 } else if (argument == "--leaf-exclude") {
+                     if (i + 1 >= argc) { std::cerr << auto_usage; return 2; }
+                     leaf_excluded_pcs = load_pc_list(argv[++i]);
+@@ -2862,7 +3112,7 @@
+                 : 0x20000u;
+             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
+             return generate_auto(argv[1], argv[3], load_base, unit_span, leaf_functions, call_functions,
+-                                 leaf_excluded_pcs, cache_gpr);
++                                 leaf_excluded_pcs, cache_gpr, indirect_functions);
+         }
+         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
+         std::cerr << "Usage:\n"

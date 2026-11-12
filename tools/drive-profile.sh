@@ -28,7 +28,7 @@
 # on the console
 # Don't touch the controls while it runs.
 set -eu
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../goodluckOS-tools"
 # The game is the player's while they hold the pad: it is stopped only once
 # the pad has been left alone for 5 s (the player puts it down after driving).
 pad_quiet() {

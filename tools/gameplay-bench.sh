@@ -7,6 +7,7 @@
 # the presses load it instead (wherever it was saved).
 #   tools/gameplay-bench.sh <binary in ports/gtalcs-psp> [VAR=value ...]   (default LCSNative)
 #   SHOT=file.png also saves a screenshot of the scene.
+#   UNCAP=1 runs without start.sh's LCS_FPS_CAP line (to compare builds above the cap).
 #   START=start.ioctl.sh launches through that script instead of start.sh (the
 #   ioctl counter, glos/testing/ioctlcount.so, logs calls and time per kind).
 #   TELEPORT="x y z [heading]" writes that world position (and facing
@@ -22,7 +23,7 @@
 # on the console
 # Don't touch the controls while it runs.
 set -eu
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../goodluckOS-tools"
 binary=${1:-LCSNative}
 [ $# -gt 0 ] && shift
 out=$(mktemp)
@@ -38,7 +39,7 @@ print("".join("\\%03o" % b for b in struct.pack("<16f", *m)), "".join("\\%03o" %
 fi
 GLOS_TIMEOUT=900 python3 -I console.py "/usr/local/bin/appctl stop-application; sleep 3
 cd /home/player/ports/gtalcs-psp
-sed 's|\./LCSNative --game|./$binary --game|' ${START:-start.sh} > start.bench.sh; chmod +x start.bench.sh
+sed 's|\./LCSNative --game|./$binary --game|${UNCAP:+; /LCS_FPS_CAP=/d}' ${START:-start.sh} > start.bench.sh; chmod +x start.bench.sh
 /usr/local/bin/appctl launch-application \"cd /home/player/ports/gtalcs-psp && env LCS_FPS_LOG=1 $* ./start.bench.sh\"
 sleep 25; i=0
 while [ \$i -lt 90 ]; do set -- \$(/home/player/ports/gtalcs-psp/glos/testing/fbprobe 494 82 126 12); [ \$2 -gt \$((\$1 + 15)) ] && [ \$2 -gt \$((\$3 + 15)) ] && break; /home/player/ports/gtalcs-psp/glos/testing/padpress a 120; sleep 1.2; i=\$((i + 1)); done

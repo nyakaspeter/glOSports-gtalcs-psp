@@ -45,6 +45,11 @@ case "$PGO" in
     *) echo "PGO must be generate, use or off"; exit 2 ;;
 esac
 pgo_files=$(echo "${PGO_FILES:-}" | tr ' ' ';')
+# IDENTITY=0 (default 1): without the PSP's memory mapped at its own addresses
+# (guest address = host address, see GuestMemory; the executable is then
+# linked at 0x10000000, clear of the scratchpad, VRAM and RAM).
+link=''
+if [ "${IDENTITY:-1}" = 1 ]; then flags="$flags -DPSPRECOMP_FASTMEM_IDENTITY"; link='-Wl,-Ttext-segment=0x10000000'; fi
 gen_opt=${GEN_OPT:-3}  # GEN_OPT=2: generated units at -O2 (see lcs/CMakeLists.txt; -O3 measured faster)
 [ -n "$pgo_files" ] && [ "$PGO" != use ] && { echo "PGO_FILES needs PGO=use (a profile in $PGO_DIR/)"; exit 2; }
 echo "PGO=$PGO${pgo_files:+ PGO_FILES=$pgo_files} BUILD_DIR=$B PGO_DIR=$PGO_DIR"
@@ -60,13 +65,13 @@ docker run --rm --name "$name" -v "$PWD":/w -w /w lcs-recomp-builder sh -c "
     # Not position-independent: PIE reserved a register for the GOT base in
     # every generated function and loaded the runtime's globals through it.
     A33='-mcpu=cortex-a7 -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -ffp-contract=off -fno-pie'
-    [ -f $B/build.ninja ] && [ \"\$(cat $B/.pgo 2>/dev/null)\" = '$PGO-a33c-$pgo_files-O$gen_opt' ] ||
+    [ -f $B/build.ninja ] && [ \"\$(cat $B/.pgo 2>/dev/null)\" = '$PGO-a33c-$pgo_files-O$gen_opt-I${IDENTITY:-1}' ] ||
         cmake -S upstream -B $B -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=/w/toolchain-armhf.cmake \
             -DCMAKE_BUILD_TYPE=Release -DLCS_VULKAN=OFF -DPSPRECOMP_BUILD_TESTS=OFF \
             -DPSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH=ON -DPSPRECOMP_AOT_PRODUCTION_FASTPATHS=ON \
-            -DCMAKE_C_FLAGS=\"\$A33 $flags\" -DCMAKE_CXX_FLAGS=\"\$A33 $flags\" -DCMAKE_EXE_LINKER_FLAGS='-no-pie $flags' \
+            -DCMAKE_C_FLAGS=\"\$A33 $flags\" -DCMAKE_CXX_FLAGS=\"\$A33 $flags\" -DCMAKE_EXE_LINKER_FLAGS='-no-pie $link $flags' \
             -DLCS_PGO_GENERATE_FILES='$pgo_files' -DLCS_GENERATED_OPT=$gen_opt
-    echo '$PGO-a33c-$pgo_files-O$gen_opt' > $B/.pgo
+    echo '$PGO-a33c-$pgo_files-O$gen_opt-I${IDENTITY:-1}' > $B/.pgo
     ninja -C $B -j${JOBS:-8} LCSNative"
 file build/lcs/LCSNative
